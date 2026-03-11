@@ -2621,13 +2621,17 @@ export async function handleMessage(
     }
 
     case "CHATGPT_NEW_TAB": {
-      const tab = await chrome.tabs.create({
+      // Open in new window (background, no focus steal)
+      const window = await chrome.windows.create({
         url: "https://chatgpt.com/",
-        active: true,
+        focused: false,
+        type: "normal",
       });
-      if (!tab.id) throw new Error("Failed to create tab");
-      const currentTab = await chrome.tabs.get(tab.id);
-      if (currentTab.status !== "complete") {
+      if (!window.id) throw new Error("Failed to create window");
+      const tabs = await chrome.tabs.query({ windowId: window.id });
+      const tab = tabs[0];
+      if (!tab?.id) throw new Error("Failed to get tab from window");
+      if (tab.status !== "complete") {
         await new Promise<void>((resolve) => {
           const listener = (tabId: number, info: chrome.tabs.TabChangeInfo) => {
             if (tabId === tab.id && info.status === "complete") {
@@ -2643,7 +2647,6 @@ export async function handleMessage(
         });
       }
       await cdp.attach(tab.id);
-      // Wait for JS runtime to be ready after CDP attach
       await waitForRuntimeReady(tab.id, 10000);
       return { tabId: tab.id };
     }
@@ -2673,13 +2676,17 @@ export async function handleMessage(
     }
 
     case "CLAUDE_NEW_TAB": {
-      const tab = await chrome.tabs.create({
+      // Open in new window (background, no focus steal)
+      const window = await chrome.windows.create({
         url: "https://claude.ai/",
-        active: true,
+        focused: false,
+        type: "normal",
       });
-      if (!tab.id) throw new Error("Failed to create tab");
-      const currentTab = await chrome.tabs.get(tab.id);
-      if (currentTab.status !== "complete") {
+      if (!window.id) throw new Error("Failed to create window");
+      const tabs = await chrome.tabs.query({ windowId: window.id });
+      const tab = tabs[0];
+      if (!tab?.id) throw new Error("Failed to get tab from window");
+      if (tab.status !== "complete") {
         await new Promise<void>((resolve) => {
           const listener = (tabId: number, info: chrome.tabs.TabChangeInfo) => {
             if (tabId === tab.id && info.status === "complete") {
@@ -2695,7 +2702,6 @@ export async function handleMessage(
         });
       }
       await cdp.attach(tab.id);
-      // Wait for JS runtime to be ready after CDP attach
       await waitForRuntimeReady(tab.id, 10000);
       return { tabId: tab.id };
     }
@@ -2725,13 +2731,17 @@ export async function handleMessage(
     }
 
     case "PERPLEXITY_NEW_TAB": {
-      const tab = await chrome.tabs.create({
+      // Open in new window (background, no focus steal)
+      const window = await chrome.windows.create({
         url: "https://www.perplexity.ai/",
-        active: true,
+        focused: false,
+        type: "normal",
       });
-      if (!tab.id) throw new Error("Failed to create tab");
-      const currentTab = await chrome.tabs.get(tab.id);
-      if (currentTab.status !== "complete") {
+      if (!window.id) throw new Error("Failed to create window");
+      const tabs = await chrome.tabs.query({ windowId: window.id });
+      const tab = tabs[0];
+      if (!tab?.id) throw new Error("Failed to get tab from window");
+      if (tab.status !== "complete") {
         await new Promise<void>((resolve) => {
           const listener = (tabId: number, info: chrome.tabs.TabChangeInfo) => {
             if (tabId === tab.id && info.status === "complete") {
@@ -2747,7 +2757,6 @@ export async function handleMessage(
         });
       }
       await cdp.attach(tab.id);
-      // Wait for JS runtime to be ready after CDP attach
       await waitForRuntimeReady(tab.id, 10000);
       return { tabId: tab.id };
     }
@@ -2810,13 +2819,17 @@ export async function handleMessage(
     }
 
     case "GROK_NEW_TAB": {
-      const tab = await chrome.tabs.create({
+      // Open in new window (background, no focus steal)
+      const window = await chrome.windows.create({
         url: "https://x.com/i/grok",
-        active: true,
+        focused: false,
+        type: "normal",
       });
-      if (!tab.id) throw new Error("Failed to create tab");
-      const currentTab = await chrome.tabs.get(tab.id);
-      if (currentTab.status !== "complete") {
+      if (!window.id) throw new Error("Failed to create window");
+      const tabs = await chrome.tabs.query({ windowId: window.id });
+      const tab = tabs[0];
+      if (!tab?.id) throw new Error("Failed to get tab from window");
+      if (tab.status !== "complete") {
         await new Promise<void>((resolve) => {
           const listener = (tabId: number, info: chrome.tabs.TabChangeInfo) => {
             if (tabId === tab.id && info.status === "complete") {
@@ -2832,7 +2845,6 @@ export async function handleMessage(
         });
       }
       await cdp.attach(tab.id);
-      // Wait for JS runtime to be ready after CDP attach
       await waitForRuntimeReady(tab.id, 10000);
       return { tabId: tab.id };
     }
@@ -2862,11 +2874,16 @@ export async function handleMessage(
     }
 
     case "GEMINI_NEW_TAB": {
-      const tab = await chrome.tabs.create({
+      // Open in new window (background, no focus steal)
+      const window = await chrome.windows.create({
         url: "https://gemini.google.com/app",
-        active: true,
+        focused: false,
+        type: "normal",
       });
-      if (!tab.id) throw new Error("Failed to create tab");
+      if (!window.id) throw new Error("Failed to create window");
+      const tabs = await chrome.tabs.query({ windowId: window.id });
+      const tab = tabs[0];
+      if (!tab?.id) throw new Error("Failed to get tab from window");
       return { tabId: tab.id };
     }
 
@@ -2983,10 +3000,17 @@ export async function handleMessage(
 
     case "AISTUDIO_NEW_TAB": {
       const url = message.url || "https://aistudio.google.com/prompts/new_chat";
-      const tab = await chrome.tabs.create({ url, active: true });
-      if (!tab.id) throw new Error("Failed to create tab");
-      const currentTab = await chrome.tabs.get(tab.id);
-      if (currentTab.status !== "complete") {
+      // Open in new window (background, no focus steal)
+      const window = await chrome.windows.create({
+        url: url,
+        focused: false,
+        type: "normal",
+      });
+      if (!window.id) throw new Error("Failed to create window");
+      const tabs = await chrome.tabs.query({ windowId: window.id });
+      const tab = tabs[0];
+      if (!tab?.id) throw new Error("Failed to get tab from window");
+      if (tab.status !== "complete") {
         await new Promise<void>((resolve) => {
           const listener = (tabId: number, info: chrome.tabs.TabChangeInfo) => {
             if (tabId === tab.id && info.status === "complete") {
@@ -3025,16 +3049,19 @@ export async function handleMessage(
     }
 
     case "AIMODE_NEW_TAB": {
-      const url = message.pro
-        ? "https://www.google.com/search?nem=143&q="
-        : "https://www.google.com/search?udm=50&q=";
-      const tab = await chrome.tabs.create({
-        url: url,
-        active: true,
+      // Open in new window (background, no focus steal)
+      const window = await chrome.windows.create({
+        url: message.pro
+          ? "https://www.google.com/search?nem=143&q="
+          : "https://www.google.com/search?udm=50&q=",
+        focused: false,
+        type: "normal",
       });
-      if (!tab.id) throw new Error("Failed to create tab");
-      const currentTab = await chrome.tabs.get(tab.id);
-      if (currentTab.status !== "complete") {
+      if (!window.id) throw new Error("Failed to create window");
+      const tabs = await chrome.tabs.query({ windowId: window.id });
+      const tab = tabs[0];
+      if (!tab?.id) throw new Error("Failed to get tab from window");
+      if (tab.status !== "complete") {
         await new Promise<void>((resolve) => {
           const listener = (tabId: number, info: chrome.tabs.TabChangeInfo) => {
             if (tabId === tab.id && info.status === "complete") {
@@ -3232,7 +3259,7 @@ const COMMANDS_WITHOUT_TAB = new Set([
   "LIST_TABS", "NEW_TAB", "TABS_NEW", "CLOSE_TABS", "SWITCH_TAB", "TABS_SWITCH",
   "TABS_REGISTER", "TABS_UNREGISTER", "TABS_LIST_NAMED", "TABS_GET_BY_NAME",
   "CREATE_TAB_GROUP", "UNGROUP_TABS", "LIST_TAB_GROUPS", "GET_HISTORY", "SEARCH_HISTORY",
-  "GET_COOKIES", "SET_COOKIE", "DELETE_COOKIES", "GET_BOOKMARKS", "ADD_BOOKMARK", 
+  "GET_COOKIES", "SET_COOKIE", "DELETE_COOKIES", "GET_BOOKMARKS", "ADD_BOOKMARK",
   "DELETE_BOOKMARK", "DIALOG_DISMISS", "DIALOG_ACCEPT", "DIALOG_INFO",
   "CHATGPT_NEW_TAB", "CHATGPT_CLOSE_TAB", "CHATGPT_EVALUATE", "CHATGPT_CDP_COMMAND",
   "GET_CHATGPT_COOKIES", "GET_GOOGLE_COOKIES", "GET_TWITTER_COOKIES",
@@ -3242,6 +3269,7 @@ const COMMANDS_WITHOUT_TAB = new Set([
   "GROK_NEW_TAB", "GROK_CLOSE_TAB", "GROK_EVALUATE", "GROK_CDP_COMMAND",
   "GEMINI_NEW_TAB", "GEMINI_CLOSE_TAB", "GEMINI_FETCH_URL", "UPLOAD_FILE_TO_TAB",
   "AISTUDIO_NEW_TAB", "AISTUDIO_CLOSE_TAB", "AISTUDIO_EVALUATE", "AISTUDIO_CDP_COMMAND",
+  "AIMODE_NEW_TAB", "AIMODE_CLOSE_TAB", "AIMODE_EVALUATE", "AIMODE_CDP_COMMAND",
   "DOWNLOADS_SEARCH",
   "WINDOW_NEW", "WINDOW_LIST", "WINDOW_FOCUS", "WINDOW_CLOSE", "WINDOW_RESIZE",
   "EMULATE_DEVICE_LIST"
