@@ -808,8 +808,7 @@ function handleToolRequest(msg, socket) {
             tool: "create_tab",
             onComplete: (r) => resolve(r)
           });
-          const baseUrl = pro ? "https://www.google.com/search?nem=143&q=" : "https://www.google.com/search?udm=50&q=";
-          writeMessage({ type: "NEW_TAB", url: baseUrl, id: tabCreateId });
+          writeMessage({ type: "AIMODE_NEW_TAB", pro: pro || false, id: tabCreateId });
         }),
         closeTab: (tabIdToClose) => new Promise((resolve) => {
           const tabCloseId = ++requestCounter;
