@@ -9,3 +9,14 @@ dist/
 coverage/
 .playwright-mcp/
 FEATURE_COMPARISON.md
+.grepai/
+
+# Claude & AI config
+.claude/
+.quint/
+.serena/
+.mcp.json
+
+# Experimental
+openspec/
+*.png

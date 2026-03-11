@@ -342,10 +342,10 @@ const TOOLS = {
   ai: {
     desc: "AI assistants (ChatGPT, Gemini)",
     commands: {
-      "chatgpt": { 
-        desc: "Send prompt to ChatGPT (uses browser cookies)", 
-        args: ["query"], 
-        opts: { 
+      "chatgpt": {
+        desc: "Send prompt to ChatGPT (uses browser cookies)",
+        args: ["query"],
+        opts: {
           "with-page": "Include current page context",
           model: "Model: gpt-4o, o1, etc.",
           file: "Attach file",
@@ -356,6 +356,34 @@ const TOOLS = {
           { cmd: 'chatgpt "summarize" --with-page', desc: "With page context" },
           { cmd: 'chatgpt "review" --file code.ts', desc: "With file" },
           { cmd: 'chatgpt "analyze" --model gpt-4o', desc: "Specify model" },
+        ]
+      },
+      "claude": {
+        desc: "Send prompt to Claude AI (uses browser cookies)",
+        args: ["query"],
+        opts: {
+          "with-page": "Include current page context",
+          model: "Model: claude-3-5-sonnet (default), claude-3-opus, etc.",
+          timeout: "Timeout in seconds (default: 300)"
+        },
+        examples: [
+          { cmd: 'claude "explain quantum computing"', desc: "Basic query" },
+          { cmd: 'claude "summarize" --with-page', desc: "With page context" },
+          { cmd: 'claude "review this code"', desc: "Code review" },
+        ]
+      },
+      "aimode": {
+        desc: "Query Google AI Mode (udm=50=auto, nem=143=pro)",
+        args: ["query"],
+        opts: {
+          "with-page": "Include current page context",
+          timeout: "Timeout in seconds (default: 120)",
+          pro: "Use nem=143 (pro mode) instead of udm=50 (auto)"
+        },
+        examples: [
+          { cmd: 'aimode "what is quantum computing"', desc: "Basic query (auto mode)" },
+          { cmd: 'aimode "summarize" --with-page', desc: "With page context" },
+          { cmd: 'aimode "question" --pro', desc: "Use pro mode (nem=143)" },
         ]
       },
       "gemini": { 
@@ -2515,6 +2543,8 @@ const PRIMARY_ARG_MAP = {
   ai: "query",
   gemini: "query",
   chatgpt: "query",
+  claude: "query",
+  aimode: "query",
   perplexity: "query",
   grok: "query",
   aistudio: "query",
@@ -2900,7 +2930,7 @@ const socket = net.createConnection(SOCKET_PATH, () => {
   socket.write(JSON.stringify(request) + "\n");
 });
 
-const AI_TOOLS = ["smoke", "chatgpt", "gemini", "perplexity", "grok", "aistudio", "aistudio.build", "ai"];
+const AI_TOOLS = ["smoke", "chatgpt", "claude", "aimode", "gemini", "perplexity", "grok", "aistudio", "aistudio.build", "ai"];
 let requestTimeout = AI_TOOLS.includes(tool) ? 300000 : 30000;
 if (tool === "aistudio.build") {
   const userTimeoutSec = parseInt(options.timeout || "600", 10);
@@ -3192,6 +3222,12 @@ async function handleResponse(response) {
     if (data.sources) meta.push(`${data.sources} sources`);
     if (data.mode) meta.push(data.mode);
     if (data.model && data.model !== 'default') meta.push(data.model);
+    meta.push(`${((data.tookMs || 0) / 1000).toFixed(1)}s`);
+    console.error(`\n[${meta.join(' | ')}]`);
+    if (data.url) console.error(`URL: ${data.url}`);
+  } else if (tool === "aimode" && data?.response) {
+    console.log(data.response);
+    const meta = [];
     meta.push(`${((data.tookMs || 0) / 1000).toFixed(1)}s`);
     console.error(`\n[${meta.join(' | ')}]`);
     if (data.url) console.error(`URL: ${data.url}`);

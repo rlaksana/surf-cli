@@ -4,11 +4,13 @@ const SELECTORS = {
   promptTextarea: '#prompt-textarea, [data-testid="composer-textarea"], textarea[name="prompt-textarea"], .ProseMirror, [contenteditable="true"][data-virtualkeyboard="true"]',
   sendButton: 'button[data-testid="send-button"], button[data-testid*="composer-send"], form button[type="submit"]',
   modelButton: '[data-testid="model-switcher-dropdown-button"]',
-  assistantMessage: '[data-message-author-role="assistant"], [data-turn="assistant"], [data-testid*="assistant-message"], [data-testid*="assistant-turn"], [data-testid*="assistant-response"]',
-  assistantContent: '.markdown, [data-message-content], .prose, [class*="markdown"], [dir="auto"]',
-  stopButton: '[data-testid="stop-button"], [data-testid*="stop"], button[aria-label*="Stop"], button[aria-label*="stop"]',
-  finishedActions: 'button[data-testid="copy-turn-action-button"], button[data-testid="good-response-turn-action-button"], button[data-testid*="turn-action"], button[aria-label*="Copy"], button[aria-label*="copy"], button[aria-label*="Read aloud"], button[aria-label*="read aloud"]',
-  conversationTurn: '[data-testid^="conversation-turn"], [data-testid*="conversation-turn"]',
+  menuContainer: '[role="menu"], [data-radix-collection-root]',
+  menuItem: 'button, [role="menuitem"], [role="menuitemradio"], [data-testid*="model-switcher-"]',
+  assistantMessage: '[data-message-author-role="assistant"], [data-turn="assistant"]',
+  stopButton: '[data-testid="stop-button"]',
+  finishedActions: 'button[data-testid="copy-turn-action-button"], button[data-testid="good-response-turn-action-button"]',
+  conversationTurn: 'article[data-testid^="conversation-turn"], div[data-testid^="conversation-turn"]',
+  fileInput: 'input[type="file"]',
   cloudflareScript: 'script[src*="/challenge-platform/"]',
 };
 
@@ -36,155 +38,10 @@ function buildClickDispatcher() {
 
 function hasRequiredCookies(cookies) {
   if (!cookies || !Array.isArray(cookies)) return false;
-  return cookies.some(
-    (c) =>
-      typeof c?.name === "string" &&
-      Boolean(c.value) &&
-      (c.name === "__Secure-next-auth.session-token" ||
-        /^__Secure-next-auth\.session-token\.\d+$/.test(c.name))
+  const sessionCookie = cookies.find(
+    (c) => c.name.startsWith("__Secure-next-auth.session-token") && c.value
   );
-}
-
-function cleanChatGPTResponseText(rawText) {
-  if (!rawText) return "";
-
-  const chromeLines = new Set([
-    "copy",
-    "good response",
-    "bad response",
-    "read aloud",
-    "edit",
-    "retry",
-    "continue generating",
-    "share",
-  ]);
-
-  const lines = [];
-  let inCodeFence = false;
-
-  for (const line of String(rawText).replace(/\r\n?/g, "\n").split("\n")) {
-    const trimmed = line.trim();
-    const isFenceLine = trimmed.startsWith("```");
-    const normalizedLine = inCodeFence || isFenceLine ? line.replace(/[\t ]+$/g, "") : line;
-
-    lines.push({
-      text: normalizedLine,
-      trimmed,
-      isChrome: trimmed.length > 0 && chromeLines.has(trimmed.toLowerCase()),
-      inCodeFence,
-      isFenceLine,
-    });
-
-    if (isFenceLine) {
-      inCodeFence = !inCodeFence;
-    }
-  }
-
-  while (lines.length > 0 && lines[0].trimmed.length === 0) {
-    lines.shift();
-  }
-  while (lines.length > 0 && lines[lines.length - 1].trimmed.length === 0) {
-    lines.pop();
-  }
-
-  let trailingChromeStart = lines.length;
-  while (trailingChromeStart > 0) {
-    const line = lines[trailingChromeStart - 1];
-    if (line.inCodeFence || line.isFenceLine || !line.isChrome) break;
-    trailingChromeStart--;
-  }
-
-  const trailingChromeCount = lines.length - trailingChromeStart;
-  if (trailingChromeCount >= 2) {
-    lines.splice(trailingChromeStart);
-  }
-
-  while (lines.length > 0 && lines[0].trimmed.length === 0) {
-    lines.shift();
-  }
-  while (lines.length > 0 && lines[lines.length - 1].trimmed.length === 0) {
-    lines.pop();
-  }
-
-  return lines.map((line) => line.text).join("\n");
-}
-
-function extractLatestAssistantSnapshot(candidates) {
-  if (!Array.isArray(candidates)) return null;
-
-  let latestEmptyAssistant = null;
-
-  for (let i = candidates.length - 1; i >= 0; i--) {
-    const candidate = candidates[i];
-    if (!candidate?.isAssistant) continue;
-
-    const snapshot = {
-      ...candidate,
-      text: cleanChatGPTResponseText(candidate?.text || ""),
-      turnIndex: i,
-    };
-
-    if (snapshot.text) {
-      return snapshot;
-    }
-
-    if (!latestEmptyAssistant) {
-      latestEmptyAssistant = snapshot;
-    }
-  }
-
-  return latestEmptyAssistant;
-}
-
-function normalizeResponseSnapshot(rawSnapshot) {
-  const candidates = rawSnapshot?.candidates;
-  return {
-    latestAssistant: extractLatestAssistantSnapshot(candidates),
-    assistantCount: Array.isArray(candidates)
-      ? candidates.filter((candidate) => candidate?.isAssistant).length
-      : 0,
-    stopVisible: Boolean(rawSnapshot?.stopVisible),
-  };
-}
-
-function isNewAssistantContent(
-  latestAssistant,
-  baselineAssistant,
-  assistantCount = 0,
-  baselineAssistantCount = 0
-) {
-  if (!latestAssistant) return false;
-  if (!baselineAssistant) return true;
-  if (latestAssistant.messageId && baselineAssistant.messageId) {
-    if (latestAssistant.messageId !== baselineAssistant.messageId) {
-      return true;
-    }
-  }
-
-  const currentText = latestAssistant.text || "";
-  const baselineText = baselineAssistant.text || "";
-
-  if (assistantCount > baselineAssistantCount) {
-    if (latestAssistant.turnIndex !== baselineAssistant.turnIndex) {
-      return true;
-    }
-    if (currentText !== baselineText) {
-      return true;
-    }
-    return false;
-  }
-
-  if (currentText !== baselineText) {
-    return true;
-  }
-  return false;
-}
-
-function isChatGPTResponseComplete(snapshot, stableCycles, stableMs) {
-  if (!snapshot?.text) return false;
-  if (snapshot.stopVisible) return false;
-  if (snapshot.hasFinishedActions) return true;
-  return stableCycles >= 6 && stableMs >= 1200;
+  return Boolean(sessionCookie);
 }
 
 async function evaluate(cdp, expression) {
@@ -273,33 +130,6 @@ async function waitForPromptReady(cdp, timeoutMs = 30000) {
   return false;
 }
 
-function normalizeChatGPTModelChoice(desiredModel) {
-  const normalized = String(desiredModel || "")
-    .toLowerCase()
-    .replace(/[^a-z0-9]/g, "");
-
-  if (["instant", "gpt53"].includes(normalized)) return "instant";
-  if (["thinking", "gpt54thinking"].includes(normalized)) return "thinking";
-  if (["pro", "gpt54pro"].includes(normalized)) return "pro";
-
-  return normalized;
-}
-
-function resolveChatGPTModelMenuOption(items, desiredModel) {
-  if (!Array.isArray(items)) return null;
-
-  const targetModel = normalizeChatGPTModelChoice(desiredModel);
-
-  return items.find((item) => {
-    if (item?.role !== "menuitemradio") return false;
-    if (typeof item?.testId !== "string" || !item.testId.startsWith("model-switcher-")) return false;
-
-    const label = normalizeChatGPTModelChoice(item.label || "");
-    const testId = normalizeChatGPTModelChoice(item.testId.replace(/^model-switcher-/, ""));
-    return label === targetModel || testId === targetModel;
-  }) || null;
-}
-
 async function selectModel(cdp, desiredModel, timeoutMs = 8000) {
   const modelButton = await evaluate(
     cdp,
@@ -320,66 +150,57 @@ async function selectModel(cdp, desiredModel, timeoutMs = 8000) {
     })()`
   );
   await delay(300);
-
-  const normalizedModel = normalizeChatGPTModelChoice(desiredModel);
+  // Select from menu - loop in Node.js to avoid CDP timeout issues
+  const normalizedModel = desiredModel.toLowerCase().replace(/[^a-z0-9]/g, "");
   const deadline = Date.now() + timeoutMs;
-
+  
   while (Date.now() < deadline) {
     const result = await evaluate(
       cdp,
       `(() => {
-        const menu = document.querySelector('[role="menu"][data-radix-menu-content]');
+        ${buildClickDispatcher()}
+        const targetModel = ${JSON.stringify(normalizedModel)};
+        const menuSelector = '${SELECTORS.menuContainer}';
+        const itemSelector = '${SELECTORS.menuItem}';
+        const normalize = (text) => (text || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+        
+        const menu = document.querySelector(menuSelector);
         if (!menu) {
           return { found: false, waiting: true };
         }
-
-        return {
-          found: true,
-          items: Array.from(menu.children).map((item) => {
-            const primary = item.querySelector?.('.min-w-0 > span');
-            return {
-              role: item.getAttribute?.('role') || null,
-              label: (primary?.textContent || item.getAttribute?.('aria-label') || item.textContent || '').trim(),
-              testId: item.getAttribute?.('data-testid') || null,
-            };
-          }),
-        };
+        const items = Array.from(menu.querySelectorAll(itemSelector));
+        let bestMatch = null;
+        let bestScore = 0;
+        for (const item of items) {
+          const text = normalize(item.textContent || '');
+          const testId = normalize(item.getAttribute('data-testid') || '');
+          let score = 0;
+          if (text.includes(targetModel) || testId.includes(targetModel)) score = 100;
+          else if (targetModel.includes(text) || targetModel.includes(testId)) score = 50;
+          if (score > bestScore) {
+            bestScore = score;
+            bestMatch = item;
+          }
+        }
+        if (bestMatch) {
+          dispatchClickSequence(bestMatch);
+          return { found: true, success: true, label: bestMatch.textContent?.trim() };
+        }
+        return { found: true, success: false, error: 'No matching model in menu' };
       })()`
     );
-
+    
     if (result && result.found) {
-      const match = resolveChatGPTModelMenuOption(result.items, normalizedModel);
-      if (match) {
-        await evaluate(
-          cdp,
-          `(() => {
-            ${buildClickDispatcher()}
-            const menu = document.querySelector('[role="menu"][data-radix-menu-content]');
-            const item = menu?.querySelector('[data-testid="${match.testId}"]');
-            if (item) dispatchClickSequence(item);
-          })()`
-        );
+      if (result.success) {
         await delay(200);
-        return match.label;
+        return result.label;
       }
-
-      const available = Array.isArray(result.items)
-        ? result.items
-            .filter((item) => item?.role === "menuitemradio" && typeof item?.testId === "string" && item.testId.startsWith("model-switcher-"))
-            .map((item) => item.label)
-            .filter(Boolean)
-            .join(", ")
-        : "";
-      throw new Error(
-        available
-          ? `Model not found: ${desiredModel}. Available: ${available}`
-          : `Model not found: ${desiredModel}`
-      );
+      throw new Error(`Model not found: ${desiredModel}`);
     }
-
+    
     await delay(100);
   }
-
+  
   throw new Error(`Model not found: ${desiredModel} (timeout)`);
 }
 
@@ -493,150 +314,84 @@ async function clickSend(cdp, inputCdp) {
   return true;
 }
 
-async function readChatGPTResponseSnapshot(cdp) {
-  return evaluate(
-    cdp,
-    `(() => {
-      const scope = document.querySelector('main') || document;
-      const CONVERSATION_SELECTOR = ${JSON.stringify(SELECTORS.conversationTurn)};
-      const ASSISTANT_SELECTOR = ${JSON.stringify(SELECTORS.assistantMessage)};
-      const CONTENT_SELECTORS = ${JSON.stringify(SELECTORS.assistantContent.split(", "))};
-      const STOP_SELECTOR = ${JSON.stringify(SELECTORS.stopButton)};
-      const FINISHED_SELECTOR = ${JSON.stringify(SELECTORS.finishedActions)};
-
-      const toCandidate = (turnNode, messageRoot = null) => {
-        const resolvedMessageRoot = messageRoot || (turnNode.matches?.(ASSISTANT_SELECTOR)
-          ? turnNode
-          : turnNode.querySelector(ASSISTANT_SELECTOR));
-        const searchRoot = resolvedMessageRoot || turnNode;
-        let contentRoot = null;
-
-        for (const selector of CONTENT_SELECTORS) {
-          const match = selector === '[dir="auto"]'
-            ? (searchRoot.matches?.(selector) ? searchRoot : null)
-            : (searchRoot.matches?.(selector) ? searchRoot : searchRoot.querySelector(selector));
-          if (match) {
-            contentRoot = match;
+async function waitForResponse(cdp, timeoutMs = 2700000) {
+  const deadline = Date.now() + timeoutMs;
+  let previousLength = 0;
+  let stableCycles = 0;
+  const requiredStableCycles = 6;
+  const minStableMs = 1200;
+  let lastChangeAt = Date.now();
+  while (Date.now() < deadline) {
+    const snapshot = await evaluate(
+      cdp,
+      `(() => {
+        const CONVERSATION_SELECTOR = '${SELECTORS.conversationTurn}';
+        const ASSISTANT_SELECTOR = '${SELECTORS.assistantMessage}';
+        const STOP_SELECTOR = '${SELECTORS.stopButton}';
+        const FINISHED_SELECTOR = '${SELECTORS.finishedActions}';
+        const isAssistantTurn = (node) => {
+          if (!(node instanceof HTMLElement)) return false;
+          const role = (node.getAttribute('data-message-author-role') || '').toLowerCase();
+          if (role === 'assistant') return true;
+          const turn = (node.getAttribute('data-turn') || '').toLowerCase();
+          if (turn === 'assistant') return true;
+          return Boolean(node.querySelector(ASSISTANT_SELECTOR));
+        };
+        const turns = Array.from(document.querySelectorAll(CONVERSATION_SELECTOR));
+        let lastAssistantTurn = null;
+        for (let i = turns.length - 1; i >= 0; i--) {
+          if (isAssistantTurn(turns[i])) {
+            lastAssistantTurn = turns[i];
             break;
           }
         }
-
-        const role =
-          resolvedMessageRoot?.getAttribute('data-message-author-role') ||
-          turnNode.getAttribute('data-message-author-role') ||
-          null;
-        const turn =
-          resolvedMessageRoot?.getAttribute('data-turn') ||
-          turnNode.getAttribute('data-turn') ||
-          null;
-        const isAssistant =
-          role === 'assistant' ||
-          turn === 'assistant' ||
-          resolvedMessageRoot !== null;
-        const text = (contentRoot || turnNode).innerText || (contentRoot || turnNode).textContent || '';
-        const messageId =
-          resolvedMessageRoot?.getAttribute('data-message-id') ||
-          turnNode.getAttribute('data-message-id') ||
-          null;
-        const hasFinishedActions = Boolean(turnNode.querySelector(FINISHED_SELECTOR));
-
-        return {
-          role,
-          turn,
-          isAssistant,
-          text,
-          messageId,
-          hasFinishedActions,
-        };
-      };
-
-      let candidates = Array.from(scope.querySelectorAll(CONVERSATION_SELECTOR)).map((turnNode) =>
-        toCandidate(turnNode)
-      );
-
-      if (candidates.length === 0) {
-        candidates = Array.from(scope.querySelectorAll(ASSISTANT_SELECTOR)).map((messageRoot) =>
-          toCandidate(messageRoot, messageRoot)
-        );
-      }
-
-      return {
-        candidates,
-        stopVisible: Boolean(scope.querySelector(STOP_SELECTOR)),
-      };
-    })()`
-  );
-}
-
-async function waitForResponse(
-  cdp,
-  timeoutMs = 2700000,
-  baselineAssistant,
-  baselineAssistantCount
-) {
-  const deadline = Date.now() + timeoutMs;
-  let previousText = "";
-  let stableCycles = 0;
-  let lastChangeAt = Date.now();
-
-  previousText = baselineAssistant?.text || "";
-  lastChangeAt = Date.now();
-
-  while (Date.now() < deadline) {
-    const snapshot = await readChatGPTResponseSnapshot(cdp);
-
+        if (!lastAssistantTurn) {
+          return { text: '', stopVisible: Boolean(document.querySelector(STOP_SELECTOR)), finished: false };
+        }
+        const messageRoot = lastAssistantTurn.querySelector(ASSISTANT_SELECTOR) || lastAssistantTurn;
+        const contentRoot = messageRoot.querySelector('.markdown') || 
+                           messageRoot.querySelector('[data-message-content]') ||
+                           messageRoot.querySelector('.prose') ||
+                           messageRoot;
+        const text = (contentRoot?.innerText || contentRoot?.textContent || '').trim();
+        const stopVisible = Boolean(document.querySelector(STOP_SELECTOR));
+        const finished = Boolean(lastAssistantTurn.querySelector(FINISHED_SELECTOR));
+        const messageId = messageRoot.getAttribute('data-message-id') || null;
+        return { text, stopVisible, finished, messageId, turnIndex: turns.length - 1 };
+      })()`
+    );
     if (!snapshot) {
       await delay(400);
       continue;
     }
-
-    const { latestAssistant, assistantCount, stopVisible } = normalizeResponseSnapshot(snapshot);
-    const currentText = latestAssistant?.text || "";
-    const hasNewAssistantContent = isNewAssistantContent(
-      latestAssistant,
-      baselineAssistant,
-      assistantCount,
-      baselineAssistantCount
-    );
-
-    if (!hasNewAssistantContent) {
-      await delay(400);
-      continue;
-    }
-
-    if (currentText !== previousText) {
-      previousText = currentText;
+    const currentLength = (snapshot.text || "").length;
+    if (currentLength > previousLength) {
+      previousLength = currentLength;
       stableCycles = 0;
       lastChangeAt = Date.now();
-    } else if (currentText) {
-      stableCycles++;
     } else {
-      stableCycles = 0;
-      lastChangeAt = Date.now();
+      stableCycles++;
     }
-
     const stableMs = Date.now() - lastChangeAt;
-    const completionSnapshot = latestAssistant
-      ? { ...latestAssistant, stopVisible }
-      : { text: "", stopVisible, hasFinishedActions: false };
-
-    if (isChatGPTResponseComplete(completionSnapshot, stableCycles, stableMs)) {
-      return {
-        text: latestAssistant.text,
-        messageId: latestAssistant.messageId,
-        turnIndex: latestAssistant.turnIndex,
-      };
+    if (!snapshot.stopVisible) {
+      const stableEnough = stableCycles >= requiredStableCycles && stableMs >= minStableMs;
+      const finishedVisible = snapshot.finished;
+      if ((finishedVisible || stableEnough) && currentLength > 0) {
+        return {
+          text: snapshot.text,
+          messageId: snapshot.messageId,
+          turnIndex: snapshot.turnIndex,
+        };
+      }
     }
-
     await delay(400);
   }
-
   throw new Error("Response timeout");
 }
 
 async function query(options) {
   const {
-    prompt,
+    prompt: originalPrompt,
     model,
     file,
     timeout = 2700000,
@@ -645,13 +400,17 @@ async function query(options) {
     closeTab,
     cdpEvaluate,
     cdpCommand,
+    uploadFile,
     log = () => {},
   } = options;
+
+  let prompt = originalPrompt;
   const startTime = Date.now();
   log("Starting ChatGPT query");
   const { cookies } = await getCookies();
+  const cookieNames = cookies?.map(c => c.name) || [];
   if (!hasRequiredCookies(cookies)) {
-    throw new Error("ChatGPT login required");
+    throw new Error(`ChatGPT login required. Found ${cookies?.length || 0} cookies: ${cookieNames.join(", ")}`);
   }
   log(`Got ${cookies.length} cookies`);
   const tabInfo = await createTab();
@@ -660,10 +419,10 @@ async function query(options) {
     throw new Error("Failed to create ChatGPT tab");
   }
   log(`Created tab ${tabId}`);
-  
+
   const cdp = (expr) => cdpEvaluate(tabId, expr);
   const inputCdp = (method, params) => cdpCommand(tabId, method, params);
-  
+
   try {
     await waitForPageLoad(cdp);
     log("Page loaded");
@@ -671,15 +430,9 @@ async function query(options) {
       throw new Error("Cloudflare challenge detected - complete in browser");
     }
     const loginStatus = await checkLoginStatus(cdp);
-    if (loginStatus.status === 0) {
-      throw new Error(
-        loginStatus.error
-          ? `ChatGPT login check failed: ${loginStatus.error}`
-          : "ChatGPT login check failed"
-      );
-    }
+    log(`DEBUG loginStatus: ${JSON.stringify(loginStatus)}`);
     if (loginStatus.status !== 200 || loginStatus.hasLoginCta) {
-      throw new Error("ChatGPT login required");
+      throw new Error(`ChatGPT login required. loginStatus: ${JSON.stringify(loginStatus)}`);
     }
     log("Login verified");
     const promptReady = await waitForPromptReady(cdp);
@@ -692,19 +445,33 @@ async function query(options) {
       log(`Selected model: ${selectedLabel}`);
     }
     if (file) {
-      throw new Error("File upload not yet implemented");
+      const fs = require("fs");
+      const path = require("path");
+
+      const absolutePath = path.resolve(process.cwd(), file);
+      if (!fs.existsSync(absolutePath)) {
+        throw new Error(`File not found: ${file}`);
+      }
+
+      const fileName = path.basename(absolutePath);
+      const fileExt = path.extname(absolutePath).toLowerCase();
+
+      // Text-based extensions only
+      const textExtensions = [".js", ".ts", ".tsx", ".jsx", ".py", ".java", ".c", ".cpp", ".h", ".hpp", ".go", ".rs", ".rb", ".php", ".html", ".htm", ".css", ".scss", ".less", ".json", ".md", ".txt", ".sh", ".bash", ".zsh", ".yaml", ".yml", ".xml", ".sql", ".gitignore", ".env", ".toml", ".ini", ".cfg", ".conf", ".log", ".csv", ".tsv"];
+
+      if (!textExtensions.includes(fileExt)) {
+        throw new Error(`Unsupported file type: ${fileExt}. Only text files are supported.`);
+      }
+
+      const fileContent = fs.readFileSync(absolutePath, "utf-8");
+      prompt = `File: ${fileName}\n\n\`\`\`\n${fileContent}\n\`\`\`\n\n---\n\n${prompt}`;
+      log(`Attached file: ${fileName} (${fileContent.length} chars)`);
     }
     await typePrompt(cdp, inputCdp, prompt);
     log("Prompt typed");
-    const baseline = normalizeResponseSnapshot(await readChatGPTResponseSnapshot(cdp));
     await clickSend(cdp, inputCdp);
     log("Prompt sent, waiting for response...");
-    const response = await waitForResponse(
-      cdp,
-      timeout,
-      baseline.latestAssistant,
-      baseline.assistantCount
-    );
+    const response = await waitForResponse(cdp, timeout);
     log(`Response received (${response.text.length} chars)`);
     return {
       response: response.text,
@@ -713,22 +480,8 @@ async function query(options) {
       tookMs: Date.now() - startTime,
     };
   } finally {
-    try {
-      await closeTab(tabId);
-    } catch (error) {
-      log(`Failed to close ChatGPT tab ${tabId}: ${error?.message || error}`);
-    }
+    await closeTab(tabId).catch(() => {});
   }
 }
 
-module.exports = {
-  query,
-  hasRequiredCookies,
-  cleanChatGPTResponseText,
-  extractLatestAssistantSnapshot,
-  normalizeChatGPTModelChoice,
-  resolveChatGPTModelMenuOption,
-  isNewAssistantContent,
-  isChatGPTResponseComplete,
-  CHATGPT_URL,
-};
+module.exports = { query, hasRequiredCookies, CHATGPT_URL };

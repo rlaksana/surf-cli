@@ -7,6 +7,8 @@ const https = require("https");
 const { execSync } = require("child_process");
 const { GoogleGenerativeAI } = require("@google/generative-ai");
 const chatgptClient = require("./chatgpt-client.cjs");
+const claudeClient = require("./claude-client.cjs");
+const aimodeClient = require("./aimode-client.cjs");
 const geminiClient = require("./gemini-client.cjs");
 const perplexityClient = require("./perplexity-client.cjs");
 const grokClient = require("./grok-client.cjs");
@@ -534,6 +536,16 @@ function handleToolRequest(msg, socket) {
           });
           writeMessage({ type: "CHATGPT_CDP_COMMAND", tabId, method, params, id: cmdId });
         }),
+        uploadFile: (tabId, filePaths) => new Promise((resolve) => {
+          const uploadId = ++requestCounter;
+          pendingToolRequests.set(uploadId, {
+            socket: null,
+            originalId: null,
+            tool: "upload_file",
+            onComplete: (r) => resolve(r)
+          });
+          writeMessage({ type: "UPLOAD_FILE_TO_TAB", tabId, filePaths, id: uploadId });
+        }),
         log: (msg) => log(`[chatgpt] ${msg}`)
       });
       
@@ -644,7 +656,208 @@ function handleToolRequest(msg, socket) {
     
     return;
   }
-  
+
+  if (extensionMsg.type === "CLAUDE_QUERY") {
+    const { query, model, withPage, timeout } = extensionMsg;
+
+    queueAiRequest(async () => {
+      let pageContext = null;
+      if (withPage) {
+        const pageResult = await new Promise((resolve) => {
+          const pageId = ++requestCounter;
+          pendingToolRequests.set(pageId, {
+            socket: null,
+            originalId: null,
+            tool: "read_page",
+            onComplete: resolve
+          });
+          writeMessage({ type: "GET_PAGE_TEXT", tabId: extensionMsg.tabId, id: pageId });
+        });
+        if (pageResult && !pageResult.error) {
+          pageContext = {
+            url: pageResult.url,
+            text: pageResult.text || pageResult.pageContent || ""
+          };
+        }
+      }
+
+      let fullPrompt = query;
+      if (pageContext) {
+        fullPrompt = `Page: ${pageContext.url}\n\n${pageContext.text}\n\n---\n\n${query}`;
+      }
+
+      const result = await claudeClient.query({
+        prompt: fullPrompt,
+        model,
+        timeout: timeout || 300000,
+        getCookies: () => new Promise((resolve) => {
+          const cookieId = ++requestCounter;
+          pendingToolRequests.set(cookieId, {
+            socket: null,
+            originalId: null,
+            tool: "get_cookies",
+            onComplete: (r) => resolve(r)
+          });
+          writeMessage({ type: "GET_CLAUDE_COOKIES", id: cookieId });
+        }),
+        createTab: () => new Promise((resolve) => {
+          const tabCreateId = ++requestCounter;
+          pendingToolRequests.set(tabCreateId, {
+            socket: null,
+            originalId: null,
+            tool: "create_tab",
+            onComplete: (r) => resolve(r)
+          });
+          writeMessage({ type: "CLAUDE_NEW_TAB", id: tabCreateId });
+        }),
+        closeTab: (tabIdToClose) => new Promise((resolve) => {
+          const tabCloseId = ++requestCounter;
+          pendingToolRequests.set(tabCloseId, {
+            socket: null,
+            originalId: null,
+            tool: "close_tab",
+            onComplete: (r) => resolve(r)
+          });
+          writeMessage({ type: "CLAUDE_CLOSE_TAB", tabId: tabIdToClose, id: tabCloseId });
+        }),
+        cdpEvaluate: (tabId, expression) => new Promise((resolve) => {
+          const evalId = ++requestCounter;
+          pendingToolRequests.set(evalId, {
+            socket: null,
+            originalId: null,
+            tool: "cdp_evaluate",
+            onComplete: (r) => resolve(r)
+          });
+          writeMessage({ type: "CLAUDE_EVALUATE", tabId, expression, id: evalId });
+        }),
+        cdpCommand: (tabId, method, params) => new Promise((resolve) => {
+          const cmdId = ++requestCounter;
+          pendingToolRequests.set(cmdId, {
+            socket: null,
+            originalId: null,
+            tool: "cdp_command",
+            onComplete: (r) => resolve(r)
+          });
+          writeMessage({ type: "CLAUDE_CDP_COMMAND", tabId, method, params, id: cmdId });
+        }),
+        log: (msg) => log(`[claude] ${msg}`)
+      });
+
+      return result;
+    }).then((result) => {
+      sendToolResponse(socket, originalId, {
+        response: result.response,
+        model: result.model,
+        tookMs: result.tookMs
+      }, null);
+    }).catch((err) => {
+      sendToolResponse(socket, originalId, null, err.message);
+    });
+
+    return;
+  }
+
+  if (extensionMsg.type === "AIMODE_QUERY") {
+    const { query, withPage, pro, timeout } = extensionMsg;
+
+    queueAiRequest(async () => {
+      let pageContext = null;
+      if (withPage) {
+        const pageResult = await new Promise((resolve) => {
+          const pageId = ++requestCounter;
+          pendingToolRequests.set(pageId, {
+            socket: null,
+            originalId: null,
+            tool: "read_page",
+            onComplete: resolve
+          });
+          writeMessage({ type: "GET_PAGE_TEXT", tabId: extensionMsg.tabId, id: pageId });
+        });
+        if (pageResult && !pageResult.error) {
+          pageContext = {
+            url: pageResult.url,
+            text: pageResult.text || pageResult.pageContent || ""
+          };
+        }
+      }
+
+      let fullPrompt = query;
+      if (pageContext) {
+        fullPrompt = `Page: ${pageContext.url}\n\n${pageContext.text}\n\n---\n\n${query}`;
+      }
+
+      const result = await aimodeClient.query({
+        prompt: fullPrompt,
+        pro: pro || false,
+        timeout: timeout || 120000,
+        getCookies: () => new Promise((resolve) => {
+          const cookieId = ++requestCounter;
+          pendingToolRequests.set(cookieId, {
+            socket: null,
+            originalId: null,
+            tool: "get_cookies",
+            onComplete: (r) => resolve(r)
+          });
+          writeMessage({ type: "GET_GOOGLE_COOKIES", id: cookieId });
+        }),
+        createTab: () => new Promise((resolve) => {
+          const tabCreateId = ++requestCounter;
+          pendingToolRequests.set(tabCreateId, {
+            socket: null,
+            originalId: null,
+            tool: "create_tab",
+            onComplete: (r) => resolve(r)
+          });
+          const baseUrl = pro ? "https://www.google.com/search?nem=143&q=" : "https://www.google.com/search?udm=50&q=";
+          writeMessage({ type: "NEW_TAB", url: baseUrl, id: tabCreateId });
+        }),
+        closeTab: (tabIdToClose) => new Promise((resolve) => {
+          const tabCloseId = ++requestCounter;
+          pendingToolRequests.set(tabCloseId, {
+            socket: null,
+            originalId: null,
+            tool: "close_tab",
+            onComplete: (r) => resolve(r)
+          });
+          writeMessage({ type: "AIMODE_CLOSE_TAB", tabId: tabIdToClose, id: tabCloseId });
+        }),
+        cdpEvaluate: (tabId, expression) => new Promise((resolve) => {
+          const evalId = ++requestCounter;
+          pendingToolRequests.set(evalId, {
+            socket: null,
+            originalId: null,
+            tool: "cdp_evaluate",
+            onComplete: (r) => resolve(r)
+          });
+          writeMessage({ type: "AIMODE_EVALUATE", tabId, expression, id: evalId });
+        }),
+        cdpCommand: (tabId, method, params) => new Promise((resolve) => {
+          const cmdId = ++requestCounter;
+          pendingToolRequests.set(cmdId, {
+            socket: null,
+            originalId: null,
+            tool: "cdp_command",
+            onComplete: (r) => resolve(r)
+          });
+          writeMessage({ type: "AIMODE_CDP_COMMAND", tabId, method, params, id: cmdId });
+        }),
+        log: (msg) => log(`[aimode] ${msg}`)
+      });
+
+      return result;
+    }).then((result) => {
+      sendToolResponse(socket, originalId, {
+        response: result.response,
+        url: result.url,
+        tookMs: result.tookMs
+      }, null);
+    }).catch((err) => {
+      sendToolResponse(socket, originalId, null, err.message);
+    });
+
+    return;
+  }
+
   if (extensionMsg.type === "GEMINI_QUERY") {
     const { query, model, withPage, file, generateImage, editImage, output, youtube, aspectRatio, timeout } = extensionMsg;
     
