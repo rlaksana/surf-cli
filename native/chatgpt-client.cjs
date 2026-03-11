@@ -39,7 +39,7 @@ function buildClickDispatcher() {
 function hasRequiredCookies(cookies) {
   if (!cookies || !Array.isArray(cookies)) return false;
   const sessionCookie = cookies.find(
-    (c) => c.name === "__Secure-next-auth.session-token" && c.value
+    (c) => c.name.startsWith("__Secure-next-auth.session-token") && c.value
   );
   return Boolean(sessionCookie);
 }
@@ -391,7 +391,7 @@ async function waitForResponse(cdp, timeoutMs = 2700000) {
 
 async function query(options) {
   const {
-    prompt,
+    prompt: originalPrompt,
     model,
     file,
     timeout = 2700000,
@@ -400,13 +400,17 @@ async function query(options) {
     closeTab,
     cdpEvaluate,
     cdpCommand,
+    uploadFile,
     log = () => {},
   } = options;
+
+  let prompt = originalPrompt;
   const startTime = Date.now();
   log("Starting ChatGPT query");
   const { cookies } = await getCookies();
+  const cookieNames = cookies?.map(c => c.name) || [];
   if (!hasRequiredCookies(cookies)) {
-    throw new Error("ChatGPT login required");
+    throw new Error(`ChatGPT login required. Found ${cookies?.length || 0} cookies: ${cookieNames.join(", ")}`);
   }
   log(`Got ${cookies.length} cookies`);
   const tabInfo = await createTab();
@@ -415,10 +419,10 @@ async function query(options) {
     throw new Error("Failed to create ChatGPT tab");
   }
   log(`Created tab ${tabId}`);
-  
+
   const cdp = (expr) => cdpEvaluate(tabId, expr);
   const inputCdp = (method, params) => cdpCommand(tabId, method, params);
-  
+
   try {
     await waitForPageLoad(cdp);
     log("Page loaded");
@@ -426,8 +430,9 @@ async function query(options) {
       throw new Error("Cloudflare challenge detected - complete in browser");
     }
     const loginStatus = await checkLoginStatus(cdp);
+    log(`DEBUG loginStatus: ${JSON.stringify(loginStatus)}`);
     if (loginStatus.status !== 200 || loginStatus.hasLoginCta) {
-      throw new Error("ChatGPT login required");
+      throw new Error(`ChatGPT login required. loginStatus: ${JSON.stringify(loginStatus)}`);
     }
     log("Login verified");
     const promptReady = await waitForPromptReady(cdp);
@@ -440,7 +445,27 @@ async function query(options) {
       log(`Selected model: ${selectedLabel}`);
     }
     if (file) {
-      throw new Error("File upload not yet implemented");
+      const fs = require("fs");
+      const path = require("path");
+
+      const absolutePath = path.resolve(process.cwd(), file);
+      if (!fs.existsSync(absolutePath)) {
+        throw new Error(`File not found: ${file}`);
+      }
+
+      const fileName = path.basename(absolutePath);
+      const fileExt = path.extname(absolutePath).toLowerCase();
+
+      // Text-based extensions only
+      const textExtensions = [".js", ".ts", ".tsx", ".jsx", ".py", ".java", ".c", ".cpp", ".h", ".hpp", ".go", ".rs", ".rb", ".php", ".html", ".htm", ".css", ".scss", ".less", ".json", ".md", ".txt", ".sh", ".bash", ".zsh", ".yaml", ".yml", ".xml", ".sql", ".gitignore", ".env", ".toml", ".ini", ".cfg", ".conf", ".log", ".csv", ".tsv"];
+
+      if (!textExtensions.includes(fileExt)) {
+        throw new Error(`Unsupported file type: ${fileExt}. Only text files are supported.`);
+      }
+
+      const fileContent = fs.readFileSync(absolutePath, "utf-8");
+      prompt = `File: ${fileName}\n\n\`\`\`\n${fileContent}\n\`\`\`\n\n---\n\n${prompt}`;
+      log(`Attached file: ${fileName} (${fileContent.length} chars)`);
     }
     await typePrompt(cdp, inputCdp, prompt);
     log("Prompt typed");

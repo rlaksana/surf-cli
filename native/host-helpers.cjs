@@ -1020,14 +1020,34 @@ function mapToolToMessage(tool, args, tabId) {
       return { type: "HISTORY_SEARCH", query: a.query, limit: a.limit !== undefined ? parseInt(a.limit, 10) : 20 };
     case "chatgpt":
       if (!a.query) throw new Error("query required");
-      return { 
-        type: "CHATGPT_QUERY", 
-        query: a.query, 
+      return {
+        type: "CHATGPT_QUERY",
+        query: a.query,
         model: a.model,
         withPage: a["with-page"],
         file: a.file,
         timeout: a.timeout ? parseInt(a.timeout, 10) * 1000 : 2700000,
-        ...baseMsg 
+        ...baseMsg
+      };
+    case "claude":
+      if (!a.query) throw new Error("query required");
+      return {
+        type: "CLAUDE_QUERY",
+        query: a.query,
+        model: a.model,
+        withPage: a["with-page"],
+        timeout: a.timeout ? parseInt(a.timeout, 10) * 1000 : 300000,
+        ...baseMsg
+      };
+    case "aimode":
+      if (!a.query) throw new Error("query required");
+      return {
+        type: "AIMODE_QUERY",
+        query: a.query,
+        withPage: a["with-page"],
+        pro: a.pro === true,
+        timeout: a.timeout ? parseInt(a.timeout, 10) * 1000 : 120000,
+        ...baseMsg
       };
     case "gemini":
       if (!a.query && !a["generate-image"]) throw new Error("query required");

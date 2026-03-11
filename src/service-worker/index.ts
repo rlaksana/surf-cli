@@ -2672,6 +2672,58 @@ export async function handleMessage(
       return result;
     }
 
+    case "CLAUDE_NEW_TAB": {
+      const tab = await chrome.tabs.create({
+        url: "https://claude.ai/",
+        active: true,
+      });
+      if (!tab.id) throw new Error("Failed to create tab");
+      const currentTab = await chrome.tabs.get(tab.id);
+      if (currentTab.status !== "complete") {
+        await new Promise<void>((resolve) => {
+          const listener = (tabId: number, info: chrome.tabs.TabChangeInfo) => {
+            if (tabId === tab.id && info.status === "complete") {
+              chrome.tabs.onUpdated.removeListener(listener);
+              resolve();
+            }
+          };
+          chrome.tabs.onUpdated.addListener(listener);
+          setTimeout(() => {
+            chrome.tabs.onUpdated.removeListener(listener);
+            resolve();
+          }, 30000);
+        });
+      }
+      await cdp.attach(tab.id);
+      // Wait for JS runtime to be ready after CDP attach
+      await waitForRuntimeReady(tab.id, 10000);
+      return { tabId: tab.id };
+    }
+
+    case "CLAUDE_CLOSE_TAB": {
+      const claudeTabId = message.tabId;
+      if (claudeTabId) {
+        try {
+          await cdp.detach(claudeTabId);
+        } catch {}
+        try {
+          await chrome.tabs.remove(claudeTabId);
+        } catch {}
+      }
+      return { success: true };
+    }
+
+    case "CLAUDE_CDP_COMMAND": {
+      const { method, params } = message;
+      const result = await cdp.sendCommand(message.tabId, method, params || {});
+      return result;
+    }
+
+    case "CLAUDE_EVALUATE": {
+      const result = await cdp.evaluateScript(message.tabId, message.expression);
+      return result;
+    }
+
     case "PERPLEXITY_NEW_TAB": {
       const tab = await chrome.tabs.create({
         url: "https://www.perplexity.ai/",
@@ -2972,6 +3024,53 @@ export async function handleMessage(
       return await cdp.evaluateScript(message.tabId, message.expression);
     }
 
+    case "AIMODE_NEW_TAB": {
+      const url = message.pro
+        ? "https://www.google.com/search?nem=143&q="
+        : "https://www.google.com/search?udm=50&q=";
+      const tab = await chrome.tabs.create({
+        url: url,
+        active: true,
+      });
+      if (!tab.id) throw new Error("Failed to create tab");
+      const currentTab = await chrome.tabs.get(tab.id);
+      if (currentTab.status !== "complete") {
+        await new Promise<void>((resolve) => {
+          const listener = (tabId: number, info: chrome.tabs.TabChangeInfo) => {
+            if (tabId === tab.id && info.status === "complete") {
+              chrome.tabs.onUpdated.removeListener(listener);
+              resolve();
+            }
+          };
+          chrome.tabs.onUpdated.addListener(listener);
+          setTimeout(() => {
+            chrome.tabs.onUpdated.removeListener(listener);
+            resolve();
+          }, 30000);
+        });
+      }
+      await cdp.attach(tab.id);
+      await waitForRuntimeReady(tab.id, 10000);
+      return { tabId: tab.id };
+    }
+
+    case "AIMODE_CLOSE_TAB": {
+      if (message.tabId) {
+        await cdp.detach(message.tabId);
+        await chrome.tabs.remove(message.tabId);
+      }
+      return { success: true };
+    }
+
+    case "AIMODE_CDP_COMMAND": {
+      const { method, params } = message;
+      return await cdp.sendCommand(message.tabId, method, params || {});
+    }
+
+    case "AIMODE_EVALUATE": {
+      return await cdp.evaluateScript(message.tabId, message.expression);
+    }
+
     case "DOWNLOADS_SEARCH": {
       const results = await chrome.downloads.search(message.searchParams || {});
       return {
@@ -3017,6 +3116,12 @@ export async function handleMessage(
       }
       
       return { cookies: Array.from(seen.values()) };
+    }
+
+    case "GET_CLAUDE_COOKIES": {
+      const cookies = await chrome.cookies.getAll({ domain: ".claude.ai" });
+      const anthropicCookies = await chrome.cookies.getAll({ domain: ".anthropic.com" });
+      return { cookies: [...cookies, ...anthropicCookies] };
     }
 
     case "WINDOW_NEW": {
@@ -3131,6 +3236,8 @@ const COMMANDS_WITHOUT_TAB = new Set([
   "DELETE_BOOKMARK", "DIALOG_DISMISS", "DIALOG_ACCEPT", "DIALOG_INFO",
   "CHATGPT_NEW_TAB", "CHATGPT_CLOSE_TAB", "CHATGPT_EVALUATE", "CHATGPT_CDP_COMMAND",
   "GET_CHATGPT_COOKIES", "GET_GOOGLE_COOKIES", "GET_TWITTER_COOKIES",
+  "CLAUDE_NEW_TAB", "CLAUDE_CLOSE_TAB", "CLAUDE_EVALUATE", "CLAUDE_CDP_COMMAND",
+  "GET_CLAUDE_COOKIES",
   "PERPLEXITY_NEW_TAB", "PERPLEXITY_CLOSE_TAB", "PERPLEXITY_EVALUATE", "PERPLEXITY_CDP_COMMAND",
   "GROK_NEW_TAB", "GROK_CLOSE_TAB", "GROK_EVALUATE", "GROK_CDP_COMMAND",
   "GEMINI_NEW_TAB", "GEMINI_CLOSE_TAB", "GEMINI_FETCH_URL", "UPLOAD_FILE_TO_TAB",
