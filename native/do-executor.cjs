@@ -105,9 +105,9 @@ function sendDoRequest(toolName, toolArgs, context = {}) {
     
     sock.on("error", (e) => {
       if (e.code === "ENOENT") {
-        reject(new Error("Socket not found. Is Chrome running with the extension?"));
+        reject(new Error("Socket not found.\nSURF_NOT_RUNNING: Is Chrome running with the surf extension? Run: surf tab.new"));
       } else if (e.code === "ECONNREFUSED") {
-        reject(new Error("Connection refused. Native host not running."));
+        reject(new Error('Connection refused. Native host not running.\nSURF_NOT_RUNNING: Try running \'surf tab.new\' to start surf.'));
       } else {
         reject(e);
       }
@@ -115,7 +115,7 @@ function sendDoRequest(toolName, toolArgs, context = {}) {
     
     const timeoutId = setTimeout(() => { 
       sock.destroy(); 
-      reject(new Error("Request timeout")); 
+      reject(new Error("Request timeout.\nSURF_TIMEOUT: Chrome windows may be stuck. Try closing Chrome windows manually and retry.\nIf problem persists, run: taskkill /F /IM chrome.exe")); 
     }, 30000);
     
     sock.on("close", () => clearTimeout(timeoutId));

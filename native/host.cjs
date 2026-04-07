@@ -21,6 +21,27 @@ const SURF_TMP = IS_WIN ? path.join(os.tmpdir(), "surf") : "/tmp";
 const SOCKET_PATH = IS_WIN ? "//./pipe/surf" : "/tmp/surf.sock";
 if (IS_WIN) { try { fs.mkdirSync(SURF_TMP, { recursive: true }); } catch {} }
 
+// Surf-specific error codes with actionable hints
+const SURF_ERRORS = {
+  SURF_TIMEOUT: {
+    code: "SURF_TIMEOUT",
+    message: "Surf command timed out.",
+    hint: "Chrome windows may be stuck. Try closing Chrome windows manually and retry. If problem persists, run: taskkill /F /IM chrome.exe"
+  },
+  SURF_ZOMBIE_DETECTED: {
+    code: "SURF_ZOMBIE_DETECTED",
+    message: "Zombie Chrome windows detected.",
+    hint: "Force closing zombie processes..."
+  },
+  SURF_NOT_RUNNING: {
+    code: "SURF_NOT_RUNNING",
+    message: "Surf is not running or socket is not available.",
+    hint: "Is Chrome running with the surf extension? Run: surf tab.new"
+  }
+};
+
+
+
 // Cross-platform image resize (macOS: sips, Linux: ImageMagick)
 function resizeImage(filePath, maxSize) {
   const platform = process.platform;
@@ -1771,7 +1792,8 @@ process.stdin.on("end", () => {
     try {
       socket.write(JSON.stringify({ 
         type: "extension_disconnected",
-        message: "Surf extension was reloaded. Restart your command."
+        code: SURF_ERRORS.SURF_NOT_RUNNING.code,
+        message: `${SURF_ERRORS.SURF_NOT_RUNNING.message} ${SURF_ERRORS.SURF_NOT_RUNNING.hint}`
       }) + "\n");
       socket.end();
     } catch (e) {
@@ -1906,6 +1928,15 @@ server.listen(SOCKET_PATH, () => {
 
 server.on("error", (err) => {
   log(`Server error: ${err.message}`);
+  if (err.code === "EADDRINUSE") {
+    console.error(`Error: Socket ${SOCKET_PATH} is already in use.`);
+    console.error("Another surf instance may be running. Try: taskkill /F /IM chrome.exe");
+  } else if (err.code === "EACCES") {
+    console.error(`Error: Permission denied for socket ${SOCKET_PATH}.`);
+    console.error("Try checking socket permissions or running with elevated privileges.");
+  } else {
+    console.error(`Error: ${err.message}`);
+  }
 });
 
 process.on("SIGTERM", () => {
