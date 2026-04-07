@@ -21,6 +21,21 @@ const STARTER_CONFIG = {
   }
 };
 
+const COUNCIL_CONFIG = {
+  defaultProviders: ['chatgpt', 'gemini', 'aimode'],
+  timeouts: {
+    chatgpt: 300000,   // 5 min
+    gemini: 180000,    // 3 min
+    aimode: 120000     // 2 min
+  },
+  overallTimeout: 480000,  // 8 min
+  zombieRecovery: {
+    enabled: true,
+    maxRetries: 2,
+    cleanupTimeout: 30000
+  }
+};
+
 // Grok models can be customized in surf.json if X.com UI changes:
 // {
 //   "grok": {
@@ -99,4 +114,5 @@ module.exports = {
   createStarterConfig,
   clearCache,
   STARTER_CONFIG,
+  COUNCIL_CONFIG,
 };
