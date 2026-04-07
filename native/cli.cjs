@@ -2975,9 +2975,15 @@ socket.on("data", (data) => {
 socket.on("error", (err) => {
   clearTimeout(timeout);
   if (err.code === "ENOENT") {
-    console.error("Error: Socket not found. Is Chrome running with the extension?");
+    console.error("Error: Socket not found.");
+    console.error("SURF_NOT_RUNNING: Is Chrome running with the surf extension? Run: surf tab.new");
   } else if (err.code === "ECONNREFUSED") {
     console.error("Error: Connection refused. Native host not running.");
+    console.error("SURF_NOT_RUNNING: Try running 'surf tab.new' to start surf.");
+  } else if (err.code === "ETIMEDOUT" || err.message.includes("timeout")) {
+    console.error("Error: Connection timed out.");
+    console.error("SURF_TIMEOUT: Chrome windows may be stuck. Try closing Chrome windows manually and retry.");
+    console.error("If problem persists, run: taskkill /F /IM chrome.exe");
   } else {
     console.error("Error:", err.message);
   }

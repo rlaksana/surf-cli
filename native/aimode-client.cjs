@@ -363,7 +363,9 @@ async function query(options) {
       tookMs: Date.now() - startTime,
     };
   } finally {
-    await closeTab(tabId).catch(() => {});
+    if (tabId) {
+      await closeTab(tabId).catch(e => console.error('[aimode] Tab cleanup error:', e.message));
+    }
   }
 }
 
