@@ -38,10 +38,26 @@ npm run uninstall:native # Uninstall native host
 
 ```
 native/                    # Compiled CLI and native host (TypeScript → CJS via Vite)
+  core/                    # Shared AI client infrastructure
+    strategy-contracts.cjs  # Typedef contracts: Verdict, SignalEnvelope, etc.
+    signal-normalizer.cjs    # CDP + Tampermonkey → SignalEnvelope
+    completion-engine.cjs     # 4-signal completion formula
+    client-runtime.cjs       # Lifecycle: init → poll → validate → destroy
+    cookie-validator.cjs     # Two-phase: sync check + HTTP ping with TTL cache
+    ttl-cache.cjs           # Sliding-expiration LRU cache
+    rate-limit-detector.cjs  # Priority: CDP 429 → TM 429 → text patterns
+    error-detector.cjs      # Priority: CDP 5xx → TM 5xx → text patterns
+  clients/                  # Per-AI-client implementations
+    chatgpt/               # config.cjs, strategy.cjs, selectors.cjs
+    claude/                 # CoT-aware (thinking blocks)
+    gemini/                 # Image gen/edit, YouTube analysis
+    grok/                  # X.com integration
+    perplexity/             # Research mode, zero cookie validation
+    aistudio/              # Google AI Studio, app building
+    aimode/                # AI mode (udm=50 / nem=143)
   cli.cjs                  # CLI entry point, argument parsing, socket communication
   host.cjs                 # Native host server, request handling, tool execution
   mcp-server.cjs           # Model Context Protocol server implementation
-  *-client.cjs             # AI clients (chatgpt, gemini, grok, perplexity, claude, aistudio)
   do-*.cjs                 # Workflow parsing and execution
   network-store.cjs        # Network request capture and storage
   protocol.cjs             # Protocol utilities
@@ -106,6 +122,29 @@ Tests use Vitest. Run a single test:
 npm run test -- native/tests/<filename>
 ```
 
+**Test file types:**
+- `test/**/*.test.ts` — Vitest tests (auto-included)
+- `native/**/*.test.cjs` — Standalone Node scripts (run with `node native/core/*.test.cjs`)
+- When adding new test file patterns, update `vitest.config.ts` `include` array
+
+**Running CJS test scripts:** `node native/core/<module>.test.cjs` (syntax check first: `node -c native/core/<module>.cjs`)
+
+## Biome / Linting
+
+- `biome.json` `files.includes` must be manually updated for new source directories (e.g. `native/core/`, `native/clients/`)
+- `biome-ignore` format: place `// biome-ignore <rule>` on the **line before** the issue (not inline, not `-line` suffix)
+- `noVoid` is enabled — never use `void expr` to suppress unused variable warnings
+- `noNestedPromises` — avoid `.then()` inside `.then()` callbacks; flatten chains
+- Empty `catch {}` blocks require a comment: `catch { /* reason */ }`
+- `noExcessiveCognitiveComplexity` is a **warning** only — does not fail the build
+- CRLF→LF git warnings on Windows are harmless (line-ending normalization)
+
+**Fix-and-check workflow:**
+```bash
+npx biome check --write native/core/ native/clients/   # auto-fix new sprint files
+npm run lint                                            # verify (warnings OK, errors not)
+```
+
 ## CLI Aliases
 
 | Alias | Command |
@@ -150,10 +189,10 @@ npm run test -- native/tests/<filename>
 - Find selectors with: `surf js "document.querySelector('...').outerHTML"`
 - Use `surf page.read` to see accessibility tree with element refs
 
-## Surf Claude Fix History
-
-- Selectors: `textarea[placeholder*="How can I help you"]`, `button[aria-label="Send message"]`, `.font-claude-response-body`
+## Key Fixes (see `git log` for details)
+- ChatGPT selectors: `textarea[placeholder*="How can I help you"]`, `button[aria-label="Send message"]`
 - Cookie check: accepts `sessionKey`, `anthropic-device-id`, or `ARID` cookies
+- Completion algorithm: hybrid signal-based (isSemanticComplete + isInteractionReady + isTransportIdle)
 
 ## Extension Structure (dist/)
 

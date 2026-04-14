@@ -2630,6 +2630,7 @@ export async function handleMessage(
       const window = await chrome.windows.create({
         url: "https://chatgpt.com/",
         focused: false,
+        state: "minimized",
         type: "normal",
       });
       if (!window?.id) throw new Error("Failed to create window");
@@ -2685,6 +2686,7 @@ export async function handleMessage(
       const window = await chrome.windows.create({
         url: "https://claude.ai/",
         focused: false,
+        state: "minimized",
         type: "normal",
       });
       if (!window?.id) throw new Error("Failed to create window");
@@ -2740,6 +2742,7 @@ export async function handleMessage(
       const window = await chrome.windows.create({
         url: "https://www.perplexity.ai/",
         focused: false,
+        state: "minimized",
         type: "normal",
       });
       if (!window?.id) throw new Error("Failed to create window");
@@ -2828,6 +2831,7 @@ export async function handleMessage(
       const window = await chrome.windows.create({
         url: "https://x.com/i/grok",
         focused: false,
+        state: "minimized",
         type: "normal",
       });
       if (!window?.id) throw new Error("Failed to create window");
@@ -2883,6 +2887,7 @@ export async function handleMessage(
       const window = await chrome.windows.create({
         url: "https://gemini.google.com/app",
         focused: false,
+        state: "minimized",
         type: "normal",
       });
       if (!window?.id) throw new Error("Failed to create window");
@@ -3009,6 +3014,7 @@ export async function handleMessage(
       const window = await chrome.windows.create({
         url: url,
         focused: false,
+        state: "minimized",
         type: "normal",
       });
       if (!window?.id) throw new Error("Failed to create window");
@@ -3060,6 +3066,7 @@ export async function handleMessage(
           ? "https://www.google.com/search?nem=143&q="
           : "https://www.google.com/search?udm=50&q=",
         focused: false,
+        state: "minimized",
         type: "normal",
       });
       if (!window?.id) throw new Error("Failed to create window");
@@ -3159,38 +3166,40 @@ export async function handleMessage(
     case "WINDOW_NEW": {
       // Default to a usable blank page if no URL provided
       const url = message.url || 'data:text/html,<html><head><title>Surf Agent</title></head><body style="font-family:system-ui;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;color:%23666"><div style="text-align:center"><h2>Agent Window</h2><p>Ready for automation</p></div></body></html>';
-      
+
+      // Create window minimized to avoid focus steal
       const createOptions: chrome.windows.CreateData = {
-        focused: message.focused !== false,
+        focused: false,
+        state: "minimized",
         type: "normal",
         url,
       };
-      
+
       if (message.width && message.height) {
         createOptions.width = message.width;
         createOptions.height = message.height;
       }
-      
+
       if (message.incognito) {
         createOptions.incognito = true;
       }
-      
+
       const window = await chrome.windows.create(createOptions);
-      
+
       if (!window?.id) throw new Error("Failed to create window");
-      
+
       // Get the tab that was created with the window
       const tabs = await chrome.tabs.query({ windowId: window.id });
       const firstTab = tabs[0];
-      
+
       // Wait for tab to be ready
       if (firstTab?.id) {
         await new Promise(r => setTimeout(r, 150));
       }
-      
-      return { 
-        success: true, 
-        windowId: window.id, 
+
+      return {
+        success: true,
+        windowId: window.id,
         tabId: firstTab?.id,
         hint: `Use --window-id ${window.id} to target this window`,
       };

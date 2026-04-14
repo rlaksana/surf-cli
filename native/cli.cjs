@@ -1733,72 +1733,141 @@ const SEE_ALSO = {
   network: ["console", "network.get"],
 };
 
-const showBasicHelp = () => {};
+const showBasicHelp = () => {
+  console.log(`surf v${VERSION} - Browser automation CLI
+
+Usage: surf <command> [args] [options]
+
+Common Commands:
+  navigate <url>     Go to URL (alias: go)
+  click <ref>        Click element by ref or selector
+  type <text>        Type text at cursor or into element
+  screenshot         Capture screenshot (alias: snap)
+  page.read          Get page accessibility tree (alias: read)
+  locate.role <role> Find element by ARIA role
+  search <term>      Search for text in page (alias: find)
+  window.new <url>   Create isolated browser window
+  wait <seconds>     Wait N seconds
+
+Quick Examples:
+  surf go "https://example.com"
+  surf read
+  surf click e5
+  surf type "hello" --submit
+  surf locate.role button --name "Submit" --action click
+  surf read --depth 3 --compact
+  surf emulate.device "iPhone 14"
+  surf window.new "https://example.com" && surf --window-id 123 go "https://other.com"
+
+More Help:
+  surf --help-full           All commands
+  surf --help-topic <topic>  Topic guide (refs, semantic, frames, devices...)
+  surf <command> --help       Command details
+  surf --find <query>        Search for commands
+  surf --about <topic>       Learn about a topic
+`);
+};
 
 const showFullHelp = () => {
-  for (const [_groupName, group] of Object.entries(TOOLS)) {
+  console.log(`surf v${VERSION} - Browser automation CLI
+
+Usage: surf <command> [args] [options]
+
+`);
+  for (const [groupName, group] of Object.entries(TOOLS)) {
+    console.log(`${groupName.toUpperCase()} - ${group.desc}`);
     for (const [cmd, info] of Object.entries(group.commands)) {
       if (info.alias) {
         continue;
       }
       const argStr = info.args?.length ? `<${info.args.join("> <")}>` : "";
-      const _line = `  ${cmd} ${argStr}`.padEnd(32);
+      const line = `  ${cmd} ${argStr}`.padEnd(32);
+      console.log(`${line} ${info.desc}`);
+      if (info.alias) {
+        console.log(`  Alias: ${info.alias}`);
+      }
     }
+    console.log();
   }
 };
 
 const showHelpTopic = (topic) => {
   const t = HELP_TOPICS[topic];
   if (!t) {
+    console.error(`Unknown topic: ${topic}`);
+    console.error(`Available topics: ${Object.keys(HELP_TOPICS).join(", ")}`);
     process.exit(1);
   }
+  console.log(`\n${t.title}\n${"=".repeat(t.title.length)}\n\n${t.content}\n`);
 };
 
 const showGroupHelp = (groupName) => {
   const group = TOOLS[groupName];
   if (!group) {
+    console.error(`Unknown group: ${groupName}`);
+    console.error(`Available groups: ${Object.keys(TOOLS).join(", ")}`);
     process.exit(1);
   }
-  for (const [_cmd, info] of Object.entries(group.commands)) {
+  console.log(`\n${groupName} - ${group.desc}\n`);
+  for (const [cmd, info] of Object.entries(group.commands)) {
     if (info.alias) {
+      console.log(`  ${cmd} -> ${info.alias}\n`);
       continue;
     }
-    const _argStr = info.args?.length ? `<${info.args.join("> <")}>` : "";
+    const argStr = info.args?.length ? `<${info.args.join("> <")}>` : "";
+    console.log(`  ${cmd} ${argStr}`);
+    console.log(`      ${info.desc}`);
     if (info.opts) {
-      for (const [_opt, _desc] of Object.entries(info.opts)) {
+      console.log("      Options:");
+      for (const [opt, desc] of Object.entries(info.opts)) {
+        console.log(`        --${opt.padEnd(18)} ${desc}`);
       }
     }
     if (info.examples?.length) {
-      for (const _ex of info.examples) {
+      console.log("      Examples:");
+      for (const ex of info.examples) {
+        console.log(`        surf ${ex.cmd.padEnd(40)} ${ex.desc}`);
       }
     }
+    console.log();
   }
 };
 
 const showToolHelp = (toolName) => {
-  for (const [_groupName, group] of Object.entries(TOOLS)) {
+  for (const [groupName, group] of Object.entries(TOOLS)) {
     const info = group.commands[toolName];
     if (info) {
       if (info.alias) {
         showToolHelp(info.alias);
         return;
       }
-      const _argStr = info.args?.length ? `<${info.args.join("> <")}>` : "";
+      const argStr = info.args?.length ? `<${info.args.join("> <")}>` : "";
+      console.log(`\n${toolName} - ${info.desc}\n`);
+      console.log(`Usage: surf ${toolName} ${argStr}\n`);
       if (info.args?.length) {
-        for (const _arg of info.args) {
+        console.log("Arguments:");
+        for (const arg of info.args) {
+          console.log(`  <${arg}>`);
         }
+        console.log();
       }
       if (info.opts) {
-        for (const [_opt, _desc] of Object.entries(info.opts)) {
+        console.log("Options:");
+        for (const [opt, desc] of Object.entries(info.opts)) {
+          console.log(`  --${opt.padEnd(18)} ${desc}`);
         }
+        console.log();
       }
       if (info.examples?.length) {
-        for (const _ex of info.examples) {
+        console.log("Examples:");
+        for (const ex of info.examples) {
+          console.log(`  surf ${ex.cmd.padEnd(40)} ${ex.desc}`);
         }
+        console.log();
       }
-      // Show related commands
       const related = SEE_ALSO[toolName];
       if (related && related.length > 0) {
+        console.log(`See also: ${related.join(", ")}`);
       }
       return;
     }
@@ -1807,9 +1876,13 @@ const showToolHelp = (toolName) => {
     // Show related commands for socket tools too
     const related = SEE_ALSO[toolName];
     if (related && related.length > 0) {
+      console.log(`\n  ${toolName}\n`);
+      console.log("  Socket API tool. Use --json to see response format.\n");
+      console.log(`See also: ${related.join(", ")}`);
     }
     return;
   }
+  console.error(`Unknown command: ${toolName}`);
   process.exit(1);
 };
 
@@ -1836,9 +1909,12 @@ const fuzzyFind = (query) => {
 const showFindResults = (query) => {
   const results = fuzzyFind(query);
   if (results.length === 0) {
+    console.log(`No commands found for: "${query}"`);
     return;
   }
-  for (const _r of results.slice(0, 10)) {
+  console.log(`\nSearch results for "${query}":\n`);
+  for (const r of results.slice(0, 10)) {
+    console.log(`  ${r.cmd.padEnd(20)} ${r.desc} [${r.group}]`);
   }
 };
 
@@ -1863,10 +1939,11 @@ const showAllTools = () => {
   const cols = 4;
   const width = 22;
   for (let i = 0; i < sorted.length; i += cols) {
-    const _row = sorted
+    const row = sorted
       .slice(i, i + cols)
       .map((t) => t.padEnd(width))
       .join("");
+    console.log(row);
   }
 };
 
@@ -1886,6 +1963,7 @@ if (args[0] === "--help-topic" && args[1]) {
 }
 
 if (args[0] === "--version" || args[0] === "-v") {
+  console.log(`surf v${VERSION}`);
   process.exit(0);
 }
 
@@ -2488,6 +2566,7 @@ const BOOLEAN_FLAGS = [
   "no-save",
   "no-auto-wait",
   "pro",
+  "unfocused",
 ];
 
 const AUTO_SCREENSHOT_TOOLS = [
@@ -2897,7 +2976,9 @@ if (streamMode && (tool === "console" || tool === "network")) {
 
   sock.on("error", (e) => {
     if (e.code === "ENOENT") {
+      console.error("Error: Socket not found. Is Chrome running with the surf extension?");
     } else {
+      console.error("Error:", e.message);
     }
     process.exit(1);
   });
@@ -3058,9 +3139,16 @@ socket.on("data", (data) => {
 socket.on("error", (err) => {
   clearTimeout(timeout);
   if (err.code === "ENOENT") {
+    console.error("Error: Socket not found. Is Chrome running with the surf extension?");
+    console.error("Hint: Run 'surf tab.new' or start the host with: node native/host.cjs");
   } else if (err.code === "ECONNREFUSED") {
+    console.error("Error: Connection refused. Native host not running.");
+    console.error("Hint: Start the host with: node native/host.cjs");
   } else if (err.code === "ETIMEDOUT" || err.message.includes("timeout")) {
+    console.error("Error: Connection timed out. Chrome windows may be stuck.");
+    console.error("Hint: Close Chrome manually or run: taskkill /F /IM chrome.exe");
   } else {
+    console.error("Error:", err.message);
   }
   process.exit(1);
 });
@@ -3073,11 +3161,13 @@ async function handleResponse(response) {
   clearTimeout(timeout);
 
   if (response.error) {
-    const _errContent = response.error.content?.[0]?.text || JSON.stringify(response.error);
+    const errContent = response.error.content?.[0]?.text || JSON.stringify(response.error);
     if (softFail) {
+      console.warn("Warning:", errContent);
       socket.end();
       process.exit(0);
     }
+    console.error("Error:", errContent);
 
     if (autoCapture) {
       await performAutoCapture();
@@ -3101,6 +3191,7 @@ async function handleResponse(response) {
   }
 
   if (wantJson) {
+    console.log(JSON.stringify(data ?? null, null, 2));
     socket.end();
     process.exit(0);
   }
@@ -3117,22 +3208,30 @@ async function handleResponse(response) {
     if (!skipResize && (origWidth > maxSize || origHeight > maxSize)) {
       const result = resizeImage(saveTo, maxSize);
       if (result.success) {
+        console.log(`Saved to ${saveTo} (${result.width}x${result.height}, resized from ${origWidth}x${origHeight})`);
       } else {
+        console.log(`Saved to ${saveTo} (${origWidth}x${origHeight}, resize failed: ${result.error})`);
       }
     } else {
+      console.log(`Saved to ${saveTo} (${origWidth}x${origHeight})`);
     }
   } else if (tool === "screenshot" && data?.message) {
+    console.log(data.message);
     if (data.screenshotId) {
+      console.log(`[Screenshot ID: ${data.screenshotId}]`);
     }
   } else if (tool === "tab.list") {
     const tabs = data?.tabs || data || [];
     if (Array.isArray(tabs)) {
       if (tabs.length === 0) {
         if (globalOpts.windowId) {
+          console.log(`No tabs in window ${globalOpts.windowId}. Window may not exist - use 'surf window.list' to verify.`);
         } else {
+          console.log("No tabs. Use 'surf tab.new' or 'surf tab.new <url>' to open a new tab.");
         }
       } else {
         for (const _t of tabs) {
+          console.log(`[${_t.id}] ${_t.url || "(empty)"} ${_t.title ? `- ${_t.title}` : ""}`);
         }
       }
     } else {
@@ -3141,35 +3240,59 @@ async function handleResponse(response) {
     const named = data?.tabs || data?.namedTabs || data || [];
     if (Array.isArray(named)) {
       if (named.length === 0) {
+        console.log("No named tabs.");
       } else {
         for (const _t of named) {
+          console.log(`${_t.name}: [${_t.id}] ${_t.url || "(empty)"}`);
         }
       }
     } else {
+      console.log(JSON.stringify(data, null, 2));
     }
   } else if (tool === "ai" && data?.aiResult) {
     if (data.mode === "find") {
+      // find mode output handled separately
     } else {
+      process.stdout.write(data.aiResult);
     }
   } else if (tool === "page.read" && data?.pageContent) {
+    console.log(data.pageContent);
   } else if (tool === "page.text" && data?.text) {
+    console.log(data.text);
   } else if (tool === "emulate.device" && data?.devices) {
     const devices = data.devices;
     for (const _d of devices) {
+      console.log(`${_d.name} (${_d.width}x${_d.height})`);
     }
   } else if (tool === "js") {
     if (data?.result !== undefined) {
-      const _val = data.result.value ?? data.result;
+      const val = data.result.value ?? data.result;
+      console.log(JSON.stringify(val, null, 2));
     } else {
+      console.log("OK");
     }
   } else if (tool === "health") {
     if (data?.success) {
       const _timeStr = data.time ? ` (${data.time}ms)` : "";
       if (data.status) {
+        console.log(`OK - ${data.status}${_timeStr}`);
       } else if (data.found) {
+        console.log(`Found surf extension${_timeStr}`);
       } else {
+        console.log(`Health check passed${_timeStr}`);
       }
+    } else if (data?.error) {
+      console.error(`Error: ${data.error}`);
     } else {
+      console.log("OK");
+    }
+  } else if (tool === "window.list" && data?.windows) {
+    if (data.windows.length === 0) {
+      console.log("No windows. Use 'surf window.new' to create one.");
+    } else {
+      for (const w of data.windows) {
+        console.log(`[${w.id}] ${w.title || "(untitled)"} - ${w.tabs?.length || 0} tabs`);
+      }
     }
   } else if (tool === "smoke" && data?.results) {
     const results = data.results;
@@ -3179,24 +3302,34 @@ async function handleResponse(response) {
       const _status = r.status === "pass" ? "PASS" : "FAIL";
       const _timeStr = r.time ? ` (${r.time}ms)` : "";
       const _ssStr = r.screenshot ? ` [${r.screenshot}]` : "";
+      console.log(`[${_status}] ${r.url}${_timeStr}${_ssStr}`);
       if (r.errors && r.errors.length > 0) {
         for (const _err of r.errors) {
+          console.log(`  - ${_err}`);
         }
       }
     }
+
+    console.log("");
+    console.log(`Summary: ${summary.pass} passed, ${summary.fail} failed, ${summary.total} total`);
 
     if (summary.fail > 0) {
       socket.end();
       process.exit(1);
     }
   } else if (tool === "zoom" && data?.zoom !== undefined) {
+    console.log(`Zoom: ${Math.round(data.zoom * 100)}%`);
   } else if (tool === "back" || tool === "forward") {
+    console.log("OK");
   } else if (tool === "network" && (data?.entries || data?.requests)) {
     // Network list - handle both new (entries) and old (requests) formats
     const items = data.entries || data.requests || [];
 
     if (items.length === 0) {
+      console.log("No network requests captured");
     } else if (data._format === "raw") {
+      // Raw JSON output - print entries array directly
+      console.log(JSON.stringify(items, null, 2));
     } else {
       // Simple compact format for now
       for (const req of items) {
@@ -3204,90 +3337,104 @@ async function handleResponse(response) {
         const _method = (req.method || "GET").padEnd(6);
         const _type = (req.type || "").padEnd(10);
         const _url = req.url || "";
+        console.log(`${_status} ${_method} ${_type} ${_url}`);
       }
     }
   } else if (tool === "network.get" && data?.entry) {
+    console.log(data.entry.url || data.entry);
   } else if (tool === "network.body" && data?.body !== undefined) {
     // Raw body for piping
     process.stdout.write(data.body);
   } else if (tool === "network.curl" && data?.curl) {
+    console.log(data.curl);
   } else if (tool === "network.curl" && data?.entry) {
+    console.log(data.entry.url || data.entry);
   } else if (tool === "network.origins" && data?.origins) {
+    for (const o of data.origins) {
+      console.log(o);
+    }
   } else if (tool === "network.stats" && data?.stats) {
+    console.log(JSON.stringify(data.stats, null, 2));
   } else if (tool === "network.clear" && data?.cleared !== undefined) {
+    console.log(`Cleared ${data.cleared} requests`);
   } else if (tool === "network.export" && data?.path) {
+    console.log(`Exported to: ${data.path}`);
   } else if (tool === "network.path" && data?.paths) {
-    for (const [_key, _val] of Object.entries(data.paths)) {
+    for (const [key, val] of Object.entries(data.paths)) {
+      console.log(`${key}: ${val}`);
     }
   } else if ((tool === "chatgpt" || tool === "gemini") && data?.response) {
+    console.log(data.response);
     if (data.imagePath) {
+      console.log(`\nImage saved: ${data.imagePath}`);
     }
+    console.error(`\n[${data.model || "unknown"} | ${((data.tookMs || 0) / 1000).toFixed(1)}s]`);
   } else if (tool === "aistudio" && data?.response) {
+    console.log(data.response);
+
     const meta = [];
-    if (data.model) {
-      meta.push(data.model);
-    }
-    if (data.thinkingTime) {
-      meta.push(`thought ${data.thinkingTime}s`);
-    }
-    if (Number.isFinite(data.tookMs)) {
-      meta.push(`${(data.tookMs / 1000).toFixed(1)}s`);
-    }
+    if (data.model) meta.push(data.model);
+    if (data.thinkingTime) meta.push(`thought ${data.thinkingTime}s`);
+    if (Number.isFinite(data.tookMs)) meta.push(`${(data.tookMs / 1000).toFixed(1)}s`);
     if (meta.length > 0) {
+      console.error(`\n[${meta.join(" | ")}]`);
     }
   } else if (tool === "aistudio.build" && data?.zipPath) {
+    console.error(`Downloaded: ${data.zipPath}`);
     if (data.extractedPath) {
+      console.error(`Extracted: ${data.extractedPath}`);
+      console.error("");
     }
 
     const meta = [];
-    if (data.model) {
-      meta.push(data.model);
-    }
-    if (Number.isFinite(data.buildDuration)) {
-      meta.push(`built ${data.buildDuration}s`);
-    }
-    if (Number.isFinite(data.tookMs)) {
-      meta.push(`${(data.tookMs / 1000).toFixed(1)}s total`);
-    }
+    if (data.model) meta.push(data.model);
+    if (Number.isFinite(data.buildDuration)) meta.push(`built ${data.buildDuration}s`);
+    if (Number.isFinite(data.tookMs)) meta.push(`${(data.tookMs / 1000).toFixed(1)}s total`);
     if (meta.length > 0) {
+      console.error(`[${meta.join(" | ")}]`);
     }
   } else if (tool === "perplexity" && data?.response) {
+    console.log(data.response);
     const meta = [];
-    if (data.sources) {
-      meta.push(`${data.sources} sources`);
-    }
-    if (data.mode) {
-      meta.push(data.mode);
-    }
-    if (data.model && data.model !== "default") {
-      meta.push(data.model);
-    }
+    if (data.sources) meta.push(`${data.sources} sources`);
+    if (data.mode) meta.push(data.mode);
+    if (data.model && data.model !== "default") meta.push(data.model);
     meta.push(`${((data.tookMs || 0) / 1000).toFixed(1)}s`);
-    if (data.url) {
-    }
+    console.error(`\n[${meta.join(" | ")}]`);
+    if (data.url) console.error(`URL: ${data.url}`);
   } else if (tool === "aimode" && data?.response) {
+    console.log(data.response);
     const meta = [];
+    if (data.model) meta.push(data.model);
     meta.push(`${((data.tookMs || 0) / 1000).toFixed(1)}s`);
-    if (data.url) {
+    if (meta.length > 0) {
+      console.error(`[${meta.join(" | ")}]`);
     }
   } else if (tool === "window.list" && data?.windows) {
     if (data.windows.length === 0) {
+      console.log("No windows.");
     } else {
       for (const w of data.windows) {
         const _focused = w.focused ? " [focused]" : "";
         const _state = w.state !== "normal" ? ` (${w.state})` : "";
+        console.log(`[${w.id}] ${w.title || "(untitled)"}${_focused}${_state}`);
         if (w.tabs) {
           for (const t of w.tabs) {
             const _active = t.active ? "*" : " ";
+            console.log(`  ${_active}[${t.id}] ${t.title || "(empty)"}`);
           }
         }
       }
       // Hint for agents
       if (data.windows.length > 0 && !globalOpts.windowId) {
+        console.log("\nTip: Set windowId to focus a specific window.");
       }
     }
   } else if (typeof data === "string") {
+    console.log(data);
   } else if (data?.success === true) {
+    const msg = data.message || "OK";
+    console.log(msg);
   } else if (data?.error) {
     if (softFail) {
       socket.end();
@@ -3299,6 +3446,8 @@ async function handleResponse(response) {
     socket.end();
     process.exit(1);
   } else {
+    // Fallback - just acknowledge
+    console.log("Done");
   }
 
   socket.end();
