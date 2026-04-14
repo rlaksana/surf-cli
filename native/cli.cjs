@@ -2932,7 +2932,11 @@ const socket = net.createConnection(SOCKET_PATH, () => {
 
 const AI_TOOLS = ["smoke", "chatgpt", "claude", "aimode", "gemini", "perplexity", "grok", "aistudio", "aistudio.build", "ai"];
 let requestTimeout = AI_TOOLS.includes(tool) ? 300000 : 30000;
-if (tool === "aistudio.build") {
+if (AI_TOOLS.includes(tool) && options.timeout) {
+  // Override default AI timeout with user-specified value (in seconds)
+  const userTimeoutSec = parseInt(options.timeout, 10);
+  requestTimeout = userTimeoutSec * 1000;
+} else if (tool === "aistudio.build") {
   const userTimeoutSec = parseInt(options.timeout || "600", 10);
   requestTimeout = (userTimeoutSec * 1000) + 60000;
 }
