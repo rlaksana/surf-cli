@@ -1158,7 +1158,7 @@ export class CDPController {
   private async send(tabId: number, method: string, params?: object): Promise<any> {
     await this.ensureAttached(tabId);
     const target = this.targets.get(tabId)!;
-    return chrome.debugger.sendCommand(target, method, params);
+    return chrome.debugger.sendCommand(target, method, params as { [key: string]: unknown } | undefined);
   }
 
   async sendCommand(tabId: number, method: string, params?: object): Promise<any> {

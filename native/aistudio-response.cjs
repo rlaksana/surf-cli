@@ -18,9 +18,10 @@ const {
 async function evaluate(cdp, expression) {
   const result = await cdp(expression);
   if (result.exceptionDetails) {
-    const desc = result.exceptionDetails.exception?.description ||
-                 result.exceptionDetails.text ||
-                 "Evaluation failed";
+    const desc =
+      result.exceptionDetails.exception?.description ||
+      result.exceptionDetails.text ||
+      "Evaluation failed";
     throw new Error(desc);
   }
   if (result.error) {
@@ -35,7 +36,7 @@ async function waitForGenerateResponseFromNetwork(params) {
     readNetworkEntries,
     timeoutMs = 300000,
     baselineEntryIds = new Set(),
-    prompt = '',
+    prompt = "",
     log = () => {},
   } = params;
 
@@ -67,12 +68,12 @@ async function waitForGenerateResponseFromNetwork(params) {
 
     for (const entry of freshEntries) {
       if (!doesGenerateEntryMatchPrompt(entry, prompt)) {
-        log(`Skipping GenerateContent entry ${entry?.id || 'unknown'} (prompt mismatch)`);
+        log(`Skipping GenerateContent entry ${entry?.id || "unknown"} (prompt mismatch)`);
         continue;
       }
 
       const status = Number(entry?.status || 0);
-      const body = typeof entry?.responseBody === 'string' ? entry.responseBody : '';
+      const body = typeof entry?.responseBody === "string" ? entry.responseBody : "";
 
       if (status >= 400) {
         const rpcError = parseAiStudioRpcError(body);
@@ -84,18 +85,20 @@ async function waitForGenerateResponseFromNetwork(params) {
         continue;
       }
 
-      let parsedText = '';
+      let parsedText = "";
       try {
         parsedText = parseAiStudioGenerateContentText(body);
       } catch (e) {
-        const requestId = entry.id || 'unknown';
+        const requestId = entry.id || "unknown";
         const parseErrorCount = (parseErrorCounts.get(requestId) || 0) + 1;
         parseErrorCounts.set(requestId, parseErrorCount);
 
         log(`GenerateContent parse error (${requestId} #${parseErrorCount}): ${e.message || e}`);
 
         if (parseErrorCount >= 3) {
-          throw new Error(`GenerateContent body for ${requestId} is not parseable; falling back to DOM`);
+          throw new Error(
+            `GenerateContent body for ${requestId} is not parseable; falling back to DOM`,
+          );
         }
 
         continue;
@@ -113,10 +116,10 @@ async function waitForGenerateResponseFromNetwork(params) {
     await delay(350);
   }
 
-  throw new Error('Timed out waiting for AI Studio GenerateContent network response');
+  throw new Error("Timed out waiting for AI Studio GenerateContent network response");
 }
 
-async function waitForResponse(cdp, timeoutMs = 300000, userPrompt = '', log = () => {}) {
+async function waitForResponse(cdp, timeoutMs = 300000, userPrompt = "", log = () => {}) {
   const deadline = Date.now() + timeoutMs;
 
   await delay(1000);
@@ -124,7 +127,9 @@ async function waitForResponse(cdp, timeoutMs = 300000, userPrompt = '', log = (
   let doneStreak = 0;
 
   while (Date.now() < deadline) {
-    const status = await evaluate(cdp, `(function() {
+    const status = await evaluate(
+      cdp,
+      `(function() {
       var buttons = Array.from(document.querySelectorAll('button'));
 
       var bodyText = (document.body && document.body.innerText ? document.body.innerText : '').toLowerCase();
@@ -153,17 +158,18 @@ async function waitForResponse(cdp, timeoutMs = 300000, userPrompt = '', log = (
         rateLimited: rateLimited,
         rateLimitMsg: rateLimitMsg
       };
-    })()`);
+    })()`,
+    );
 
-    if (status && status.rateLimited) {
+    if (status?.rateLimited) {
       const msg = status.rateLimitMsg || "You've reached your rate limit. Please try again later.";
       throw new Error(
         `AI Studio rate limited: ${msg} ` +
-        "(Tip: use `surf gemini` / another provider as a fallback.)"
+          "(Tip: use `surf gemini` / another provider as a fallback.)",
       );
     }
 
-    if (status && status.done) {
+    if (status?.done) {
       doneStreak++;
       if (doneStreak === 1) {
         log("Completion signal detected (waiting for stability...)");
@@ -272,8 +278,8 @@ async function waitForResponse(cdp, timeoutMs = 300000, userPrompt = '', log = (
     return { text: document.body.innerText || '', method: 'body-fallback' };
   })()`;
 
-  let bestText = '';
-  let bestRaw = '';
+  let bestText = "";
+  let bestRaw = "";
   let bestExtracted = null;
   let lastText = null;
   let stableCount = 0;
@@ -282,9 +288,7 @@ async function waitForResponse(cdp, timeoutMs = 300000, userPrompt = '', log = (
 
   while (Date.now() < extractDeadline) {
     const extracted = await evaluate(cdp, extractScript);
-    const responseTextRaw = extracted
-      ? String(extracted.text || '').trim()
-      : '';
+    const responseTextRaw = extracted ? String(extracted.text || "").trim() : "";
     const responseText = cleanAiStudioResponse(responseTextRaw, userPrompt);
 
     if (responseText.length > bestText.length) {
@@ -297,9 +301,12 @@ async function waitForResponse(cdp, timeoutMs = 300000, userPrompt = '', log = (
       stableCount++;
       if (stableCount >= 2) {
         log(
-          'Extraction stabilized: method=' + (extracted ? extracted.method : 'none') +
-          ', raw length=' + responseTextRaw.length +
-          ', cleaned length=' + responseText.length
+          "Extraction stabilized: method=" +
+            (extracted ? extracted.method : "none") +
+            ", raw length=" +
+            responseTextRaw.length +
+            ", cleaned length=" +
+            responseText.length,
         );
         return {
           text: responseText,
@@ -315,13 +322,16 @@ async function waitForResponse(cdp, timeoutMs = 300000, userPrompt = '', log = (
   }
 
   log(
-    'Extraction not stable before deadline; returning best length=' + bestText.length +
-    ', raw length=' + bestRaw.length +
-    ', method=' + (bestExtracted ? bestExtracted.method : 'none')
+    "Extraction not stable before deadline; returning best length=" +
+      bestText.length +
+      ", raw length=" +
+      bestRaw.length +
+      ", method=" +
+      (bestExtracted ? bestExtracted.method : "none"),
   );
 
   if (!bestText || bestText.length < 5) {
-    throw new Error('Could not extract response text from AI Studio');
+    throw new Error("Could not extract response text from AI Studio");
   }
 
   return {

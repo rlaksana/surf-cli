@@ -8,11 +8,15 @@
 const CLAUDE_URL = "https://claude.ai/";
 
 const SELECTORS = {
-  promptTextarea: 'textarea[placeholder*="How can I help you"], textarea[placeholder*="message"], #composer-input, [data-testid="composer-input"], div[contenteditable="true"][role="textbox"]',
-  sendButton: 'button[aria-label="Send message"], button[data-testid="send-button"], button[type="submit"]',
-  assistantMessage: '[data-is-streaming="false"], .font-claude-response, [data-turn-author="assistant"]',
+  promptTextarea:
+    'textarea[placeholder*="How can I help you"], textarea[placeholder*="message"], #composer-input, [data-testid="composer-input"], div[contenteditable="true"][role="textbox"]',
+  sendButton:
+    'button[aria-label="Send message"], button[data-testid="send-button"], button[type="submit"]',
+  assistantMessage:
+    '[data-is-streaming="false"], .font-claude-response, [data-turn-author="assistant"]',
   stopButton: '[data-testid="stop-button"], button[aria-label="Stop"]',
-  conversationTurn: '[data-is-streaming="false"], .font-claude-response, [data-turn-author="assistant"]',
+  conversationTurn:
+    '[data-is-streaming="false"], .font-claude-response, [data-turn-author="assistant"]',
 };
 
 function delay(ms) {
@@ -38,15 +42,15 @@ function buildClickDispatcher() {
 }
 
 function hasRequiredCookies(cookies) {
-  if (!cookies || !Array.isArray(cookies)) return false;
+  if (!cookies || !Array.isArray(cookies)) {
+    return false;
+  }
   // Check for session-related cookies (sessionKey, any session cookie)
   // or device ID cookies that indicate authenticated session
   const validCookie = cookies.find(
-    (c) => c.value && (
-      c.name.includes("session") ||
-      c.name === "anthropic-device-id" ||
-      c.name === "ARID"
-    )
+    (c) =>
+      c.value &&
+      (c.name.includes("session") || c.name === "anthropic-device-id" || c.name === "ARID"),
   );
   return Boolean(validCookie);
 }
@@ -54,9 +58,10 @@ function hasRequiredCookies(cookies) {
 async function evaluate(cdp, expression) {
   const result = await cdp(expression);
   if (result.exceptionDetails) {
-    const desc = result.exceptionDetails.exception?.description ||
-                 result.exceptionDetails.text ||
-                 "Evaluation failed";
+    const desc =
+      result.exceptionDetails.exception?.description ||
+      result.exceptionDetails.text ||
+      "Evaluation failed";
     throw new Error(desc);
   }
   if (result.error) {
@@ -78,7 +83,9 @@ async function waitForPageLoad(cdp, timeoutMs = 45000) {
 }
 
 async function checkLoginStatus(cdp) {
-  const result = await evaluate(cdp, `(() => {
+  const result = await evaluate(
+    cdp,
+    `(() => {
     const buttons = Array.from(document.querySelectorAll('button, a'));
     const hasSignIn = buttons.some(b => {
       const text = (b.textContent || '').toLowerCase().trim();
@@ -93,7 +100,8 @@ async function checkLoginStatus(cdp) {
       loggedIn: hasAccount || !hasSignIn,
       hasSignIn
     };
-  })()`);
+  })()`,
+  );
   return result || { loggedIn: false };
 }
 
@@ -112,9 +120,11 @@ async function waitForPromptReady(cdp, timeoutMs = 20000) {
           }
         }
         return false;
-      })()`
+      })()`,
     );
-    if (found) return true;
+    if (found) {
+      return true;
+    }
     await delay(200);
   }
   return false;
@@ -131,7 +141,7 @@ async function typePrompt(cdp, inputCdp, prompt) {
         if (node) return selector;
       }
       return null;
-    })()`
+    })()`,
   );
 
   if (!textarea) {
@@ -153,7 +163,7 @@ async function typePrompt(cdp, inputCdp, prompt) {
       node.focus();
 
       return true;
-    })()`
+    })()`,
   );
 
   // Type the prompt
@@ -178,7 +188,7 @@ async function clickSend(cdp, inputCdp) {
         }
       }
       return false;
-    })()`
+    })()`,
   );
 
   if (!clicked) {
@@ -186,12 +196,12 @@ async function clickSend(cdp, inputCdp) {
     await inputCdp("Input.dispatchKeyEvent", {
       type: "keyDown",
       key: "Enter",
-      text: "\r"
+      text: "\r",
     });
     await inputCdp("Input.dispatchKeyEvent", {
       type: "keyUp",
       key: "Enter",
-      text: "\r"
+      text: "\r",
     });
   }
 
@@ -213,7 +223,7 @@ async function waitForResponse(cdp, timeoutMs) {
           if (document.querySelector(selector)) return true;
         }
         return false;
-      })()`
+      })()`,
     );
 
     if (!isGenerating) {
@@ -267,7 +277,7 @@ async function getAssistantContent(cdp) {
       }
 
       return content.trim();
-    })()`
+    })()`,
   );
 
   return result || "";
@@ -291,9 +301,11 @@ async function query(options) {
   log("Starting Claude.ai query");
 
   const { cookies } = await getCookies();
-  const cookieNames = cookies?.map(c => c.name) || [];
+  const cookieNames = cookies?.map((c) => c.name) || [];
   if (!hasRequiredCookies(cookies)) {
-    throw new Error(`Claude.ai login required. Found ${cookies?.length || 0} cookies: ${cookieNames.join(", ")}`);
+    throw new Error(
+      `Claude.ai login required. Found ${cookies?.length || 0} cookies: ${cookieNames.join(", ")}`,
+    );
   }
   log(`Got ${cookies.length} cookies`);
 

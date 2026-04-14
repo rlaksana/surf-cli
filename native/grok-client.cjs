@@ -1,6 +1,6 @@
 /**
  * Grok Web Client for surf-cli
- * 
+ *
  * CDP-based client for X.com's Grok AI using browser automation.
  * Provides access to Grok's unique real-time X/Twitter data capabilities.
  */
@@ -12,20 +12,24 @@ const DEFAULT_MODEL = "thinking";
 
 // Default models (as of Jan 2026)
 const DEFAULT_GROK_MODELS = {
-  "auto": { id: "auto", name: "Auto", desc: "Chooses Fast or Expert" },
-  "fast": { id: "fast", name: "Fast", desc: "Quick responses" },
-  "expert": { id: "expert", name: "Expert", desc: "Thinks hard" },
-  "thinking": { id: "thinking", name: "Grok 4.1 Thinking", desc: "Thinks fast" },
+  auto: { id: "auto", name: "Auto", desc: "Chooses Fast or Expert" },
+  fast: { id: "fast", name: "Fast", desc: "Quick responses" },
+  expert: { id: "expert", name: "Expert", desc: "Thinks hard" },
+  thinking: { id: "thinking", name: "Grok 4.1 Thinking", desc: "Thinks fast" },
 };
 
 // Load models from surf.json config or use defaults
 function getGrokModels() {
   try {
     const config = loadConfig();
-    if (config.grok?.models && typeof config.grok.models === "object" && Object.keys(config.grok.models).length > 0) {
+    if (
+      config.grok?.models &&
+      typeof config.grok.models === "object" &&
+      Object.keys(config.grok.models).length > 0
+    ) {
       return config.grok.models;
     }
-  } catch (e) {
+  } catch (_e) {
     // Ignore errors, use defaults
   }
   return DEFAULT_GROK_MODELS;
@@ -39,7 +43,7 @@ const GROK_MODELS = DEFAULT_GROK_MODELS;
 // ============================================================================
 
 function delay(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function buildClickDispatcher() {
@@ -61,19 +65,22 @@ function buildClickDispatcher() {
 }
 
 function hasRequiredCookies(cookies) {
-  if (!cookies || !Array.isArray(cookies)) return false;
+  if (!cookies || !Array.isArray(cookies)) {
+    return false;
+  }
   // auth_token is the primary session cookie for X.com
   // ct0 is a CSRF token that's set dynamically, not strictly required for page load
-  const authToken = cookies.find(c => c.name === "auth_token" && c.value);
+  const authToken = cookies.find((c) => c.name === "auth_token" && c.value);
   return Boolean(authToken);
 }
 
 async function evaluate(cdp, expression) {
   const result = await cdp(expression);
   if (result.exceptionDetails) {
-    const desc = result.exceptionDetails.exception?.description || 
-                 result.exceptionDetails.text || 
-                 "Evaluation failed";
+    const desc =
+      result.exceptionDetails.exception?.description ||
+      result.exceptionDetails.text ||
+      "Evaluation failed";
     throw new Error(desc);
   }
   if (result.error) {
@@ -101,7 +108,9 @@ async function waitForPageLoad(cdp, timeoutMs = 30000) {
 }
 
 async function checkLoginStatus(cdp) {
-  const result = await evaluate(cdp, `(() => {
+  const result = await evaluate(
+    cdp,
+    `(() => {
     const body = document.body.innerText.toLowerCase();
     const hasLoginButton = !!document.querySelector('a[href*="/login"], [data-testid="loginButton"]');
     const hasGrokUI = body.includes('ask anything') || body.includes('grok');
@@ -112,17 +121,20 @@ async function checkLoginStatus(cdp) {
       hasPremium: hasGrokUI && !hasPremiumPrompt,
       url: location.href
     };
-  })()`);
-  
+  })()`,
+  );
+
   return result || { loggedIn: false, hasPremium: false };
 }
 
 async function waitForGrokReady(cdp, timeoutMs = 20000) {
   const deadline = Date.now() + timeoutMs;
   let lastState = null;
-  
+
   while (Date.now() < deadline) {
-    const state = await evaluate(cdp, `(() => {
+    const state = await evaluate(
+      cdp,
+      `(() => {
       // Check for Grok-specific elements
       const hasInput = !!document.querySelector('textarea, [contenteditable="true"][role="textbox"], [data-testid="grokComposerInput"]');
       const hasGrokBranding = document.body.innerText.includes('Grok') || 
@@ -137,27 +149,28 @@ async function waitForGrokReady(cdp, timeoutMs = 20000) {
         isLoginPage,
         url: location.href
       };
-    })()`);
-    
+    })()`,
+    );
+
     lastState = state;
-    
-    if (state && state.ready) {
+
+    if (state?.ready) {
       return state;
     }
-    
+
     // If redirected to login, fail fast
-    if (state && state.isLoginPage) {
+    if (state?.isLoginPage) {
       throw new Error("Redirected to login page - X.com login required");
     }
-    
+
     await delay(200);
   }
-  
+
   // Timeout - provide helpful error based on last state
   if (lastState && !lastState.isGrokPage) {
     throw new Error(`Not on Grok page (current: ${lastState.url}) - may need to log in`);
   }
-  
+
   // Return fallback for edge cases where we're on Grok page but UI isn't detected
   return { ready: true, fallback: true };
 }
@@ -168,9 +181,11 @@ async function waitForGrokReady(cdp, timeoutMs = 20000) {
 
 async function selectModel(cdp, desiredModel, timeoutMs = 8000) {
   const normalizedModel = desiredModel.toLowerCase().replace(/[^a-z0-9.-]/g, "");
-  
+
   // First, find and click the model selector button
-  const buttonClicked = await evaluate(cdp, `(() => {
+  const buttonClicked = await evaluate(
+    cdp,
+    `(() => {
     ${buildClickDispatcher()}
     
     // Look for model selector button (shows current model: Auto, Fast, Expert, or Grok 4.1 Thinking)
@@ -189,20 +204,23 @@ async function selectModel(cdp, desiredModel, timeoutMs = 8000) {
     
     dispatchClickSequence(modelBtn);
     return { success: true };
-  })()`);
-  
+  })()`,
+  );
+
   if (!buttonClicked || !buttonClicked.success) {
     // Model selector might not exist (single model), continue anyway
     return desiredModel;
   }
-  
+
   await delay(400);
-  
+
   // Select from menu - loop in Node.js to avoid CDP timeout issues
   const deadline = Date.now() + timeoutMs;
-  
+
   while (Date.now() < deadline) {
-    const result = await evaluate(cdp, `(() => {
+    const result = await evaluate(
+      cdp,
+      `(() => {
       ${buildClickDispatcher()}
       
       const targetModel = ${JSON.stringify(normalizedModel)};
@@ -238,9 +256,10 @@ async function selectModel(cdp, desiredModel, timeoutMs = 8000) {
       }
       
       return { found: true, success: false, error: 'No matching model in menu' };
-    })()`);
-    
-    if (result && result.found) {
+    })()`,
+    );
+
+    if (result?.found) {
       if (result.success) {
         await delay(200);
         return result.model;
@@ -249,10 +268,10 @@ async function selectModel(cdp, desiredModel, timeoutMs = 8000) {
       await evaluate(cdp, `document.body.click()`);
       return desiredModel;
     }
-    
+
     await delay(100);
   }
-  
+
   // Timeout - close menu
   await evaluate(cdp, `document.body.click()`);
   return desiredModel;
@@ -263,7 +282,9 @@ async function selectModel(cdp, desiredModel, timeoutMs = 8000) {
 // ============================================================================
 
 async function enableDeepSearch(cdp) {
-  const result = await evaluate(cdp, `(() => {
+  const result = await evaluate(
+    cdp,
+    `(() => {
     ${buildClickDispatcher()}
     
     // Look for DeepSearch toggle or button
@@ -290,12 +311,13 @@ async function enableDeepSearch(cdp) {
     
     dispatchClickSequence(deepSearchBtn);
     return { success: true };
-  })()`);
-  
-  if (result && result.success) {
+  })()`,
+  );
+
+  if (result?.success) {
     await delay(300);
   }
-  
+
   return result || { success: false };
 }
 
@@ -305,7 +327,9 @@ async function enableDeepSearch(cdp) {
 
 async function typePrompt(cdp, inputCdp, prompt) {
   // Focus the input area
-  const focused = await evaluate(cdp, `(() => {
+  const focused = await evaluate(
+    cdp,
+    `(() => {
     ${buildClickDispatcher()}
     
     // Strategy 1: Find textarea or contenteditable
@@ -329,14 +353,15 @@ async function typePrompt(cdp, inputCdp, prompt) {
     }
     
     return { success: false, error: 'Input not found' };
-  })()`);
-  
+  })()`,
+  );
+
   if (!focused || !focused.success) {
-    throw new Error(`Could not focus input: ${focused?.error || 'unknown'}`);
+    throw new Error(`Could not focus input: ${focused?.error || "unknown"}`);
   }
-  
+
   await delay(300);
-  
+
   // Type using CDP Input API
   await inputCdp("Input.insertText", { text: prompt });
   await delay(200);
@@ -344,7 +369,9 @@ async function typePrompt(cdp, inputCdp, prompt) {
 
 async function submitPrompt(cdp, inputCdp) {
   // Try to click send button
-  const clicked = await evaluate(cdp, `(() => {
+  const clicked = await evaluate(
+    cdp,
+    `(() => {
     ${buildClickDispatcher()}
     
     // Look for send button
@@ -362,8 +389,9 @@ async function submitPrompt(cdp, inputCdp) {
     }
     
     return { success: false };
-  })()`);
-  
+  })()`,
+  );
+
   if (!clicked || !clicked.success) {
     // Fallback: press Enter
     await inputCdp("Input.dispatchKeyEvent", {
@@ -382,7 +410,7 @@ async function submitPrompt(cdp, inputCdp) {
       nativeVirtualKeyCode: 13,
     });
   }
-  
+
   await delay(500);
 }
 
@@ -391,12 +419,17 @@ async function submitPrompt(cdp, inputCdp) {
 // ============================================================================
 
 // Extract Grok's response from the full page body text
-function extractGrokResponse(bodyText, userPrompt = '') {
-  if (!bodyText) return null;
-  
+function extractGrokResponse(bodyText, userPrompt = "") {
+  if (!bodyText) {
+    return null;
+  }
+
   // Split into lines and filter out navigation/UI elements
-  const lines = bodyText.split('\n').map(l => l.trim()).filter(l => l);
-  
+  const lines = bodyText
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l);
+
   // Known UI elements to skip
   const uiPatterns = [
     /^(Home|Explore|Notifications|Messages|Chat|Grok|Premium|Bookmarks|Communities|Profile|More|Post)$/i,
@@ -410,44 +443,53 @@ function extractGrokResponse(bodyText, userPrompt = '') {
     /^[A-Z][a-z]+ \d+$/, // Dates like "Jan 20"
     /^(See new posts|Talk to Grok|Get access to)/, // Sidebar promos
   ];
-  
+
   // Normalize prompt for comparison (first 30 chars to handle truncation)
-  const promptNorm = userPrompt.toLowerCase().replace(/[^a-z0-9]/g, '').substring(0, 30);
-  
+  const promptNorm = userPrompt
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, "")
+    .substring(0, 30);
+
   // Find the LAST occurrence of the user's question to get the most recent conversation
   let lastQuestionIndex = -1;
   for (let i = lines.length - 1; i >= 0; i--) {
-    const lineNorm = lines[i].toLowerCase().replace(/[^a-z0-9]/g, '');
+    const lineNorm = lines[i].toLowerCase().replace(/[^a-z0-9]/g, "");
     if (promptNorm && lineNorm.includes(promptNorm)) {
       lastQuestionIndex = i;
       break;
     }
   }
-  
+
   // Extract content after the last question
   const contentLines = [];
   const startIndex = lastQuestionIndex >= 0 ? lastQuestionIndex + 1 : 0;
-  
+
   for (let i = startIndex; i < lines.length; i++) {
     const line = lines[i];
-    
+
     // Skip empty and UI lines
-    if (!line || uiPatterns.some(p => p.test(line))) continue;
-    
+    if (!line || uiPatterns.some((p) => p.test(line))) {
+      continue;
+    }
+
     // Skip very short lines that are likely icons/buttons (but keep numbers)
-    if (line.length <= 2 && !/^\d+$/.test(line)) continue;
-    
+    if (line.length <= 2 && !/^\d+$/.test(line)) {
+      continue;
+    }
+
     // Stop at follow-up suggestions (they mark the end of the response)
-    if (/^(Explain|Tell me|Learn more|Show me|Multiplication)/i.test(line)) break;
-    
+    if (/^(Explain|Tell me|Learn more|Show me|Multiplication)/i.test(line)) {
+      break;
+    }
+
     contentLines.push(line);
   }
-  
+
   // If we found content after the question, return the response
   if (contentLines.length > 0) {
-    return contentLines.join('\n').trim();
+    return contentLines.join("\n").trim();
   }
-  
+
   // Fallback: look for the LAST standalone numeric answer
   for (let i = lines.length - 1; i >= 0; i--) {
     const line = lines[i];
@@ -455,27 +497,29 @@ function extractGrokResponse(bodyText, userPrompt = '') {
       return line;
     }
   }
-  
+
   return null;
 }
 
-async function waitForResponse(cdp, timeoutMs = 300000, userPrompt = '') {
+async function waitForResponse(cdp, timeoutMs = 300000, userPrompt = "") {
   // Grok can take a long time:
   // - Thinking models (Grok 4.1 Thinking): 40-60+ seconds to think, then streams
   // - Fast/Auto models: No thinking phase, just streams directly
-  
+
   const deadline = Date.now() + timeoutMs;
-  let previousText = '';
+  let previousText = "";
   let previousLength = 0;
   let lastChangeAt = Date.now();
   let thinkingTime = null;
   let thinkingComplete = false;
-  let lastResponseText = '';
+  let lastResponseText = "";
   let responseStableCycles = 0;
-  
+
   while (Date.now() < deadline) {
     // Get page state with multiple completion indicators
-    const snapshot = await evaluate(cdp, `(function() {
+    const snapshot = await evaluate(
+      cdp,
+      `(function() {
       const bodyText = document.body.innerText || '';
       
       // Check for stop/cancel button (indicates still generating)
@@ -529,23 +573,24 @@ async function waitForResponse(cdp, timeoutMs = 300000, userPrompt = '') {
         isThinking: isThinking,
         url: location.href
       };
-    })()`);
-    
+    })()`,
+    );
+
     if (!snapshot || !snapshot.bodyText) {
       await delay(300);
       continue;
     }
-    
+
     const bodyText = snapshot.bodyText;
     const bodyLength = snapshot.bodyLength;
-    
+
     // Track thinking time (for thinking models)
     if (snapshot.thinkingSecs) {
       if (!thinkingTime || snapshot.thinkingSecs > thinkingTime) {
         thinkingTime = snapshot.thinkingSecs;
       }
     }
-    
+
     // Detect when thinking completes (thinking models only)
     // "Thought for Xs" is a DEFINITIVE signal that thinking AND response generation is done
     if (snapshot.thinkingDone && !thinkingComplete) {
@@ -553,16 +598,16 @@ async function waitForResponse(cdp, timeoutMs = 300000, userPrompt = '') {
       // Give a brief moment for final render, then we're done
       await delay(500);
     }
-    
+
     // Extract the actual response text - try DOM-extracted first, fall back to body parsing
-    let currentResponseText = '';
+    let currentResponseText = "";
     if (snapshot.responseText && snapshot.responseText.length > 10) {
-      currentResponseText = extractGrokResponse(snapshot.responseText, userPrompt) || '';
+      currentResponseText = extractGrokResponse(snapshot.responseText, userPrompt) || "";
     }
     if (!currentResponseText || currentResponseText.length < 5) {
-      currentResponseText = extractGrokResponse(bodyText, userPrompt) || '';
+      currentResponseText = extractGrokResponse(bodyText, userPrompt) || "";
     }
-    
+
     // Track RESPONSE text stability (more reliable than body text)
     if (currentResponseText !== lastResponseText) {
       lastResponseText = currentResponseText;
@@ -571,34 +616,38 @@ async function waitForResponse(cdp, timeoutMs = 300000, userPrompt = '') {
     } else if (currentResponseText.length > 0) {
       responseStableCycles++;
     }
-    
+
     // Track body text for timeout fallback
     if (bodyLength !== previousLength) {
       previousText = bodyText;
       previousLength = bodyLength;
     }
-    
+
     const stableMs = Date.now() - lastChangeAt;
     const noStopButton = !snapshot.hasStopBtn;
-    
+
     // Response is stable if the extracted response text hasn't changed
     // Use shorter thresholds since we're checking actual content, not noisy body text
     // 4 cycles (1.2s) + 1.5s minimum is enough for response stability
-    const responseIsStable = responseStableCycles >= 4 && stableMs >= 1500 && currentResponseText.length > 10;
-    
+    const responseIsStable =
+      responseStableCycles >= 4 && stableMs >= 1500 && currentResponseText.length > 10;
+
     // "Thought for Xs" is the strongest completion signal - response is definitely done
     const thinkingModelDone = snapshot.thinkingDone && noStopButton;
-    
+
     // SIMPLE CHECK: If we have response content, no stop button, and stable for 3+ cycles
-    const hasResponseNoStop = currentResponseText.length > 5 && noStopButton && responseStableCycles >= 3;
-    
+    const hasResponseNoStop =
+      currentResponseText.length > 5 && noStopButton && responseStableCycles >= 3;
+
     // Response is complete when:
     // 1. Has meaningful response content (> 5 chars)
     // 2. No stop button
     // 3. Either: thinking done, response stable for 3+ cycles, OR stable for 4+ cycles with 1.5s
-    const isDone = currentResponseText.length > 5 && noStopButton &&
-                   (thinkingModelDone || hasResponseNoStop || responseIsStable);
-    
+    const isDone =
+      currentResponseText.length > 5 &&
+      noStopButton &&
+      (thinkingModelDone || hasResponseNoStop || responseIsStable);
+
     if (isDone) {
       return {
         text: currentResponseText,
@@ -606,10 +655,10 @@ async function waitForResponse(cdp, timeoutMs = 300000, userPrompt = '') {
         url: snapshot.url,
       };
     }
-    
+
     await delay(300);
   }
-  
+
   // Timeout - return whatever we have (partial response is better than nothing)
   const finalText = extractGrokResponse(previousText, userPrompt);
   if (finalText && finalText.length > 10) {
@@ -619,7 +668,7 @@ async function waitForResponse(cdp, timeoutMs = 300000, userPrompt = '') {
       partial: true,
     };
   }
-  
+
   throw new Error("Response timeout - Grok did not complete in time");
 }
 
@@ -640,34 +689,34 @@ async function query(options) {
     cdpCommand,
     log = () => {},
   } = options;
-  
+
   const startTime = Date.now();
   log("Starting Grok query");
-  
+
   // Check cookies for X.com authentication
   const { cookies } = await getCookies();
   if (!hasRequiredCookies(cookies)) {
     throw new Error("X.com login required - log in to x.com in Chrome first");
   }
   log(`Got ${cookies.length} cookies`);
-  
+
   // Create tab
   const tabInfo = await createTab();
   const { tabId } = tabInfo || {};
-  
+
   if (!tabId) {
     throw new Error(`Failed to create Grok tab: ${JSON.stringify(tabInfo)}`);
   }
   log(`Created tab ${tabId}`);
-  
+
   const cdp = (expr) => cdpEvaluate(tabId, expr);
   const inputCdp = (method, params) => cdpCommand(tabId, method, params);
-  
+
   try {
     // Wait for page load
     await waitForPageLoad(cdp);
     log("Page loaded");
-    
+
     // Check login status
     const loginStatus = await checkLoginStatus(cdp);
     if (!loginStatus.loggedIn) {
@@ -676,15 +725,15 @@ async function query(options) {
     if (!loginStatus.hasPremium) {
       log("Warning: X Premium may be required for some Grok features");
     }
-    log(`Login: yes${loginStatus.hasPremium ? ' (Premium)' : ''}`);
-    
+    log(`Login: yes${loginStatus.hasPremium ? " (Premium)" : ""}`);
+
     // Track warnings for agent feedback
     const warnings = [];
-    
+
     // Wait for Grok UI
     await waitForGrokReady(cdp);
     log("Grok ready");
-    
+
     // Select model (use default if not specified)
     const targetModel = model || DEFAULT_MODEL;
     let selectedModel = targetModel;
@@ -693,17 +742,21 @@ async function query(options) {
       selectedModel = await selectModel(cdp, targetModel);
       log(`Model: ${selectedModel}`);
       // Check if we got a different model than requested
-      const requestedNorm = targetModel.toLowerCase().replace(/[^a-z0-9]/g, '');
-      const selectedNorm = selectedModel.toLowerCase().replace(/[^a-z0-9]/g, '');
+      const requestedNorm = targetModel.toLowerCase().replace(/[^a-z0-9]/g, "");
+      const selectedNorm = selectedModel.toLowerCase().replace(/[^a-z0-9]/g, "");
       if (!selectedNorm.includes(requestedNorm) && !requestedNorm.includes(selectedNorm)) {
-        warnings.push(`Requested model "${targetModel}" but got "${selectedModel}" - model may not be available`);
+        warnings.push(
+          `Requested model "${targetModel}" but got "${selectedModel}" - model may not be available`,
+        );
       }
     } catch (e) {
       modelSelectionFailed = true;
-      warnings.push(`Model selection failed: ${e.message}. Run 'surf grok --validate' to check available models.`);
+      warnings.push(
+        `Model selection failed: ${e.message}. Run 'surf grok --validate' to check available models.`,
+      );
       log(`Model selection failed: ${e.message}`);
     }
-    
+
     // Enable DeepSearch if requested
     let deepSearchEnabled = false;
     if (deepSearch) {
@@ -713,27 +766,31 @@ async function query(options) {
           deepSearchEnabled = true;
           log("DeepSearch enabled");
         } else {
-          warnings.push(`DeepSearch toggle not found - feature may require X Premium or UI changed`);
+          warnings.push(
+            `DeepSearch toggle not found - feature may require X Premium or UI changed`,
+          );
         }
       } catch (e) {
         warnings.push(`DeepSearch toggle failed: ${e.message}`);
         log(`DeepSearch toggle failed: ${e.message}`);
       }
     }
-    
+
     // Type prompt
     await typePrompt(cdp, inputCdp, prompt);
     log("Prompt typed");
-    
+
     // Submit
     await submitPrompt(cdp, inputCdp);
     log("Submitted, waiting for response...");
-    
+
     // Wait for response
     const response = await waitForResponse(cdp, timeout, prompt);
-    const thinkingInfo = response.thinkingTime ? ` (thought for ${response.thinkingTime}s)` : '';
-    log(`Response: ${response.text.length} chars${thinkingInfo}${response.partial ? ' (partial)' : ''}`);
-    
+    const thinkingInfo = response.thinkingTime ? ` (thought for ${response.thinkingTime}s)` : "";
+    log(
+      `Response: ${response.text.length} chars${thinkingInfo}${response.partial ? " (partial)" : ""}`,
+    );
+
     return {
       response: response.text,
       model: selectedModel,
@@ -757,17 +814,11 @@ async function query(options) {
 // ============================================================================
 
 async function validate(options) {
-  const {
-    getCookies,
-    createTab,
-    closeTab,
-    cdpEvaluate,
-    log = () => {},
-  } = options;
-  
+  const { getCookies, createTab, closeTab, cdpEvaluate, log = () => {} } = options;
+
   const startTime = Date.now();
   log("Starting Grok validation");
-  
+
   const result = {
     authenticated: false,
     premium: false,
@@ -779,7 +830,7 @@ async function validate(options) {
     errors: [],
     configPath: getConfigPath() || "~/surf.json",
   };
-  
+
   // Check cookies
   try {
     const { cookies } = await getCookies();
@@ -793,7 +844,7 @@ async function validate(options) {
     result.errors.push(`Cookie check failed: ${e.message}`);
     return { ...result, tookMs: Date.now() - startTime };
   }
-  
+
   // Create tab
   let tabId;
   try {
@@ -808,39 +859,44 @@ async function validate(options) {
     result.errors.push(`Tab creation failed: ${e.message}`);
     return { ...result, tookMs: Date.now() - startTime };
   }
-  
+
   const cdp = (expr) => cdpEvaluate(tabId, expr);
-  
+
   try {
     // Wait for page load
     await waitForPageLoad(cdp);
     log("Page loaded");
-    
+
     // Check login status
     const loginStatus = await checkLoginStatus(cdp);
     result.authenticated = loginStatus.loggedIn;
     result.premium = loginStatus.hasPremium;
-    
+
     if (!loginStatus.loggedIn) {
       result.errors.push("Page shows logged out state");
       return { ...result, tookMs: Date.now() - startTime };
     }
-    log(`Login: yes${result.premium ? ' (Premium)' : ''}`);
-    
+    log(`Login: yes${result.premium ? " (Premium)" : ""}`);
+
     // Wait for Grok UI
     await waitForGrokReady(cdp);
     log("Grok ready");
-    
+
     // Check for input field
-    const inputCheck = await evaluate(cdp, `(() => {
+    const inputCheck = await evaluate(
+      cdp,
+      `(() => {
       const input = document.querySelector('textarea, [contenteditable="true"][role="textbox"], [data-testid="grokComposerInput"]');
       return { found: !!input && input.offsetParent !== null };
-    })()`);
+    })()`,
+    );
     result.inputFound = inputCheck?.found || false;
-    log(`Input field: ${result.inputFound ? 'found' : 'NOT FOUND'}`);
-    
+    log(`Input field: ${result.inputFound ? "found" : "NOT FOUND"}`);
+
     // Check for send button
-    const sendCheck = await evaluate(cdp, `(() => {
+    const sendCheck = await evaluate(
+      cdp,
+      `(() => {
       const buttons = Array.from(document.querySelectorAll('button'));
       const sendBtn = buttons.find(b => {
         const label = (b.getAttribute('aria-label') || '').toLowerCase();
@@ -848,12 +904,15 @@ async function validate(options) {
         return label.includes('send') || testId.includes('send') || testId.includes('submit');
       });
       return { found: !!sendBtn };
-    })()`);
+    })()`,
+    );
     result.sendButtonFound = sendCheck?.found || false;
-    log(`Send button: ${result.sendButtonFound ? 'found' : 'NOT FOUND'}`);
-    
+    log(`Send button: ${result.sendButtonFound ? "found" : "NOT FOUND"}`);
+
     // Click model selector and scrape models
-    const modelButtonClicked = await evaluate(cdp, `(() => {
+    const modelButtonClicked = await evaluate(
+      cdp,
+      `(() => {
       ${buildClickDispatcher()}
       const buttons = Array.from(document.querySelectorAll('button'));
       const modelBtn = buttons.find(b => {
@@ -867,13 +926,16 @@ async function validate(options) {
       if (!modelBtn) return { success: false };
       dispatchClickSequence(modelBtn);
       return { success: true };
-    })()`);
-    
+    })()`,
+    );
+
     if (modelButtonClicked?.success) {
       await delay(500);
-      
+
       // Scrape model options
-      const modelScrape = await evaluate(cdp, `(() => {
+      const modelScrape = await evaluate(
+        cdp,
+        `(() => {
         const items = document.querySelectorAll('[role="menuitem"], [role="menuitemradio"], [role="option"]');
         const models = [];
         for (const item of items) {
@@ -886,73 +948,77 @@ async function validate(options) {
           }
         }
         return { models };
-      })()`);
-      
+      })()`,
+      );
+
       result.models = modelScrape?.models || [];
-      log(`Found models: ${result.models.join(', ')}`);
-      
+      log(`Found models: ${result.models.join(", ")}`);
+
       // Close the menu
       await evaluate(cdp, `document.body.click()`);
     } else {
       log("Could not open model selector");
       result.errors.push("Model selector button not found");
     }
-    
+
     // Check for model mismatch
-    const expectedNames = Object.values(getGrokModels()).map(m => m.name.toLowerCase());
-    const foundNames = result.models.map(m => m.toLowerCase());
-    
-    const missing = expectedNames.filter(e => !foundNames.some(f => f.includes(e) || e.includes(f)));
-    const extra = foundNames.filter(f => !expectedNames.some(e => f.includes(e) || e.includes(f)));
-    
+    const expectedNames = Object.values(getGrokModels()).map((m) => m.name.toLowerCase());
+    const foundNames = result.models.map((m) => m.toLowerCase());
+
+    const missing = expectedNames.filter(
+      (e) => !foundNames.some((f) => f.includes(e) || e.includes(f)),
+    );
+    const extra = foundNames.filter(
+      (f) => !expectedNames.some((e) => f.includes(e) || e.includes(f)),
+    );
+
     if (missing.length > 0 || extra.length > 0) {
       result.modelMismatch = true;
       if (missing.length > 0) {
-        result.errors.push(`Expected models not found: ${missing.join(', ')}`);
+        result.errors.push(`Expected models not found: ${missing.join(", ")}`);
       }
       if (extra.length > 0) {
-        result.errors.push(`Unexpected models found: ${extra.join(', ')}`);
+        result.errors.push(`Unexpected models found: ${extra.join(", ")}`);
       }
     }
-    
   } catch (e) {
     result.errors.push(`Validation error: ${e.message}`);
   } finally {
     await closeTab(tabId).catch(() => {});
   }
-  
+
   result.tookMs = Date.now() - startTime;
   return result;
 }
 
 // Save discovered models to surf.json config
 function saveModels(models) {
-  const fs = require("fs");
-  const path = require("path");
-  const os = require("os");
-  
+  const fs = require("node:fs");
+  const path = require("node:path");
+  const os = require("node:os");
+
   try {
     // Use existing config path or default to ~/surf.json
     let configPath = getConfigPath();
     if (!configPath) {
       configPath = path.join(os.homedir(), "surf.json");
     }
-    
+
     // Load existing config or start fresh
     let config = {};
     if (fs.existsSync(configPath)) {
       try {
         config = JSON.parse(fs.readFileSync(configPath, "utf-8"));
-      } catch (e) {
+      } catch (_e) {
         // Start fresh if parse fails
       }
     }
-    
+
     // Update grok.models
     config.grok = config.grok || {};
     config.grok.models = models;
-    
-    fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n");
+
+    fs.writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`);
     clearCache(); // Clear config cache so subsequent reads see new values
     return { success: true, path: configPath };
   } catch (e) {
@@ -960,10 +1026,10 @@ function saveModels(models) {
   }
 }
 
-module.exports = { 
+module.exports = {
   query,
   validate,
-  hasRequiredCookies, 
+  hasRequiredCookies,
   getGrokModels,
   saveModels,
   extractGrokResponse,

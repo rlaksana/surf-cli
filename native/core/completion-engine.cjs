@@ -1,4 +1,4 @@
-'use strict';
+"use strict";
 
 /**
  * @fileoverview Completion Engine — Evaluates 4 signals to determine if AI response is done.
@@ -44,36 +44,47 @@ function buildVerdict(done, maxTimeoutResult, signals) {
 
   // Check semantic completion branch
   if (signals.isSemanticComplete?.complete) {
-    activeSignals.push('isSemanticComplete');
+    activeSignals.push("isSemanticComplete");
     confidence++;
   }
   if (signals.isInteractionReady?.ready) {
-    activeSignals.push('isInteractionReady');
+    activeSignals.push("isInteractionReady");
     confidence++;
   }
 
   // Check transport/idle branch
   if (signals.isTransportIdle?.idle) {
-    activeSignals.push('isTransportIdle');
+    activeSignals.push("isTransportIdle");
     confidence++;
   }
   if (maxTimeoutResult.timedOut) {
-    activeSignals.push('maxTimeout');
+    activeSignals.push("maxTimeout");
     confidence++;
   }
 
   // Build reason
-  const semanticBranch = signals.isSemanticComplete?.complete
-    ? 'semantic-complete'
-    : signals.isInteractionReady?.ready
-      ? 'interaction-ready'
-      : 'none';
+  function getSemanticBranch() {
+    if (signals.isSemanticComplete?.complete) {
+      return "semantic-complete";
+    }
+    if (signals.isInteractionReady?.ready) {
+      return "interaction-ready";
+    }
+    return "none";
+  }
 
-  const transportBranch = signals.isTransportIdle?.idle
-    ? 'transport-idle'
-    : maxTimeoutResult.timedOut
-      ? 'max-timeout'
-      : 'not-idle';
+  function getTransportBranch() {
+    if (signals.isTransportIdle?.idle) {
+      return "transport-idle";
+    }
+    if (maxTimeoutResult.timedOut) {
+      return "max-timeout";
+    }
+    return "not-idle";
+  }
+
+  const semanticBranch = getSemanticBranch();
+  const transportBranch = getTransportBranch();
 
   const reason = done
     ? `Complete: (${semanticBranch}) AND (${transportBranch})`
@@ -107,7 +118,7 @@ function run(ctx, signals) {
   if (!ctx || !signals) {
     return {
       done: false,
-      reason: 'Invalid args: ctx and signals are required',
+      reason: "Invalid args: ctx and signals are required",
       confidence: 0,
       activeSignals: [],
     };
@@ -118,8 +129,7 @@ function run(ctx, signals) {
 
   // Left side: semantic OR interaction
   const semanticDone =
-    signals.isSemanticComplete?.complete === true ||
-    signals.isInteractionReady?.ready === true;
+    signals.isSemanticComplete?.complete === true || signals.isInteractionReady?.ready === true;
 
   // Right side: transport idle OR maxTimeout
   const transportReady =

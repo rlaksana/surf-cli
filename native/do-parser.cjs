@@ -1,13 +1,13 @@
 /**
  * Parser for surf `do` workflow commands
- * 
+ *
  * Parses newline-separated commands into structured step arrays:
- * 
+ *
  * Input:
  *   'go "https://example.com"
  *    click e5
  *    screenshot'
- * 
+ *
  * Output:
  *   [
  *     { cmd: 'navigate', args: { url: 'https://example.com' } },
@@ -72,7 +72,7 @@ const PRIMARY_ARG_MAP = {
   "emulate.device": "device",
   "frame.js": "code",
   "element.styles": "selector",
-  "select": "selector",
+  select: "selector",
 };
 
 /**
@@ -82,12 +82,12 @@ const PRIMARY_ARG_MAP = {
  */
 function tokenize(line) {
   const tokens = [];
-  let current = '';
+  let current = "";
   let inQuote = null;
-  
+
   for (let i = 0; i < line.length; i++) {
     const ch = line[i];
-    
+
     if (inQuote) {
       if (ch === inQuote) {
         // End of quoted string
@@ -98,22 +98,22 @@ function tokenize(line) {
     } else if (ch === '"' || ch === "'") {
       // Start of quoted string
       inQuote = ch;
-    } else if (ch === ' ' || ch === '\t') {
+    } else if (ch === " " || ch === "\t") {
       // Whitespace separator
       if (current) {
         tokens.push(current);
-        current = '';
+        current = "";
       }
     } else {
       current += ch;
     }
   }
-  
+
   // Don't forget last token
   if (current) {
     tokens.push(current);
   }
-  
+
   return tokens;
 }
 
@@ -124,21 +124,23 @@ function tokenize(line) {
  */
 function parseCommandLine(line) {
   const tokens = tokenize(line);
-  if (tokens.length === 0) return null;
-  
+  if (tokens.length === 0) {
+    return null;
+  }
+
   // Get command and apply alias
   let cmd = tokens[0];
   cmd = ALIASES[cmd] || cmd;
-  
+
   const args = {};
   let i = 1;
-  
+
   // Handle first positional argument based on command type
-  if (i < tokens.length && !tokens[i].startsWith('--')) {
+  if (i < tokens.length && !tokens[i].startsWith("--")) {
     const firstArg = tokens[i];
-    
+
     // Special handling for click command
-    if (cmd === 'click') {
+    if (cmd === "click") {
       if (/^e\d+$/.test(firstArg)) {
         // Element reference: e5 -> ref
         args.ref = firstArg;
@@ -149,21 +151,21 @@ function parseCommandLine(line) {
         args.y = parseInt(tokens[i + 1], 10);
         i += 2;
       }
-    } else if (cmd === 'select') {
+    } else if (cmd === "select") {
       // Select takes selector + one or more values: select e5 "US" or select e5 "opt1" "opt2"
       args.selector = firstArg;
       i++;
       // Collect remaining positional args as values
       const values = [];
-      while (i < tokens.length && !tokens[i].startsWith('--')) {
+      while (i < tokens.length && !tokens[i].startsWith("--")) {
         values.push(tokens[i]);
         i++;
       }
       // Host expects 'values' (always), matching CLI behavior
       if (values.length === 1) {
-        args.values = values[0];  // Single value as string (host will wrap in array)
+        args.values = values[0]; // Single value as string (host will wrap in array)
       } else if (values.length > 1) {
-        args.values = values;     // Multiple values as array
+        args.values = values; // Multiple values as array
       }
     } else {
       // Use PRIMARY_ARG_MAP for other commands
@@ -174,21 +176,26 @@ function parseCommandLine(line) {
       }
     }
   }
-  
+
   // Parse --flag value pairs
   while (i < tokens.length) {
     const token = tokens[i];
-    if (token.startsWith('--')) {
+    if (token.startsWith("--")) {
       const key = token.slice(2);
       const next = tokens[i + 1];
-      if (next && !next.startsWith('--')) {
+      if (next && !next.startsWith("--")) {
         // Flag with value
         let val = next;
         // Type coercion
-        if (val === "true") val = true;
-        else if (val === "false") val = false;
-        else if (/^-?\d+$/.test(val)) val = parseInt(val, 10);
-        else if (/^-?\d+\.\d+$/.test(val)) val = parseFloat(val);
+        if (val === "true") {
+          val = true;
+        } else if (val === "false") {
+          val = false;
+        } else if (/^-?\d+$/.test(val)) {
+          val = parseInt(val, 10);
+        } else if (/^-?\d+\.\d+$/.test(val)) {
+          val = parseFloat(val);
+        }
         args[key] = val;
         i += 2;
       } else {
@@ -201,7 +208,7 @@ function parseCommandLine(line) {
       i++;
     }
   }
-  
+
   return { cmd, args };
 }
 
@@ -215,24 +222,24 @@ function parseDoCommands(input) {
   // Determine separator: use pipe if present, otherwise newlines
   // Pipe is preferred for inline: 'go "url" | click e5 | screenshot'
   // Newlines for files or heredocs
-  const hasPipe = input.includes('|');
-  const separator = hasPipe ? '|' : '\n';
-  
+  const hasPipe = input.includes("|");
+  const separator = hasPipe ? "|" : "\n";
+
   // Also handle literal \n for backwards compatibility
-  const normalized = hasPipe ? input : input.replace(/\\n/g, '\n');
-  
+  const normalized = hasPipe ? input : input.replace(/\\n/g, "\n");
+
   return normalized
     .split(separator)
-    .map(line => line.trim())
-    .filter(line => line && !line.startsWith('#'))
-    .map(line => parseCommandLine(line))
-    .filter(step => step !== null);
+    .map((line) => line.trim())
+    .filter((line) => line && !line.startsWith("#"))
+    .map((line) => parseCommandLine(line))
+    .filter((step) => step !== null);
 }
 
-module.exports = { 
-  parseDoCommands, 
-  parseCommandLine, 
+module.exports = {
+  parseDoCommands,
+  parseCommandLine,
   tokenize,
   ALIASES,
-  PRIMARY_ARG_MAP
+  PRIMARY_ARG_MAP,
 };

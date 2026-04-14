@@ -1,4 +1,4 @@
-'use strict';
+"use strict";
 
 /**
  * @fileoverview Rate Limit Detector — Detects rate limiting from CDP, TM, or text patterns.
@@ -8,9 +8,7 @@
  * Retry-After header is extracted and converted to ms.
  */
 
-const {
-  RateLimitResult, // eslint-disable-line no-unused-vars
-} = require('./strategy-contracts.cjs');
+require("./strategy-contracts.cjs");
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Default rate-limit text patterns (can be overridden by client config)
@@ -35,7 +33,9 @@ const DEFAULT_RATE_LIMIT_PATTERNS = [
  * @returns {boolean}
  */
 function matchTextPatterns(textContent, patterns = DEFAULT_RATE_LIMIT_PATTERNS) {
-  if (!textContent || typeof textContent !== 'string') return false;
+  if (!textContent || typeof textContent !== "string") {
+    return false;
+  }
   return patterns.some((p) => p.test(textContent));
 }
 
@@ -64,28 +64,26 @@ function detectRateLimit(ctx, textContent, interceptEvent) {
   const source = interceptEvent?.source;
 
   // Priority 1: CDP status === 429 (source is 'cdp' or undefined)
-  if (status === 429 && (source === 'cdp' || source === undefined)) {
-    const retryAfterMs = extractRetryAfter(interceptEvent, 'cdp');
+  if (status === 429 && (source === "cdp" || source === undefined)) {
+    const retryAfterMs = extractRetryAfter(interceptEvent, "cdp");
     return {
       isRateLimited: true,
       retryAfterMs: retryAfterMs !== null ? retryAfterMs : undefined,
-      source: 'cdp',
-      reason: retryAfterMs !== null
-        ? `CDP 429 with Retry-After: ${retryAfterMs}ms`
-        : 'CDP 429 detected',
+      source: "cdp",
+      reason:
+        retryAfterMs !== null ? `CDP 429 with Retry-After: ${retryAfterMs}ms` : "CDP 429 detected",
     };
   }
 
   // Priority 2: TM status === 429 (source is explicitly 'tm')
-  if (status === 429 && source === 'tm') {
-    const retryAfterMs = extractRetryAfter(interceptEvent, 'tm');
+  if (status === 429 && source === "tm") {
+    const retryAfterMs = extractRetryAfter(interceptEvent, "tm");
     return {
       isRateLimited: true,
       retryAfterMs: retryAfterMs !== null ? retryAfterMs : undefined,
-      source: 'tm',
-      reason: retryAfterMs !== null
-        ? `TM 429 with Retry-After: ${retryAfterMs}ms`
-        : 'TM 429 detected',
+      source: "tm",
+      reason:
+        retryAfterMs !== null ? `TM 429 with Retry-After: ${retryAfterMs}ms` : "TM 429 detected",
     };
   }
 
@@ -95,16 +93,16 @@ function detectRateLimit(ctx, textContent, interceptEvent) {
     return {
       isRateLimited: true,
       retryAfterMs: undefined,
-      source: 'text',
-      reason: 'Rate limit text pattern matched',
+      source: "text",
+      reason: "Rate limit text pattern matched",
     };
   }
 
   return {
     isRateLimited: false,
     retryAfterMs: undefined,
-    source: /** @type {'cdp'|'tm'|'text'} */ ('cdp'),
-    reason: 'No rate limit detected',
+    source: /** @type {'cdp'|'tm'|'text'} */ ("cdp"),
+    reason: "No rate limit detected",
   };
 }
 
@@ -120,26 +118,30 @@ function detectRateLimit(ctx, textContent, interceptEvent) {
  * @param {'cdp'|'tm'} [source]
  * @returns {number|null} - Parsed retry-after in ms, or null if not present/invalid
  */
-function extractRetryAfter(event, source) {
-  if (!event?.headers) return null;
+function extractRetryAfter(event, _source) {
+  if (!event?.headers) {
+    return null;
+  }
 
-  const headerKey = Object.keys(event.headers).find(
-    (k) => k.toLowerCase() === 'retry-after'
-  );
-  if (!headerKey) return null;
+  const headerKey = Object.keys(event.headers).find((k) => k.toLowerCase() === "retry-after");
+  if (!headerKey) {
+    return null;
+  }
 
   const value = event.headers[headerKey];
-  if (!value) return null;
+  if (!value) {
+    return null;
+  }
 
   // Try parsing as delta seconds first
   const deltaSec = parseInt(value, 10);
-  if (!isNaN(deltaSec)) {
+  if (!Number.isNaN(deltaSec)) {
     return deltaSec * 1000;
   }
 
   // Try parsing as HTTP-date (RFC 7231)
   const date = new Date(value);
-  if (!isNaN(date.getTime())) {
+  if (!Number.isNaN(date.getTime())) {
     const deltaMs = date.getTime() - Date.now();
     return deltaMs > 0 ? deltaMs : null;
   }

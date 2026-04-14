@@ -1,4 +1,4 @@
-'use strict';
+"use strict";
 
 /**
  * @fileoverview Error Detector — Detects errors from CDP, TM, or text patterns.
@@ -9,9 +9,7 @@
  * The ctx.interceptedStatus field carries the last CDP/TM status.
  */
 
-const {
-  ErrorResult, // eslint-disable-line no-unused-vars
-} = require('./strategy-contracts.cjs');
+require("./strategy-contracts.cjs");
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Default error text patterns (can be overridden by client config)
@@ -56,7 +54,7 @@ const DEFAULT_ERROR_PATTERNS = [
  * @returns {{ matched: boolean, errorType: string|null }}
  */
 function matchTextPatterns(textContent, patterns = DEFAULT_ERROR_PATTERNS) {
-  if (!textContent || typeof textContent !== 'string') {
+  if (!textContent || typeof textContent !== "string") {
     return { matched: false, errorType: null };
   }
   for (const p of patterns) {
@@ -76,19 +74,23 @@ function matchTextPatterns(textContent, patterns = DEFAULT_ERROR_PATTERNS) {
  */
 function inferErrorTypeFromPattern(pattern) {
   const src = pattern.source;
-  if (/5\d{2}|server\s*error|internal|service\s*unavailable|bad\s*gateway|gateway\s*timeout/i.test(src)) {
-    return 'server_error';
+  if (
+    /5\d{2}|server\s*error|internal|service\s*unavailable|bad\s*gateway|gateway\s*timeout/i.test(
+      src,
+    )
+  ) {
+    return "server_error";
   }
   if (/401|unauthorized|forbidden|access\s*denied/i.test(src)) {
-    return 'auth_error';
+    return "auth_error";
   }
   if (/timeout|etimedout/i.test(src)) {
-    return 'timeout_error';
+    return "timeout_error";
   }
   if (/network|connection|econnreset|econnrefused|enotfound/i.test(src)) {
-    return 'network_error';
+    return "network_error";
   }
-  return 'server_error'; // default
+  return "server_error"; // default
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -118,42 +120,42 @@ function detectError(ctx, textContent, interceptEvent) {
   const source = interceptEvent?.source;
 
   // Priority 1: CDP status >= 500 → server_error (source is 'cdp' or undefined)
-  if (status >= 500 && status < 600 && (source === 'cdp' || source === undefined)) {
+  if (status >= 500 && status < 600 && (source === "cdp" || source === undefined)) {
     return {
       isError: true,
-      errorType: 'server_error',
-      source: 'cdp',
+      errorType: "server_error",
+      source: "cdp",
       reason: `CDP ${status} server error`,
     };
   }
 
   // Priority 2: CDP status 401/403 → auth_error (source is 'cdp' or undefined)
-  if ((status === 401 || status === 403) && (source === 'cdp' || source === undefined)) {
+  if ((status === 401 || status === 403) && (source === "cdp" || source === undefined)) {
     return {
       isError: true,
-      errorType: 'auth_error',
-      source: 'cdp',
-      reason: status === 401 ? 'CDP 401 Unauthorized' : 'CDP 403 Forbidden',
+      errorType: "auth_error",
+      source: "cdp",
+      reason: status === 401 ? "CDP 401 Unauthorized" : "CDP 403 Forbidden",
     };
   }
 
   // Priority 3: TM status >= 500 → server_error (source is explicitly 'tm')
-  if (status >= 500 && status < 600 && source === 'tm') {
+  if (status >= 500 && status < 600 && source === "tm") {
     return {
       isError: true,
-      errorType: 'server_error',
-      source: 'tm',
+      errorType: "server_error",
+      source: "tm",
       reason: `TM ${status} server error`,
     };
   }
 
   // Priority 4: TM status 401/403 → auth_error (source is explicitly 'tm')
-  if ((status === 401 || status === 403) && source === 'tm') {
+  if ((status === 401 || status === 403) && source === "tm") {
     return {
       isError: true,
-      errorType: 'auth_error',
-      source: 'tm',
-      reason: status === 401 ? 'TM 401 Unauthorized' : 'TM 403 Forbidden',
+      errorType: "auth_error",
+      source: "tm",
+      reason: status === 401 ? "TM 401 Unauthorized" : "TM 403 Forbidden",
     };
   }
 
@@ -163,8 +165,8 @@ function detectError(ctx, textContent, interceptEvent) {
   if (matched) {
     return {
       isError: true,
-      errorType: errorType || 'server_error',
-      source: 'text',
+      errorType: errorType || "server_error",
+      source: "text",
       reason: `Error text pattern matched: ${errorType}`,
     };
   }
@@ -172,8 +174,8 @@ function detectError(ctx, textContent, interceptEvent) {
   return {
     isError: false,
     errorType: undefined,
-    source: /** @type {'cdp'|'tm'|'text'} */ ('cdp'),
-    reason: 'No error detected',
+    source: /** @type {'cdp'|'tm'|'text'} */ ("cdp"),
+    reason: "No error detected",
   };
 }
 

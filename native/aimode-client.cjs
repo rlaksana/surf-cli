@@ -11,14 +11,14 @@ const AIMODE_URL_PRO = "https://www.google.com/search?nem=143&q=";
 const SELECTORS = {
   searchInput: 'textarea[name="q"], input[name="q"], input[aria-label="Search"]',
   resultContainer: '#main, [role="main"], .GybnWb, . Response-container',
-  answer: '.X7NTVe, .的气, [data-initq], .reply-content, .AdD1h',
+  answer: ".X7NTVe, .的气, [data-initq], .reply-content, .AdD1h",
 };
 
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function buildClickDispatcher() {
+function _buildClickDispatcher() {
   return `function dispatchClickSequence(target){
     if(!target || !(target instanceof EventTarget)) return false;
     const types = ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'];
@@ -37,13 +37,16 @@ function buildClickDispatcher() {
 }
 
 function hasRequiredCookies(cookies) {
-  if (!cookies || !Array.isArray(cookies)) return false;
+  if (!cookies || !Array.isArray(cookies)) {
+    return false;
+  }
   // Check for Google session cookies
-  const hasSession = cookies.some(c =>
-    c.name.includes('SID') ||
-    c.name.includes('HSID') ||
-    c.name === '__Secure-1PAPISID' ||
-    c.name === '__Secure-1PSID'
+  const hasSession = cookies.some(
+    (c) =>
+      c.name.includes("SID") ||
+      c.name.includes("HSID") ||
+      c.name === "__Secure-1PAPISID" ||
+      c.name === "__Secure-1PSID",
   );
   return hasSession || cookies.length > 0;
 }
@@ -51,9 +54,10 @@ function hasRequiredCookies(cookies) {
 async function evaluate(cdp, expression) {
   const result = await cdp(expression);
   if (result.exceptionDetails) {
-    const desc = result.exceptionDetails.exception?.description ||
-                 result.exceptionDetails.text ||
-                 "Evaluation failed";
+    const desc =
+      result.exceptionDetails.exception?.description ||
+      result.exceptionDetails.text ||
+      "Evaluation failed";
     throw new Error(desc);
   }
   if (result.error) {
@@ -75,7 +79,7 @@ async function waitForPageLoad(cdp, timeoutMs = 30000) {
   throw new Error("Page did not load in time");
 }
 
-async function waitForSearchBox(cdp, timeoutMs = 15000) {
+async function _waitForSearchBox(cdp, timeoutMs = 15000) {
   const deadline = Date.now() + timeoutMs;
   const selectors = JSON.stringify(SELECTORS.searchInput.split(", "));
   while (Date.now() < deadline) {
@@ -90,15 +94,17 @@ async function waitForSearchBox(cdp, timeoutMs = 15000) {
           }
         }
         return false;
-      })()`
+      })()`,
     );
-    if (found) return true;
+    if (found) {
+      return true;
+    }
     await delay(200);
   }
   return false;
 }
 
-async function typeQuery(cdp, inputCdp, query) {
+async function _typeQuery(cdp, inputCdp, query) {
   const selectors = SELECTORS.searchInput.split(", ");
 
   // Click on search box first
@@ -114,7 +120,7 @@ async function typeQuery(cdp, inputCdp, query) {
         }
       }
       return false;
-    })()`
+    })()`,
   );
 
   await delay(200);
@@ -125,16 +131,16 @@ async function typeQuery(cdp, inputCdp, query) {
   await delay(100);
 }
 
-async function pressEnter(cdp, inputCdp) {
+async function _pressEnter(_cdp, inputCdp) {
   await inputCdp("Input.dispatchKeyEvent", {
     type: "keyDown",
     key: "Enter",
-    text: "\r"
+    text: "\r",
   });
   await inputCdp("Input.dispatchKeyEvent", {
     type: "keyUp",
     key: "Enter",
-    text: "\r"
+    text: "\r",
   });
 }
 
@@ -168,7 +174,7 @@ async function waitForResponse(cdp, timeoutMs, log = () => {}) {
         `(() => {
           const spinner = document.querySelector('.pRzye, .l4cyt, [role="progressbar"]');
           return spinner !== null;
-        })()`
+        })()`,
       );
       log(`  -> Loading: ${isLoading}, lastContent length: ${lastContent.length}`);
       if (!isLoading && lastContent) {
@@ -201,7 +207,7 @@ async function getAnswerContent(cdp, log = () => {}) {
         try { info.aimc = document.querySelector('[data-subtree="aimc"]')?.textContent?.substring(0, 100); } catch(e) {}
         try { info.main = document.querySelector('main')?.textContent?.substring(0, 100); } catch(e) {}
         return info;
-      })()`
+      })()`,
     );
     log(`Debug: ${JSON.stringify(debugInfo)}`);
 
@@ -244,7 +250,7 @@ async function getAnswerContent(cdp, log = () => {}) {
 
         // Last resort: body text cleaned
         return document.body.textContent.trim().replace(/\\s+/g, ' ').substring(0, 3000);
-      })()`
+      })()`,
     );
 
     return result || "";
@@ -271,14 +277,13 @@ async function query(options) {
   const searchUrl = pro ? AIMODE_URL_PRO : AIMODE_URL_AUTO;
   const startTime = Date.now();
   const debugLog = (msg) => {
-    console.error(`[AIMODE DEBUG] ${msg}`);
     log(msg);
   };
 
   debugLog("Starting aimode query");
 
   const { cookies } = await getCookies();
-  const cookieNames = cookies?.map(c => c.name) || [];
+  const cookieNames = cookies?.map((c) => c.name) || [];
   if (!hasRequiredCookies(cookies)) {
     debugLog(`Warning: No Google cookies found. Found: ${cookieNames.join(", ")}`);
   }
@@ -298,7 +303,7 @@ async function query(options) {
   debugLog(`Created tab ${tabId}`);
 
   const cdp = (expr) => cdpEvaluate(tabId, expr);
-  const inputCdp = (method, params) => cdpCommand(tabId, method, params);
+  const _inputCdp = (method, params) => cdpCommand(tabId, method, params);
 
   try {
     // Wait for tab to be ready
@@ -327,7 +332,7 @@ async function query(options) {
           const hasAI = document.querySelector('[data-subtree="aimc"]') !== null ||
                         document.querySelector('[data-subtree="aimfl"]') !== null;
           return { loading: loading !== null, hasAI: hasAI };
-        })()`
+        })()`,
       );
       debugLog(`Status: loading=${status.loading}, hasAI=${status.hasAI}`);
 
@@ -341,7 +346,7 @@ async function query(options) {
         const retryStatus = await evaluate(
           cdp,
           `(() => document.querySelector('[data-subtree="aimc"]') !== null ||
-                    document.querySelector('[data-subtree="aimfl"]') !== null)`
+                    document.querySelector('[data-subtree="aimfl"]') !== null)`,
         );
         if (!retryStatus) {
           debugLog("No AI response available");
@@ -364,7 +369,7 @@ async function query(options) {
     };
   } finally {
     if (tabId) {
-      await closeTab(tabId).catch(e => console.error('[aimode] Tab cleanup error:', e.message));
+      await closeTab(tabId).catch((_e) => {});
     }
   }
 }

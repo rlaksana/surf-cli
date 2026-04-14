@@ -1,6 +1,6 @@
-const fs = require("fs");
-const path = require("path");
-const os = require("os");
+const fs = require("node:fs");
+const path = require("node:path");
+const os = require("node:os");
 
 const CONFIG_NAME = "surf.json";
 
@@ -12,28 +12,28 @@ const STARTER_CONFIG = {
   // When disabled, screenshots return base64 + ID instead of file path
   autoSaveScreenshots: true,
   routes: {
-    main: ["http://localhost:3000"]
+    main: ["http://localhost:3000"],
   },
   selectors: {
     chatgpt: {
-      input: "#prompt-textarea"
-    }
-  }
+      input: "#prompt-textarea",
+    },
+  },
 };
 
 const COUNCIL_CONFIG = {
-  defaultProviders: ['chatgpt', 'gemini', 'aimode'],
+  defaultProviders: ["chatgpt", "gemini", "aimode"],
   timeouts: {
-    chatgpt: 300000,   // 5 min
-    gemini: 180000,    // 3 min
-    aimode: 120000     // 2 min
+    chatgpt: 300000, // 5 min
+    gemini: 180000, // 3 min
+    aimode: 120000, // 2 min
   },
-  overallTimeout: 480000,  // 8 min
+  overallTimeout: 480000, // 8 min
   zombieRecovery: {
     enabled: true,
     maxRetries: 2,
-    cleanupTimeout: 30000
-  }
+    cleanupTimeout: 30000,
+  },
 };
 
 // Grok models can be customized in surf.json if X.com UI changes:
@@ -75,8 +75,7 @@ function loadConfig() {
     cachedConfig = JSON.parse(content);
     cachedConfigPath = configPath;
     return cachedConfig;
-  } catch (err) {
-    console.error(`Warning: Failed to parse ${configPath}: ${err.message}`);
+  } catch (_err) {
     cachedConfig = {};
     cachedConfigPath = null;
     return cachedConfig;
@@ -96,7 +95,7 @@ function createStarterConfig(targetDir = process.cwd()) {
     return { success: false, error: "Config already exists", path: targetPath };
   }
   try {
-    fs.writeFileSync(targetPath, JSON.stringify(STARTER_CONFIG, null, 2) + "\n");
+    fs.writeFileSync(targetPath, `${JSON.stringify(STARTER_CONFIG, null, 2)}\n`);
     return { success: true, path: targetPath };
   } catch (err) {
     return { success: false, error: err.message, path: targetPath };

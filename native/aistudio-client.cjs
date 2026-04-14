@@ -29,19 +29,17 @@ const {
   selectModel,
 } = require("./aistudio-model.cjs");
 
-const {
-  waitForGenerateResponseFromNetwork,
-  waitForResponse,
-} = require("./aistudio-response.cjs");
+const { waitForGenerateResponseFromNetwork, waitForResponse } = require("./aistudio-response.cjs");
 
 const DEFAULT_MODEL = "gemini-3.1-pro-preview";
 
 async function evaluate(cdp, expression) {
   const result = await cdp(expression);
   if (result.exceptionDetails) {
-    const desc = result.exceptionDetails.exception?.description ||
-                 result.exceptionDetails.text ||
-                 "Evaluation failed";
+    const desc =
+      result.exceptionDetails.exception?.description ||
+      result.exceptionDetails.text ||
+      "Evaluation failed";
     throw new Error(desc);
   }
   if (result.error) {
@@ -67,7 +65,9 @@ async function waitForStudioReady(cdp, timeoutMs = 30000) {
   const deadline = Date.now() + timeoutMs;
 
   while (Date.now() < deadline) {
-    const state = await evaluate(cdp, `(() => {
+    const state = await evaluate(
+      cdp,
+      `(() => {
       const url = location.href;
       const isLoginPage = url.includes('accounts.google.com') || url.includes('/signin');
       const isStudioPage = url.includes('aistudio.google.com');
@@ -92,13 +92,14 @@ async function waitForStudioReady(cdp, timeoutMs = 30000) {
         isLoginPage,
         url
       };
-    })()`);
+    })()`,
+    );
 
-    if (state && state.ready) {
+    if (state?.ready) {
       return state;
     }
 
-    if (state && state.isLoginPage) {
+    if (state?.isLoginPage) {
       throw new Error("Redirected to login page - sign into Google in Chrome first");
     }
 
@@ -110,20 +111,25 @@ async function waitForStudioReady(cdp, timeoutMs = 30000) {
 
 async function enableUnformattedMarkdownView(cdp, log = () => {}, timeoutMs = 8000) {
   try {
-    const alreadyEnabled = await evaluate(cdp, `(() => {
+    const alreadyEnabled = await evaluate(
+      cdp,
+      `(() => {
       const t = (document.body && document.body.innerText ? document.body.innerText : '').toLowerCase();
       return t.includes('show conversation with markdown formatting') || t.includes('raw mode');
-    })()`);
+    })()`,
+    );
 
     if (alreadyEnabled) {
-      log('Markdown toggle: already enabled (detected on page)');
+      log("Markdown toggle: already enabled (detected on page)");
       return { success: true, alreadyEnabled: true, detected: true };
     }
   } catch {
     // Ignore detection failures and fall back to menu interaction
   }
 
-  const openMenu = await evaluate(cdp, `(() => {
+  const openMenu = await evaluate(
+    cdp,
+    `(() => {
     ${buildClickDispatcher()}
     const buttons = Array.from(document.querySelectorAll('button'));
     const menuBtn = buttons.find(b => {
@@ -134,18 +140,21 @@ async function enableUnformattedMarkdownView(cdp, log = () => {}, timeoutMs = 80
     if (!menuBtn) return { success: false, error: 'View more actions button not found' };
     dispatchClickSequence(menuBtn);
     return { success: true };
-  })()`);
+  })()`,
+  );
 
   if (!openMenu || !openMenu.success) {
-    log(`Markdown toggle: ${openMenu?.error || 'menu not available'}`);
-    return { success: false, reason: openMenu?.error || 'menu not available' };
+    log(`Markdown toggle: ${openMenu?.error || "menu not available"}`);
+    return { success: false, reason: openMenu?.error || "menu not available" };
   }
 
   const deadline = Date.now() + timeoutMs;
   let result = null;
 
   while (Date.now() < deadline) {
-    result = await evaluate(cdp, `(() => {
+    result = await evaluate(
+      cdp,
+      `(() => {
       ${buildClickDispatcher()}
 
       const menu = document.querySelector('[role="menu"]');
@@ -183,47 +192,55 @@ async function enableUnformattedMarkdownView(cdp, log = () => {}, timeoutMs = 80
         isEnabled: isEnabled,
         clicked: !isEnabled,
       };
-    })()`);
+    })()`,
+    );
 
-    if (result && result.ready) {
+    if (result?.ready) {
       break;
     }
 
     await delay(150);
   }
 
-  await evaluate(cdp, `(() => {
+  await evaluate(
+    cdp,
+    `(() => {
     const esc = new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', bubbles: true });
     document.dispatchEvent(esc);
-  })()`).catch(() => {});
+  })()`,
+  ).catch(() => {});
 
   if (!result || !result.ready) {
-    log('Markdown toggle: menu did not appear');
-    return { success: false, reason: 'menu did not appear' };
+    log("Markdown toggle: menu did not appear");
+    return { success: false, reason: "menu did not appear" };
   }
 
   if (!result.found) {
-    log(`Markdown toggle: Raw Mode item not found (candidates: ${(result.candidates || []).join(' | ')})`);
-    return { success: false, reason: 'raw mode item not found' };
+    log(
+      `Markdown toggle: Raw Mode item not found (candidates: ${(result.candidates || []).join(" | ")})`,
+    );
+    return { success: false, reason: "raw mode item not found" };
   }
 
   if (result.isEnabled) {
-    log('Markdown toggle: already enabled (Raw Mode)');
+    log("Markdown toggle: already enabled (Raw Mode)");
     return { success: true, alreadyEnabled: true };
   }
 
   if (result.clicked) {
-    log('Markdown toggle: enabled (Raw Mode)');
+    log("Markdown toggle: enabled (Raw Mode)");
     await delay(200);
     return { success: true, enabled: true };
   }
 
-  log('Markdown toggle: not enabled (unexpected)');
-  return { success: false, reason: 'unexpected raw mode toggle state' };
+  log("Markdown toggle: not enabled (unexpected)");
+  return { success: false, reason: "unexpected raw mode toggle state" };
 }
 
 async function typePrompt(cdp, inputCdp, prompt) {
-  const focused = await evaluate(cdp, `(() => {
+  const focused = await evaluate(
+    cdp,
+    `(() => {
     ${buildClickDispatcher()}
 
     const isVisible = (el) => Boolean(el && (el.offsetParent !== null || el.getClientRects().length > 0));
@@ -246,10 +263,11 @@ async function typePrompt(cdp, inputCdp, prompt) {
     }
 
     return { success: false, error: 'Prompt input not found' };
-  })()`);
+  })()`,
+  );
 
   if (!focused || !focused.success) {
-    throw new Error(`Could not focus prompt input: ${focused?.error || 'unknown'}`);
+    throw new Error(`Could not focus prompt input: ${focused?.error || "unknown"}`);
   }
 
   await delay(300);
@@ -261,7 +279,9 @@ async function typePrompt(cdp, inputCdp, prompt) {
 async function submitPrompt(cdp, inputCdp) {
   await delay(200);
 
-  const clicked = await evaluate(cdp, `(() => {
+  const clicked = await evaluate(
+    cdp,
+    `(() => {
     ${buildClickDispatcher()}
     const submitBtn = document.querySelector('button[type="submit"]:not([disabled])');
     if (submitBtn) {
@@ -269,9 +289,10 @@ async function submitPrompt(cdp, inputCdp) {
       return { success: true, method: 'submit-button' };
     }
     return { success: false };
-  })()`);
+  })()`,
+  );
 
-  if (clicked && clicked.success) {
+  if (clicked?.success) {
     await delay(500);
     return;
   }
@@ -345,7 +366,7 @@ async function query(options) {
     await waitForStudioReady(cdp);
     log("AI Studio ready");
 
-    if (typeof readNetworkEntries === 'function') {
+    if (typeof readNetworkEntries === "function") {
       try {
         const baselineNetwork = await readNetworkEntries(tabId);
         const baselineEntries = Array.isArray(baselineNetwork?.entries)
@@ -357,7 +378,7 @@ async function query(options) {
         baselineGenerateEntryIds = new Set(
           extractGenerateEntries(baselineEntries)
             .map((entry) => entry.id)
-            .filter(Boolean)
+            .filter(Boolean),
         );
 
         log(`Network baseline ready (${baselineGenerateEntryIds.size} GenerateContent entries)`);
@@ -372,43 +393,55 @@ async function query(options) {
       log(`Markdown toggle failed: ${e.message}`);
     }
 
-    const usedUrlParam = createdUrl.includes('?model=');
+    const usedUrlParam = createdUrl.includes("?model=");
 
-    let runtimeUrl = await evaluate(cdp, 'location.href');
-    let runtimeModelParam = await evaluate(cdp, `(() => {
+    let runtimeUrl = await evaluate(cdp, "location.href");
+    let runtimeModelParam = await evaluate(
+      cdp,
+      `(() => {
       try {
         return new URLSearchParams(location.search).get('model') || '';
       } catch {
         return '';
       }
-    })()`);
+    })()`,
+    );
 
     if (usedUrlParam && !runtimeModelParam) {
       try {
         log(`Runtime model param missing; retrying direct navigation: ${createdUrl}`);
-        await inputCdp('Page.navigate', { url: createdUrl });
+        await inputCdp("Page.navigate", { url: createdUrl });
         await waitForPageLoad(cdp);
         await waitForStudioReady(cdp);
-        runtimeUrl = await evaluate(cdp, 'location.href');
-        runtimeModelParam = await evaluate(cdp, `(() => {
+        runtimeUrl = await evaluate(cdp, "location.href");
+        runtimeModelParam = await evaluate(
+          cdp,
+          `(() => {
           try {
             return new URLSearchParams(location.search).get('model') || '';
           } catch {
             return '';
           }
-        })()`);
+        })()`,
+        );
       } catch (e) {
         log(`Direct model URL navigation retry failed: ${e.message || e}`);
       }
     }
 
     if (usedUrlParam) {
-      log(`Model via URL param: requested="${resolvedModel}", runtimeParam="${runtimeModelParam || '(none)'}"`);
+      log(
+        `Model via URL param: requested="${resolvedModel}", runtimeParam="${runtimeModelParam || "(none)"}"`,
+      );
     } else {
       log(`Model via UI (no URL param): requested="${resolvedModel}"`);
     }
 
-    const currentModelInfo = await readCurrentModelInfo(cdp).catch(() => ({ found: false, label: '', modelId: '' }));
+    const currentModelInfo = await readCurrentModelInfo(cdp).catch(() => ({
+      found: false,
+      label: "",
+      modelId: "",
+    }));
 
     log(`AI Studio URL: ${runtimeUrl}`);
     if (currentModelInfo?.label) {
@@ -453,7 +486,7 @@ async function query(options) {
 
     let response;
 
-    if (typeof readNetworkEntries === 'function') {
+    if (typeof readNetworkEntries === "function") {
       try {
         const networkResult = await waitForGenerateResponseFromNetwork({
           tabId,
@@ -471,7 +504,7 @@ async function query(options) {
 
         log(
           `Network response: ${response.text.length} chars` +
-          `${networkResult.requestId ? ` (request ${networkResult.requestId})` : ''}`
+            `${networkResult.requestId ? ` (request ${networkResult.requestId})` : ""}`,
         );
       } catch (networkErr) {
         log(`Network extraction failed, falling back to DOM: ${networkErr.message || networkErr}`);
@@ -483,7 +516,7 @@ async function query(options) {
       response = await waitForResponse(cdp, timeout, prompt, log);
     }
 
-    const thinkingInfo = response.thinkingTime ? ` (thought for ${response.thinkingTime}s)` : '';
+    const thinkingInfo = response.thinkingTime ? ` (thought for ${response.thinkingTime}s)` : "";
     log(`Response: ${response.text.length} chars${thinkingInfo}`);
 
     return {

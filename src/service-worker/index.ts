@@ -2153,6 +2153,7 @@ export async function handleMessage(
       const targetTabId = message.tabId;
       if (!targetTabId) throw new Error("No tabId provided");
       const tab = await chrome.tabs.update(targetTabId, { active: true });
+      if (!tab) throw new Error("Tab not found");
       if (tab.windowId) {
         await chrome.windows.update(tab.windowId, { focused: true });
       }
@@ -2341,45 +2342,49 @@ export async function handleMessage(
     }
 
     case "TAB_GROUP_CREATE": {
-      const tabIds = [...(message.tabIds || [])];
+      const tabIdsRaw: number[] = [...(message.tabIds || [])] as number[];
       const name = message.name || "Surf";
       const validColors = ['grey', 'blue', 'red', 'yellow', 'green', 'pink', 'purple', 'cyan', 'orange'];
       const color = validColors.includes(message.color) ? message.color : 'blue';
-      
-      if (tabIds.length === 0 && tabId) {
-        tabIds.push(tabId);
+
+      if (tabIdsRaw.length === 0 && tabId) {
+        tabIdsRaw.push(tabId);
       }
-      
-      if (tabIds.length === 0) throw new Error("No tabs specified");
-      
+
+      if (tabIdsRaw.length === 0) throw new Error("No tabs specified");
+
+      // tabIds must be at least [number, ...number[]] per Chrome API
+      const tabIds = tabIdsRaw as [number, ...number[]];
+
       const existingGroups = await chrome.tabGroups.query({ title: name });
+
       let groupId: number;
-      
       if (existingGroups.length > 0) {
         groupId = existingGroups[0].id;
         await chrome.tabs.group({ tabIds, groupId });
       } else {
-        groupId = await chrome.tabs.group({ tabIds });
+        const newGroupId = await chrome.tabs.group({ tabIds });
+        groupId = newGroupId;
         await chrome.tabGroups.update(groupId, {
           title: name,
-          color: color as chrome.tabGroups.ColorEnum,
+          color: color as chrome.tabGroups.Color,
           collapsed: false,
         });
       }
-      
-      return { success: true, groupId, name, tabIds };
+
+      return { success: true, groupId, name, tabIds: tabIdsRaw };
     }
 
     case "TAB_GROUP_REMOVE": {
-      const tabIds = [...(message.tabIds || [])];
-      if (tabIds.length === 0 && tabId) {
-        tabIds.push(tabId);
+      const tabIdsRaw: number[] = [...(message.tabIds || [])] as number[];
+      if (tabIdsRaw.length === 0 && tabId) {
+        tabIdsRaw.push(tabId);
       }
-      
-      if (tabIds.length === 0) throw new Error("No tabs specified");
-      
-      await chrome.tabs.ungroup(tabIds);
-      return { success: true, ungrouped: tabIds };
+
+      if (tabIdsRaw.length === 0) throw new Error("No tabs specified");
+
+      await chrome.tabs.ungroup(tabIdsRaw as [number, ...number[]]);
+      return { success: true, ungrouped: tabIdsRaw };
     }
 
     case "TAB_GROUPS_LIST": {
@@ -2627,13 +2632,13 @@ export async function handleMessage(
         focused: false,
         type: "normal",
       });
-      if (!window.id) throw new Error("Failed to create window");
+      if (!window?.id) throw new Error("Failed to create window");
       const tabs = await chrome.tabs.query({ windowId: window.id });
       const tab = tabs[0];
       if (!tab?.id) throw new Error("Failed to get tab from window");
       if (tab.status !== "complete") {
         await new Promise<void>((resolve) => {
-          const listener = (tabId: number, info: chrome.tabs.TabChangeInfo) => {
+          const listener = (tabId: number, info: chrome.tabs.OnUpdatedInfo) => {
             if (tabId === tab.id && info.status === "complete") {
               chrome.tabs.onUpdated.removeListener(listener);
               resolve();
@@ -2682,13 +2687,13 @@ export async function handleMessage(
         focused: false,
         type: "normal",
       });
-      if (!window.id) throw new Error("Failed to create window");
+      if (!window?.id) throw new Error("Failed to create window");
       const tabs = await chrome.tabs.query({ windowId: window.id });
       const tab = tabs[0];
       if (!tab?.id) throw new Error("Failed to get tab from window");
       if (tab.status !== "complete") {
         await new Promise<void>((resolve) => {
-          const listener = (tabId: number, info: chrome.tabs.TabChangeInfo) => {
+          const listener = (tabId: number, info: chrome.tabs.OnUpdatedInfo) => {
             if (tabId === tab.id && info.status === "complete") {
               chrome.tabs.onUpdated.removeListener(listener);
               resolve();
@@ -2737,13 +2742,13 @@ export async function handleMessage(
         focused: false,
         type: "normal",
       });
-      if (!window.id) throw new Error("Failed to create window");
+      if (!window?.id) throw new Error("Failed to create window");
       const tabs = await chrome.tabs.query({ windowId: window.id });
       const tab = tabs[0];
       if (!tab?.id) throw new Error("Failed to get tab from window");
       if (tab.status !== "complete") {
         await new Promise<void>((resolve) => {
-          const listener = (tabId: number, info: chrome.tabs.TabChangeInfo) => {
+          const listener = (tabId: number, info: chrome.tabs.OnUpdatedInfo) => {
             if (tabId === tab.id && info.status === "complete") {
               chrome.tabs.onUpdated.removeListener(listener);
               resolve();
@@ -2825,13 +2830,13 @@ export async function handleMessage(
         focused: false,
         type: "normal",
       });
-      if (!window.id) throw new Error("Failed to create window");
+      if (!window?.id) throw new Error("Failed to create window");
       const tabs = await chrome.tabs.query({ windowId: window.id });
       const tab = tabs[0];
       if (!tab?.id) throw new Error("Failed to get tab from window");
       if (tab.status !== "complete") {
         await new Promise<void>((resolve) => {
-          const listener = (tabId: number, info: chrome.tabs.TabChangeInfo) => {
+          const listener = (tabId: number, info: chrome.tabs.OnUpdatedInfo) => {
             if (tabId === tab.id && info.status === "complete") {
               chrome.tabs.onUpdated.removeListener(listener);
               resolve();
@@ -2880,7 +2885,7 @@ export async function handleMessage(
         focused: false,
         type: "normal",
       });
-      if (!window.id) throw new Error("Failed to create window");
+      if (!window?.id) throw new Error("Failed to create window");
       const tabs = await chrome.tabs.query({ windowId: window.id });
       const tab = tabs[0];
       if (!tab?.id) throw new Error("Failed to get tab from window");
@@ -3006,13 +3011,13 @@ export async function handleMessage(
         focused: false,
         type: "normal",
       });
-      if (!window.id) throw new Error("Failed to create window");
+      if (!window?.id) throw new Error("Failed to create window");
       const tabs = await chrome.tabs.query({ windowId: window.id });
       const tab = tabs[0];
       if (!tab?.id) throw new Error("Failed to get tab from window");
       if (tab.status !== "complete") {
         await new Promise<void>((resolve) => {
-          const listener = (tabId: number, info: chrome.tabs.TabChangeInfo) => {
+          const listener = (tabId: number, info: chrome.tabs.OnUpdatedInfo) => {
             if (tabId === tab.id && info.status === "complete") {
               chrome.tabs.onUpdated.removeListener(listener);
               resolve();
@@ -3057,13 +3062,13 @@ export async function handleMessage(
         focused: false,
         type: "normal",
       });
-      if (!window.id) throw new Error("Failed to create window");
+      if (!window?.id) throw new Error("Failed to create window");
       const tabs = await chrome.tabs.query({ windowId: window.id });
       const tab = tabs[0];
       if (!tab?.id) throw new Error("Failed to get tab from window");
       if (tab.status !== "complete") {
         await new Promise<void>((resolve) => {
-          const listener = (tabId: number, info: chrome.tabs.TabChangeInfo) => {
+          const listener = (tabId: number, info: chrome.tabs.OnUpdatedInfo) => {
             if (tabId === tab.id && info.status === "complete") {
               chrome.tabs.onUpdated.removeListener(listener);
               resolve();
@@ -3172,7 +3177,7 @@ export async function handleMessage(
       
       const window = await chrome.windows.create(createOptions);
       
-      if (!window.id) throw new Error("Failed to create window");
+      if (!window?.id) throw new Error("Failed to create window");
       
       // Get the tab that was created with the window
       const tabs = await chrome.tabs.query({ windowId: window.id });
@@ -3235,7 +3240,7 @@ export async function handleMessage(
       if (message.height) updateInfo.height = message.height;
       if (message.left !== undefined) updateInfo.left = message.left;
       if (message.top !== undefined) updateInfo.top = message.top;
-      if (message.state) updateInfo.state = message.state as chrome.windows.windowStateEnum;
+      if (message.state) updateInfo.state = message.state as chrome.windows.WindowState;
       
       const window = await chrome.windows.update(message.windowId, updateInfo);
       return { 

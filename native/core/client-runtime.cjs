@@ -1,4 +1,4 @@
-'use strict';
+"use strict";
 
 /**
  * @fileoverview Client Runtime — Orchestrates all core modules for AI client detection.
@@ -13,9 +13,9 @@
  *   destroy() → removes listeners, clears state
  */
 
-const { EventEmitter } = require('events');
-const { createNormalizer } = require('./signal-normalizer.cjs');
-const { createTTLCache } = require('./ttl-cache.cjs');
+const { EventEmitter } = require("events");
+const { createNormalizer } = require("./signal-normalizer.cjs");
+const { createTTLCache } = require("./ttl-cache.cjs");
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Cookie Validator Interface (Task 7 — implemented in parallel)
@@ -39,8 +39,21 @@ function loadCookieValidator(cookieValidatorPath) {
   } catch {
     // Return a no-op validator if cookie-validator is not yet available
     return {
-      validatePhase1: () => ({ valid: true, phase: 1, failedSignals: [], reason: 'cookie-validator not available', cached: false }),
-      validatePhase2: () => Promise.resolve({ valid: true, phase: 2, failedSignals: [], reason: 'cookie-validator not available', cached: false }),
+      validatePhase1: () => ({
+        valid: true,
+        phase: 1,
+        failedSignals: [],
+        reason: "cookie-validator not available",
+        cached: false,
+      }),
+      validatePhase2: () =>
+        Promise.resolve({
+          valid: true,
+          phase: 2,
+          failedSignals: [],
+          reason: "cookie-validator not available",
+          cached: false,
+        }),
     };
   }
 }
@@ -56,9 +69,9 @@ function loadCookieValidator(cookieValidatorPath) {
  * @returns {object} CDP client with cdp() method
  */
 function createCdpSocketClient(socketPath) {
-  const net = require('net');
-  const IS_WIN = process.platform === 'win32';
-  const pipePath = IS_WIN ? '//./pipe/surf' : socketPath;
+  const net = require("node:net");
+  const IS_WIN = process.platform === "win32";
+  const pipePath = IS_WIN ? "//./pipe/surf" : socketPath;
 
   /** @type {Map<number, {resolve: Function, reject: Function}>} */
   const pendingRequests = new Map();
@@ -80,7 +93,7 @@ function createCdpSocketClient(socketPath) {
       pendingRequests.set(id, { resolve, reject });
 
       const msg = {
-        type: 'tool',
+        type: "tool",
         method,
         params: { ...params, tabId },
         id,
@@ -88,7 +101,7 @@ function createCdpSocketClient(socketPath) {
       };
 
       if (!connected || !socket) {
-        reject(new Error('CDP socket not connected'));
+        reject(new Error("CDP socket not connected"));
         return;
       }
 
@@ -109,16 +122,16 @@ function createCdpSocketClient(socketPath) {
     return new Promise((resolve, reject) => {
       socket = net.createConnection(pipePath, () => {
         connected = true;
-        socket.on('data', handleData);
+        socket.on("data", handleData);
         resolve();
       });
 
-      socket.on('error', (err) => {
+      socket.on("error", (err) => {
         connected = false;
         reject(err);
       });
 
-      socket.on('close', () => {
+      socket.on("close", () => {
         connected = false;
       });
 
@@ -127,21 +140,25 @@ function createCdpSocketClient(socketPath) {
 
         while (inputBuffer.length >= 4) {
           const len = inputBuffer.readUInt32LE(0);
-          if (inputBuffer.length < 4 + len) break;
+          if (inputBuffer.length < 4 + len) {
+            break;
+          }
 
-          const json = inputBuffer.slice(4, 4 + len).toString('utf8');
+          const json = inputBuffer.slice(4, 4 + len).toString("utf8");
           inputBuffer = inputBuffer.slice(4 + len);
 
           try {
             const msg = JSON.parse(json);
             handleMessage(msg);
-          } catch {}
+          } catch {
+            // Swallow malformed JSON — partial frames are expected during streaming
+          }
         }
       }
 
       function handleMessage(msg) {
         // Handle tool_response messages — resolve pending request promises
-        if (msg.type === 'tool_response' && msg.id !== undefined) {
+        if (msg.type === "tool_response" && msg.id !== undefined) {
           const pending = pendingRequests.get(msg.id);
           if (pending) {
             pendingRequests.delete(msg.id);
@@ -174,7 +191,7 @@ function createCdpSocketClient(socketPath) {
 
   function destroy() {
     for (const [, p] of pendingRequests) {
-      p.reject(new Error('Socket destroyed'));
+      p.reject(new Error("Socket destroyed"));
     }
     pendingRequests.clear();
     streamHandlers.clear();
@@ -200,8 +217,8 @@ function createCdpSocketClient(socketPath) {
  * @param {object} normalizer - SignalNormalizer instance
  * @returns {CompletionSignals}
  */
-function buildCompletionSignals(snapshot, ctx, normalizer) {
-  const pageContent = snapshot?.pageContent || '';
+function buildCompletionSignals(snapshot, ctx) {
+  const pageContent = snapshot?.pageContent || "";
 
   // Signal 1: isTransportIdle — always true by default
   // Real idle detection requires the normalizer to emit idle events after the
@@ -209,26 +226,23 @@ function buildCompletionSignals(snapshot, ctx, normalizer) {
   // interceptedStatus, but idle tracking is handled by the completion engine
   // based on the verdict's maxTimeout.
   const transportIdle = true;
-  const idleReason = 'Transport idle (normalizer idle tracking not yet wired)';
-  void normalizer; // normalizer param reserved for future idle tracking
+  const idleReason = "Transport idle (normalizer idle tracking not yet wired)";
 
   // Signal 2: isRenderStable — content length stability check
   const contentLength = pageContent.length;
   const isStable = contentLength > 0;
-  const stableReason = isStable
-    ? `Content length: ${contentLength} chars`
-    : 'No content rendered';
+  const stableReason = isStable ? `Content length: ${contentLength} chars` : "No content rendered";
 
   // Signal 3: isSemanticComplete — done token check
   const doneTokenSelector = ctx.doneTokenSelector;
   let semanticComplete = false;
-  let semanticReason = 'Done token not found';
+  let semanticReason = "Done token not found";
 
   if (doneTokenSelector && pageContent) {
     // Simple check: if the selector string appears in page content, it's complete
     // In practice this would use CDP querySelector, but for the signal we scan content
-    const donePattern = doneTokenSelector.split(',')[0].trim();
-    if (donePattern && pageContent.includes(donePattern.replace(/[''""\\]/g, ''))) {
+    const donePattern = doneTokenSelector.split(",")[0].trim();
+    if (donePattern && pageContent.includes(donePattern.replace(/[''""\\]/g, ""))) {
       semanticComplete = true;
       semanticReason = `Done token found: ${donePattern}`;
     }
@@ -237,21 +251,21 @@ function buildCompletionSignals(snapshot, ctx, normalizer) {
   // Signal 4: isInteractionReady — stop button gone + input ready
   const stopButtonSelector = ctx.stopButtonSelector;
   let interactionReady = false;
-  let interactionReason = 'Waiting for interaction ready';
+  let interactionReason = "Waiting for interaction ready";
 
   if (stopButtonSelector) {
-    const stopPattern = stopButtonSelector.split(',')[0].trim();
-    const stopGone = !stopPattern || !pageContent.includes(stopPattern.replace(/[''""\\]/g, ''));
+    const stopPattern = stopButtonSelector.split(",")[0].trim();
+    const stopGone = !stopPattern || !pageContent.includes(stopPattern.replace(/[''""\\]/g, ""));
     if (stopGone) {
       interactionReady = true;
-      interactionReason = 'Stop button not visible';
+      interactionReason = "Stop button not visible";
     }
   } else {
     // No stop button configured — treat as interaction ready if content exists
     interactionReady = contentLength > 0;
     interactionReason = interactionReady
-      ? 'No stop button configured, content present'
-      : 'No content yet';
+      ? "No stop button configured, content present"
+      : "No content yet";
   }
 
   return {
@@ -276,7 +290,7 @@ function buildCompletionSignals(snapshot, ctx, normalizer) {
 async function getDomSnapshot(cdpClient, tabId) {
   // Use the same protocol as host.cjs: send a tool request for page content
   // The result comes back via the socket as a tool_response
-  return cdpClient.cdp('Page.read', { filter: 'interactive' }, tabId);
+  return cdpClient.cdp("Page.read", { filter: "interactive" }, tabId);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -294,13 +308,13 @@ async function getDomSnapshot(cdpClient, tabId) {
  */
 function wireInterceptHandlers(normalizer, interceptEvents, ctx) {
   // Track the latest HTTP status from any source
-  interceptEvents.on('response', (envelope) => {
+  interceptEvents.on("response", (envelope) => {
     if (envelope.status) {
       ctx.interceptedStatus = envelope.status;
     }
   });
 
-  interceptEvents.on('error', (envelope) => {
+  interceptEvents.on("error", (envelope) => {
     if (envelope.status) {
       ctx.interceptedStatus = envelope.status;
     }
@@ -309,14 +323,14 @@ function wireInterceptHandlers(normalizer, interceptEvents, ctx) {
   // Forward all normalized envelopes from both CDP and TM to interceptEvents
   // This lets callers (strategy, completion engine) subscribe to intercept events
   normalizer.addCDPHandler((envelope) => {
-    interceptEvents.emit('envelope', envelope);
+    interceptEvents.emit("envelope", envelope);
     if (envelope.status) {
       ctx.interceptedStatus = envelope.status;
     }
   });
 
   normalizer.addTMHandler((envelope) => {
-    interceptEvents.emit('envelope', envelope);
+    interceptEvents.emit("envelope", envelope);
     if (envelope.status) {
       ctx.interceptedStatus = envelope.status;
     }
@@ -359,20 +373,20 @@ function wireInterceptHandlers(normalizer, interceptEvents, ctx) {
  */
 function createClientRuntime(clientId, config, strategy, options = {}) {
   // Validate required arguments
-  if (!clientId || typeof clientId !== 'string') {
-    throw new Error('clientId is required and must be a string');
+  if (!clientId || typeof clientId !== "string") {
+    throw new Error("clientId is required and must be a string");
   }
-  if (!config || typeof config !== 'object') {
-    throw new Error('config is required and must be an object');
+  if (!config || typeof config !== "object") {
+    throw new Error("config is required and must be an object");
   }
-  if (!strategy || typeof strategy !== 'object') {
-    throw new Error('strategy is required and must be an object');
+  if (!strategy || typeof strategy !== "object") {
+    throw new Error("strategy is required and must be an object");
   }
-  if (typeof strategy.checkCompletion !== 'function') {
-    throw new Error('strategy.checkCompletion is required and must be a function');
+  if (typeof strategy.checkCompletion !== "function") {
+    throw new Error("strategy.checkCompletion is required and must be a function");
   }
 
-  const socketPath = options.socketPath || '/tmp/surf.sock';
+  const socketPath = options.socketPath || "/tmp/surf.sock";
   const cookieValidatorPath = options.cookieValidatorPath;
 
   // Test overrides — used ONLY in test environments (injected via options._testOverrides)
@@ -419,32 +433,49 @@ function createClientRuntime(clientId, config, strategy, options = {}) {
   // Runtime context passed to strategy.checkCompletion
   /** @type {ClientRuntimeCtx} */
   const ctx = {
-    get tabId() { return tabId; },
-    get socket() { return socket; },
-    get interceptEvents() { return interceptEvents; },
-    get interceptedStatus() { return interceptedStatus; },
-    get config() { return config; },
-    get clientId() { return clientId; },
+    get tabId() {
+      return tabId;
+    },
+    get socket() {
+      return socket;
+    },
+    get interceptEvents() {
+      return interceptEvents;
+    },
+    get interceptedStatus() {
+      return interceptedStatus;
+    },
+    get config() {
+      return config;
+    },
+    get clientId() {
+      return clientId;
+    },
 
     // Lazy DOM snapshot — captures on demand
     async domSnapshot() {
       if (!cdpClient || tabId == null) {
-        return { pageContent: '', error: 'Not initialized' };
+        return { pageContent: "", error: "Not initialized" };
       }
       try {
         return await getDomSnapshot(cdpClient, tabId);
       } catch (err) {
-        return { pageContent: '', error: err.message };
+        return { pageContent: "", error: err.message };
       }
     },
 
     // CDP querySelector via Page.read accessibility tree
     async querySelector(selector) {
-      if (!cdpClient || tabId == null) return null;
+      if (!cdpClient || tabId == null) {
+        return null;
+      }
       try {
         const snapshot = await getDomSnapshot(cdpClient, tabId);
-        const content = snapshot?.pageContent || '';
-        const firstSelector = selector.split(',')[0].trim().replace(/[''""\\]/g, '');
+        const content = snapshot?.pageContent || "";
+        const firstSelector = selector
+          .split(",")[0]
+          .trim()
+          .replace(/[''""\\]/g, "");
         if (firstSelector && content.includes(firstSelector)) {
           return { found: true, selector };
         }
@@ -456,12 +487,12 @@ function createClientRuntime(clientId, config, strategy, options = {}) {
 
     get stopButtonSelector() {
       const chain = config?.selectors?.stopButton;
-      return Array.isArray(chain) ? chain[0] : (chain || '');
+      return Array.isArray(chain) ? chain[0] : chain || "";
     },
 
     get doneTokenSelector() {
       const chain = config?.selectors?.doneToken;
-      return Array.isArray(chain) ? chain[0] : (chain || '');
+      return Array.isArray(chain) ? chain[0] : chain || "";
     },
 
     get networkIdleMs() {
@@ -504,7 +535,7 @@ function createClientRuntime(clientId, config, strategy, options = {}) {
     // Skip if already provided via test overrides
     if (!normalizer) {
       normalizer = createNormalizer((envelope) => {
-        interceptEvents.emit('envelope', envelope);
+        interceptEvents.emit("envelope", envelope);
       });
     }
 
@@ -531,7 +562,7 @@ function createClientRuntime(clientId, config, strategy, options = {}) {
    */
   async function attachInterceptors() {
     if (!normalizer) {
-      throw new Error('init() must be called before attachInterceptors()');
+      throw new Error("init() must be called before attachInterceptors()");
     }
 
     // Wire up intercept handlers to update ctx.interceptedStatus
@@ -540,15 +571,15 @@ function createClientRuntime(clientId, config, strategy, options = {}) {
     // CDP interceptors are always active — normalizer handles the events
     // The cdpClient stream is set up in wireInterceptHandlers to call
     // normalizer.normalizeCDPEvent on Network events
-    interceptEvents.on('cdp:Network.responseReceived', (envelope) => {
+    interceptEvents.on("cdp:Network.responseReceived", (envelope) => {
       normalizer.emit(envelope);
     });
 
-    interceptEvents.on('cdp:Network.requestWillBeSent', (envelope) => {
+    interceptEvents.on("cdp:Network.requestWillBeSent", (envelope) => {
       normalizer.emit(envelope);
     });
 
-    interceptEvents.on('cdp:Network.loadingFailed', (envelope) => {
+    interceptEvents.on("cdp:Network.loadingFailed", (envelope) => {
       normalizer.emit(envelope);
     });
 
@@ -556,15 +587,19 @@ function createClientRuntime(clientId, config, strategy, options = {}) {
     // This is checked at runtime via window.Tampermonkey !== undefined
     // The content script will set up TM listeners if available
     // For the runtime, we just wire up the handler (normalizer.addTMHandler is a no-op if TM absent)
-    if (typeof window !== 'undefined' && window.Tampermonkey !== undefined) {
-      interceptEvents.on('tm:fetch', (rawEvent) => {
+    if (typeof window !== "undefined" && window.Tampermonkey !== undefined) {
+      interceptEvents.on("tm:fetch", (rawEvent) => {
         const envelope = normalizer.normalizeTMEvent(rawEvent);
-        if (envelope) normalizer.emit(envelope);
+        if (envelope) {
+          normalizer.emit(envelope);
+        }
       });
 
-      interceptEvents.on('tm:xhr', (rawEvent) => {
+      interceptEvents.on("tm:xhr", (rawEvent) => {
         const envelope = normalizer.normalizeTMEvent(rawEvent);
-        if (envelope) normalizer.emit(envelope);
+        if (envelope) {
+          normalizer.emit(envelope);
+        }
       });
     }
   }
@@ -584,7 +619,7 @@ function createClientRuntime(clientId, config, strategy, options = {}) {
     if (!cdpClient || tabId == null) {
       return {
         done: false,
-        reason: 'Runtime not initialized',
+        reason: "Runtime not initialized",
         confidence: 0,
         activeSignals: [],
       };
@@ -627,7 +662,7 @@ function createClientRuntime(clientId, config, strategy, options = {}) {
         valid: false,
         phase: 1,
         failedSignals: [],
-        reason: 'Runtime not initialized',
+        reason: "Runtime not initialized",
         cached: false,
       };
     }
@@ -636,12 +671,12 @@ function createClientRuntime(clientId, config, strategy, options = {}) {
     let cookies = [];
     try {
       // CDP: DOM.getCookies or Network.getCookies
-      const cookieResult = await cdpClient.cdp('DOM.getCookies', {}, tabId);
+      const cookieResult = await cdpClient.cdp("DOM.getCookies", {}, tabId);
       cookies = cookieResult?.cookies || [];
     } catch {
       // Fallback: try legacy cookie API
       try {
-        const legacyResult = await cdpClient.cdp('Network.getCookies', {}, tabId);
+        const legacyResult = await cdpClient.cdp("Network.getCookies", {}, tabId);
         cookies = legacyResult?.cookies || [];
       } catch {
         // Neither cookie API available
@@ -650,7 +685,7 @@ function createClientRuntime(clientId, config, strategy, options = {}) {
     }
 
     // Check TTL cache for previous validation result
-    const fingerprint = cookies.map((c) => `${c.name}=${c.value ? '1' : '0'}`).join('|');
+    const fingerprint = cookies.map((c) => `${c.name}=${c.value ? "1" : "0"}`).join("|");
     const cacheKey = `cookies:${clientId}:${fingerprint}`;
     const cachedResult = ttlCache?.get(cacheKey);
     if (cachedResult) {
@@ -686,9 +721,10 @@ function createClientRuntime(clientId, config, strategy, options = {}) {
       valid: failedSignals.length === 0,
       phase: 1,
       failedSignals,
-      reason: failedSignals.length === 0
-        ? 'All required cookies present'
-        : `Missing cookies: ${failedSignals.join(', ')}`,
+      reason:
+        failedSignals.length === 0
+          ? "All required cookies present"
+          : `Missing cookies: ${failedSignals.join(", ")}`,
       cached: false,
     };
 

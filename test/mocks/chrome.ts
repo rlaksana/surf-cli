@@ -251,6 +251,7 @@ export function createMockTab(overrides: Partial<chrome.tabs.Tab> = {}): chrome.
     selected: false, // deprecated but required by type
     pinned: false,
     incognito: false,
+    frozen: false,
     url: "https://example.com",
     title: "Example",
     status: "complete",

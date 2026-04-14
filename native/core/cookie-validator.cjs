@@ -1,4 +1,4 @@
-'use strict';
+"use strict";
 
 /**
  * @fileoverview Cookie Validator — Two-phase cookie validation for AI client sessions.
@@ -9,22 +9,14 @@
  * @module cookie-validator
  */
 
-const http = /** @type {import('http')} */ (require('http'));
-const https = /** @type {import('https')} */ (require('https'));
-const net = /** @type {import('net')} */ (require('net'));
-const { URL } = require('url');
+const http = /** @type {import('http')} */ (require("node:http"));
+const https = /** @type {import('https')} */ (require("node:https"));
+const net = /** @type {import('net')} */ (require("node:net"));
+const { URL } = require("node:url");
 
-const {
-  CookieValidationResult, // eslint-disable-line no-unused-vars
-  CookieSignal, // eslint-disable-line no-unused-vars
-  ClientConfig, // eslint-disable-line no-unused-vars
-  ClientRuntimeCtx, // eslint-disable-line no-unused-vars
-  TTLCache, // eslint-disable-line no-unused-vars
-} = require('./strategy-contracts.cjs');
+require("./strategy-contracts.cjs");
 
-const SOCKET_PATH = process.platform === 'win32'
-  ? '//./pipe/surf'
-  : '/tmp/surf.sock';
+const SOCKET_PATH = process.platform === "win32" ? "//./pipe/surf" : "/tmp/surf.sock";
 
 /** Default HTTP timeout for Phase 2 validation */
 const HTTP_TIMEOUT_MS = 10000;
@@ -39,28 +31,30 @@ function getCookiesFromHost(tabId) {
   return new Promise((resolve, reject) => {
     const sock = net.createConnection(SOCKET_PATH, () => {
       const req = {
-        type: 'tool_request',
-        method: 'execute_tool',
-        params: { tool: 'cookie.list', args: {} },
-        id: 'cv-' + Date.now() + '-' + Math.random(),
+        type: "tool_request",
+        method: "execute_tool",
+        params: { tool: "cookie.list", args: {} },
+        id: `cv-${Date.now()}-${Math.random()}`,
         tabId,
       };
-      sock.write(JSON.stringify(req) + '\n');
+      sock.write(`${JSON.stringify(req)}\n`);
     });
 
-    let buf = '';
+    let buf = "";
     const timeout = setTimeout(() => {
       sock.destroy();
-      reject(new Error('Cookie list request timeout'));
+      reject(new Error("Cookie list request timeout"));
     }, 10000);
 
-    sock.on('data', (d) => {
+    sock.on("data", (d) => {
       buf += d.toString();
-      const lines = buf.split('\n');
-      buf = lines.pop() || '';
+      const lines = buf.split("\n");
+      buf = lines.pop() || "";
 
       for (const line of lines) {
-        if (!line.trim()) continue;
+        if (!line.trim()) {
+          continue;
+        }
         try {
           const resp = JSON.parse(line);
 
@@ -68,15 +62,14 @@ function getCookiesFromHost(tabId) {
           if (resp.error) {
             clearTimeout(timeout);
             sock.end();
-            const errText = resp.error.content?.[0]?.text
-              || resp.error.message
-              || JSON.stringify(resp.error);
+            const errText =
+              resp.error.content?.[0]?.text || resp.error.message || JSON.stringify(resp.error);
             reject(new Error(errText));
             return;
           }
 
           // tool_response format: { type: 'tool_response', id, result: { cookies: [...] } }
-          if (resp.type === 'tool_response' && resp.result) {
+          if (resp.type === "tool_response" && resp.result) {
             clearTimeout(timeout);
             sock.end();
 
@@ -84,14 +77,16 @@ function getCookiesFromHost(tabId) {
             let cookies = [];
             if (Array.isArray(resp.result.cookies)) {
               cookies = resp.result.cookies;
-            } else if (resp.result.cookie && typeof resp.result.cookie === 'object') {
+            } else if (resp.result.cookie && typeof resp.result.cookie === "object") {
               cookies = [resp.result.cookie];
             } else if (Array.isArray(resp.result)) {
               cookies = resp.result;
-            } else if (typeof resp.result === 'object') {
+            } else if (typeof resp.result === "object") {
               // Fallback: try to extract any array named 'cookies'
               const arr = Object.values(resp.result).find(Array.isArray);
-              if (arr) cookies = arr;
+              if (arr) {
+                cookies = arr;
+              }
             }
 
             resolve(cookies);
@@ -99,34 +94,34 @@ function getCookiesFromHost(tabId) {
           }
 
           // Extension disconnected
-          if (resp.type === 'extension_disconnected') {
+          if (resp.type === "extension_disconnected") {
             clearTimeout(timeout);
             sock.end();
-            reject(new Error('Extension disconnected'));
+            reject(new Error("Extension disconnected"));
             return;
           }
         } catch (err) {
           clearTimeout(timeout);
           sock.end();
-          reject(new Error('Invalid JSON from host: ' + err.message));
+          reject(new Error(`Invalid JSON from host: ${err.message}`));
           return;
         }
       }
     });
 
-    sock.on('error', (e) => {
+    sock.on("error", (e) => {
       clearTimeout(timeout);
-      if (e.code === 'ENOENT') {
-        reject(new Error('Socket not found. Is Chrome running with the surf extension?'));
+      if (e.code === "ENOENT") {
+        reject(new Error("Socket not found. Is Chrome running with the surf extension?"));
       } else {
         reject(e);
       }
     });
 
-    sock.on('close', () => {
+    sock.on("close", () => {
       clearTimeout(timeout);
       // If we get here without resolving, it means no valid response was received
-      reject(new Error('Socket closed without response'));
+      reject(new Error("Socket closed without response"));
     });
   });
 }
@@ -147,17 +142,17 @@ function httpPing({ url, cookieHeader, timeoutMs, successStatuses }) {
       return;
     }
 
-    const isHttps = parsed.protocol === 'https:';
+    const isHttps = parsed.protocol === "https:";
     const httpMod = isHttps ? https : http;
 
     const opts = {
       hostname: parsed.hostname,
       port: parsed.port || (isHttps ? 443 : 80),
       path: parsed.pathname + parsed.search,
-      method: 'GET',
+      method: "GET",
       headers: {
-        'Cookie': cookieHeader,
-        'User-Agent': 'surf-cli/1.0 cookie-validator',
+        Cookie: cookieHeader,
+        "User-Agent": "surf-cli/1.0 cookie-validator",
       },
       timeout: timeoutMs,
     };
@@ -174,14 +169,14 @@ function httpPing({ url, cookieHeader, timeoutMs, successStatuses }) {
       });
     });
 
-    req.on('error', (err) => {
+    req.on("error", (err) => {
       resolve({
         ok: false,
         reason: `HTTP request failed: ${err.message}`,
       });
     });
 
-    req.on('timeout', () => {
+    req.on("timeout", () => {
       req.destroy();
       resolve({ ok: false, reason: `HTTP ping timed out after ${timeoutMs}ms` });
     });
@@ -210,7 +205,7 @@ function validatePhase1(ctx, requiredCookies, getCookiesFn) {
       valid: true,
       phase: /** @type {1|2} */ (1),
       failedSignals: [],
-      reason: 'No required cookies configured',
+      reason: "No required cookies configured",
       cached: false,
     });
   }
@@ -226,7 +221,7 @@ function validatePhase1(ctx, requiredCookies, getCookiesFn) {
       /** @type {Map<string, string>} */
       const cookieMap = new Map();
       for (const c of actualCookies) {
-        cookieMap.set(c.name, c.value || '');
+        cookieMap.set(c.name, c.value || "");
       }
 
       for (const required of requiredCookies) {
@@ -236,7 +231,7 @@ function validatePhase1(ctx, requiredCookies, getCookiesFn) {
         }
 
         if (required.pattern) {
-          const value = cookieMap.get(required.name) || '';
+          const value = cookieMap.get(required.name) || "";
           let regex;
           try {
             regex = new RegExp(required.pattern);
@@ -255,7 +250,7 @@ function validatePhase1(ctx, requiredCookies, getCookiesFn) {
           valid: false,
           phase: /** @type {1|2} */ (1),
           failedSignals,
-          reason: `Missing or invalid cookies: ${failedSignals.join(', ')}`,
+          reason: `Missing or invalid cookies: ${failedSignals.join(", ")}`,
           cached: false,
         };
       }
@@ -264,7 +259,7 @@ function validatePhase1(ctx, requiredCookies, getCookiesFn) {
         valid: true,
         phase: /** @type {1|2} */ (1),
         failedSignals: [],
-        reason: 'All required cookies present',
+        reason: "All required cookies present",
         cached: false,
       };
     })
@@ -298,7 +293,7 @@ function validatePhase2(ctx, cache, fingerprint, getCookiesFn) {
       valid: false,
       phase: /** @type {1|2} */ (2),
       failedSignals: [],
-      reason: 'No validation targetUrl configured',
+      reason: "No validation targetUrl configured",
       cached: false,
     });
   }
@@ -312,27 +307,26 @@ function validatePhase2(ctx, cache, fingerprint, getCookiesFn) {
 
   return getCookies(ctx.tabId)
     .then((actualCookies) => {
-      // Build cookie header string from all cookies
-      const cookieHeader = actualCookies
-        .map((c) => `${c.name}=${c.value || ''}`)
-        .join('; ');
+      const cookieHeader = actualCookies.map((c) => `${c.name}=${c.value || ""}`).join("; ");
 
+      // Return the promise so rejections propagate to the outer .catch()
       return httpPing({
         url: validation.targetUrl,
         cookieHeader,
         timeoutMs: HTTP_TIMEOUT_MS,
         successStatuses: validation.successStatus || [200, 204],
-      }).then((result) => {
-        const validationResult = {
-          valid: result.ok,
-          phase: /** @type {1|2} */ (2),
-          failedSignals: result.ok ? [] : ['http_ping'],
-          reason: result.reason,
-          cached: false,
-        };
-        cache.set(cacheKey, validationResult);
-        return validationResult;
-      });
+      }).then((result) => [result, cacheKey]);
+    })
+    .then(([result, ck]) => {
+      const validationResult = {
+        valid: result.ok,
+        phase: /** @type {1|2} */ (2),
+        failedSignals: result.ok ? [] : ["http_ping"],
+        reason: result.reason,
+        cached: false,
+      };
+      cache.set(ck, validationResult);
+      return validationResult;
     })
     .catch((err) => ({
       valid: false,
@@ -354,14 +348,14 @@ function validatePhase2(ctx, cache, fingerprint, getCookiesFn) {
  * @returns {{ validatePhase1: () => Promise<CookieValidationResult>, validatePhase2: (fingerprint?: string) => Promise<CookieValidationResult> }}
  */
 function createCookieValidator(cache, config, ctx, getCookiesFn) {
-  if (!cache || typeof cache.get !== 'function' || typeof cache.set !== 'function') {
-    throw new Error('cache must implement TTLCache interface { get, set, invalidate, clear }');
+  if (!cache || typeof cache.get !== "function" || typeof cache.set !== "function") {
+    throw new Error("cache must implement TTLCache interface { get, set, invalidate, clear }");
   }
-  if (!config || typeof config !== 'object') {
-    throw new Error('config must be a ClientConfig object');
+  if (!config || typeof config !== "object") {
+    throw new Error("config must be a ClientConfig object");
   }
-  if (!ctx || typeof ctx !== 'object') {
-    throw new Error('ctx must be a ClientRuntimeCtx object');
+  if (!ctx || typeof ctx !== "object") {
+    throw new Error("ctx must be a ClientRuntimeCtx object");
   }
 
   // Bind required cookies from config
@@ -382,7 +376,7 @@ function createCookieValidator(cache, config, ctx, getCookiesFn) {
      * @param {string} [fingerprint='default'] - Cache key fingerprint
      * @returns {Promise<CookieValidationResult>}
      */
-    async validatePhase2(fingerprint = 'default') {
+    async validatePhase2(fingerprint = "default") {
       return validatePhase2(ctx, cache, fingerprint, getCookies);
     },
   };

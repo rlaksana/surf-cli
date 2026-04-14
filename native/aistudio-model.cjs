@@ -15,9 +15,10 @@ const {
 async function evaluate(cdp, expression) {
   const result = await cdp(expression);
   if (result.exceptionDetails) {
-    const desc = result.exceptionDetails.exception?.description ||
-                 result.exceptionDetails.text ||
-                 "Evaluation failed";
+    const desc =
+      result.exceptionDetails.exception?.description ||
+      result.exceptionDetails.text ||
+      "Evaluation failed";
     throw new Error(desc);
   }
   if (result.error) {
@@ -27,7 +28,9 @@ async function evaluate(cdp, expression) {
 }
 
 async function readCurrentModelInfo(cdp) {
-  return evaluate(cdp, `(() => {
+  return evaluate(
+    cdp,
+    `(() => {
     const normalize = (text) => (text || '').replace(/\\s+/g, ' ').trim();
 
     const selector = document.querySelector('button.model-selector-card, .model-selector-card');
@@ -38,34 +41,42 @@ async function readCurrentModelInfo(cdp) {
     const raw = normalize(selector.textContent || '');
     const lower = raw.toLowerCase();
     const compact = lower.replace(/\\s+/g, '');
-    const modelIdMatch = compact.match(/gemini-[a-z0-9.\-]*(?:preview|latest)/) ||
-      lower.match(/gemini-[a-z0-9.\-]*(?:preview|latest)/);
+    const modelIdMatch = compact.match(/gemini-[a-z0-9.-]*(?:preview|latest)/) ||
+      lower.match(/gemini-[a-z0-9.-]*(?:preview|latest)/);
 
     return {
       found: true,
       label: lower,
       modelId: modelIdMatch ? modelIdMatch[0] : '',
     };
-  })()`);
+  })()`,
+  );
 }
 
 async function waitForModelToApply(cdp, requestedModel, log, timeoutMs = 15000) {
   const normalizedRequested = normalizeModelString(requestedModel);
   const keywords = extractModelKeywords(normalizedRequested);
-  if (!normalizedRequested) return true;
+  if (!normalizedRequested) {
+    return true;
+  }
 
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    const info = await readCurrentModelInfo(cdp).catch(() => ({ found: false, label: '', modelId: '' }));
+    const info = await readCurrentModelInfo(cdp).catch(() => ({
+      found: false,
+      label: "",
+      modelId: "",
+    }));
 
     const modelIdMatches = info.modelId && info.modelId === normalizedRequested;
-    const keywordMatches = info.label && keywords.length > 0 && keywords.every(k => info.label.includes(k));
+    const keywordMatches =
+      info.label && keywords.length > 0 && keywords.every((k) => info.label.includes(k));
 
     if (modelIdMatches || keywordMatches) {
       log(
         `Model appears applied: requested=${normalizedRequested}` +
-        `${info.modelId ? `, detected=${info.modelId}` : ''}` +
-        `${info.label ? `, label=${info.label.slice(0, 120)}` : ''}`
+          `${info.modelId ? `, detected=${info.modelId}` : ""}` +
+          `${info.label ? `, label=${info.label.slice(0, 120)}` : ""}`,
       );
       return true;
     }
@@ -78,7 +89,9 @@ async function waitForModelToApply(cdp, requestedModel, log, timeoutMs = 15000) 
 }
 
 async function closeModelSelectorIfOpen(cdp, log = () => {}) {
-  const closed = await evaluate(cdp, `(() => {
+  const closed = await evaluate(
+    cdp,
+    `(() => {
     const dialog = document.querySelector('[role="dialog"]');
     if (!dialog) return false;
 
@@ -88,10 +101,11 @@ async function closeModelSelectorIfOpen(cdp, log = () => {}) {
     const esc = new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', bubbles: true });
     document.dispatchEvent(esc);
     return true;
-  })()`).catch(() => false);
+  })()`,
+  ).catch(() => false);
 
   if (closed) {
-    log('Closed model selector dialog before continuing');
+    log("Closed model selector dialog before continuing");
     await delay(150);
   }
 
@@ -100,9 +114,13 @@ async function closeModelSelectorIfOpen(cdp, log = () => {}) {
 
 async function selectModel(cdp, desiredModel, log, timeoutMs = 10000) {
   const normalizedTargetModel = normalizeModelString(desiredModel);
-  if (!normalizedTargetModel) return desiredModel;
+  if (!normalizedTargetModel) {
+    return desiredModel;
+  }
 
-  const openSelector = await evaluate(cdp, `(() => {
+  const openSelector = await evaluate(
+    cdp,
+    `(() => {
     ${buildClickDispatcher()}
 
     const normalize = (text) => (text || '').replace(/\\s+/g, ' ').trim();
@@ -132,20 +150,25 @@ async function selectModel(cdp, desiredModel, log, timeoutMs = 10000) {
     }
 
     return { success: false, error: 'Model selector button not found' };
-  })()`);
+  })()`,
+  );
 
   if (!openSelector || !openSelector.success) {
-    log(`Model selector not found: ${openSelector?.error || 'unknown'}`);
+    log(`Model selector not found: ${openSelector?.error || "unknown"}`);
     return desiredModel;
   }
 
-  log(`Opened model selector via ${openSelector.method}: ${openSelector.currentModel || '(unknown)'}`);
+  log(
+    `Opened model selector via ${openSelector.method}: ${openSelector.currentModel || "(unknown)"}`,
+  );
 
   const deadline = Date.now() + timeoutMs;
-  const targetToken = normalizedTargetModel.replace(/[^a-z0-9]/g, '');
+  const targetToken = normalizedTargetModel.replace(/[^a-z0-9]/g, "");
 
   while (Date.now() < deadline) {
-    const result = await evaluate(cdp, `(() => {
+    const result = await evaluate(
+      cdp,
+      `(() => {
       ${buildClickDispatcher()}
 
       const target = ${JSON.stringify(normalizedTargetModel)};
@@ -193,26 +216,32 @@ async function selectModel(cdp, desiredModel, log, timeoutMs = 10000) {
         success: false,
         models: candidates.slice(0, 8).map((item) => item.raw.slice(0, 80)),
       };
-    })()`);
+    })()`,
+    );
 
-    if (result && result.found) {
+    if (result?.found) {
       if (result.success) {
         log(`Selected model (${result.match}): ${result.model}`);
         await delay(300);
         return result.model;
       }
 
-      log(`Model "${desiredModel}" not found in selector options: ${JSON.stringify(result.models || [])}`);
+      log(
+        `Model "${desiredModel}" not found in selector options: ${JSON.stringify(result.models || [])}`,
+      );
       break;
     }
 
     await delay(200);
   }
 
-  await evaluate(cdp, `(() => {
+  await evaluate(
+    cdp,
+    `(() => {
     const esc = new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', bubbles: true });
     document.dispatchEvent(esc);
-  })()`).catch(() => {});
+  })()`,
+  ).catch(() => {});
 
   return desiredModel;
 }

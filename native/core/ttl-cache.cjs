@@ -1,4 +1,4 @@
-'use strict';
+"use strict";
 
 /**
  * @fileoverview TTL Cache — Sliding-expiration LRU cache for cookie validation
@@ -31,12 +31,12 @@
  * @param {TTLCacheConfig} config
  * @returns {TTLCache}
  */
-function createTTLCache({ ttlMs, maxSize = 100, keyFn } = {}) {
-  if (typeof ttlMs !== 'number' || ttlMs <= 0) {
-    throw new Error('ttlMs must be a positive number');
+function createTTLCache({ ttlMs, maxSize = 100, _keyFn } = {}) {
+  if (typeof ttlMs !== "number" || ttlMs <= 0) {
+    throw new Error("ttlMs must be a positive number");
   }
-  if (typeof maxSize !== 'number' || maxSize <= 0) {
-    throw new Error('maxSize must be a positive number');
+  if (typeof maxSize !== "number" || maxSize <= 0) {
+    throw new Error("maxSize must be a positive number");
   }
 
   /** @type {Map<string, {value: any, expiresAt: number, lruOrder: number}>} */
@@ -55,7 +55,9 @@ function createTTLCache({ ttlMs, maxSize = 100, keyFn } = {}) {
         oldest = key;
       }
     }
-    if (oldest !== null) store.delete(oldest);
+    if (oldest !== null) {
+      store.delete(oldest);
+    }
   }
 
   /**
@@ -67,7 +69,9 @@ function createTTLCache({ ttlMs, maxSize = 100, keyFn } = {}) {
    */
   function get(key) {
     const entry = store.get(key);
-    if (!entry) return null;
+    if (!entry) {
+      return null;
+    }
 
     if (Date.now() > entry.expiresAt) {
       store.delete(key);

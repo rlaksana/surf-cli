@@ -12,7 +12,9 @@ const createMessageReader = (onMessage) => {
     buffer = Buffer.concat([buffer, chunk]);
     while (buffer.length >= 4) {
       const msgLen = buffer.readUInt32LE(0);
-      if (buffer.length < 4 + msgLen) break;
+      if (buffer.length < 4 + msgLen) {
+        break;
+      }
       const json = buffer.slice(4, 4 + msgLen).toString();
       buffer = buffer.slice(4 + msgLen);
       try {
