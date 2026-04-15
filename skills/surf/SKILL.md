@@ -69,6 +69,13 @@ surf perplexity "deep dive" --mode research       # Research mode (Pro)
 surf perplexity "latest news" --model sonar       # Model selection (Pro)
 ```
 
+### Claude
+```bash
+surf claude "explain this code"
+surf claude "summarize" --with-page              # Include current page context
+surf claude "analyze" --model claude-opus-4      # Specify model (default: claude-opus-4)
+```
+
 ### Grok (via x.com - requires X.com login in Chrome)
 ```bash
 surf grok "what are the latest AI trends on X"    # Search X posts
@@ -259,10 +266,8 @@ surf element.styles ".card"            # Or by CSS selector
 
 ```bash
 surf scroll.bottom
-surf scroll.top  
-surf scroll.to --y 500         # Scroll to Y position
+surf scroll.top
 surf scroll.to --ref e5        # Scroll element into view
-surf scroll.by --y 200         # Scroll by amount
 surf scroll.info               # Get scroll position
 ```
 
