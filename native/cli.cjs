@@ -3363,7 +3363,7 @@ async function handleResponse(response) {
     for (const [key, val] of Object.entries(data.paths)) {
       console.log(`${key}: ${val}`);
     }
-  } else if ((tool === "chatgpt" || tool === "gemini") && data?.response) {
+  } else if ((tool === "chatgpt" || tool === "gemini") && data?.response !== undefined) {
     console.log(data.response);
     if (data.imagePath) {
       console.log(`\nImage saved: ${data.imagePath}`);

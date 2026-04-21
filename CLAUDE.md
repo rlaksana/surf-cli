@@ -29,9 +29,12 @@ npm run lint:test        # Lint test files only
 npm run test:ui          # Run tests with Vitest UI
 
 # Extension loading
-npm run install:native  # Install native host (requires extension ID from chrome://extensions)
+npm run install:native -- --id <extension-id>  # Install native host with extension ID
 npm run uninstall:native # Uninstall native host
                          # Binary installs to: ~/.surf/bin/ (add to PATH)
+
+# Extension ID for local development:
+# lhleggnadbemlcmebhibmncbkchdbbod (load unpacked from dist/)
 ```
 
 ## Project Structure
@@ -115,6 +118,27 @@ skills/                    # AI agent skill files for surf integration
 - Filter by origin, method, status, type
 
 ## Testing
+
+### Running AI client commands (gemini, chatgpt, etc.)
+
+AI client commands require the native host to be running with the Chrome extension connected:
+
+```bash
+# 1. Install native host with extension ID
+npm run install:native -- --id lhleggnadbemlcmebhibmncbkchdbbod
+
+# 2. Open Chrome with the extension loaded (or reload extension in chrome://extensions)
+
+# 3. Test the command
+surf gemini "analisa gambar" --file "path/to/image.png"
+```
+
+If you see "Done" instead of results, check:
+- Socket exists: `ls -la /tmp/surf.sock`
+- Chrome extension is loaded and connected
+- Native host process is running
+
+### Unit tests
 
 Tests use Vitest. Run a single test:
 

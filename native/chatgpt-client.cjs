@@ -16,6 +16,10 @@ const SELECTORS = {
     'article[data-testid^="conversation-turn"], div[data-testid^="conversation-turn"]',
   fileInput: 'input[type="file"]',
   cloudflareScript: 'script[src*="/challenge-platform/"]',
+  // Detects thinking model indicator (e.g., "Thought for 1m 29s")
+  thinkingIndicator: '[data-message-model-slug*="thinking"]',
+  // Voice mode button appears when stop button transforms after completion
+  voiceButton: '[aria-label="Voice mode"], [data-testid="voice-mode-button"]',
 };
 
 function delay(ms) {
@@ -360,6 +364,7 @@ async function waitForResponse(cdp, timeoutMs = 2700000) {
         const ASSISTANT_SELECTOR = '${SELECTORS.assistantMessage}';
         const STOP_SELECTOR = '${SELECTORS.stopButton}';
         const FINISHED_SELECTOR = '${SELECTORS.finishedActions}';
+        const VOICE_SELECTOR = '${SELECTORS.voiceButton}';
         const isAssistantTurn = (node) => {
           if (!(node instanceof HTMLElement)) return false;
           const role = (node.getAttribute('data-message-author-role') || '').toLowerCase();
@@ -380,15 +385,18 @@ async function waitForResponse(cdp, timeoutMs = 2700000) {
           return { text: '', stopVisible: Boolean(document.querySelector(STOP_SELECTOR)), finished: false };
         }
         const messageRoot = lastAssistantTurn.querySelector(ASSISTANT_SELECTOR) || lastAssistantTurn;
-        const contentRoot = messageRoot.querySelector('.markdown') || 
+        const contentRoot = messageRoot.querySelector('.markdown') ||
                            messageRoot.querySelector('[data-message-content]') ||
                            messageRoot.querySelector('.prose') ||
                            messageRoot;
         const text = (contentRoot?.innerText || contentRoot?.textContent || '').trim();
         const stopVisible = Boolean(document.querySelector(STOP_SELECTOR));
         const finished = Boolean(lastAssistantTurn.querySelector(FINISHED_SELECTOR));
+        const voiceVisible = Boolean(document.querySelector(VOICE_SELECTOR));
         const messageId = messageRoot.getAttribute('data-message-id') || null;
-        return { text, stopVisible, finished, messageId, turnIndex: turns.length - 1 };
+        // Detect if this is a thinking model response (has thinking indicator but no finished actions yet)
+        const hasThinkingIndicator = Boolean(lastAssistantTurn.querySelector('[data-message-model-slug*="thinking"]'));
+        return { text, stopVisible, finished, voiceVisible, messageId, turnIndex: turns.length - 1, hasThinkingIndicator };
       })()`,
     );
     if (!snapshot) {
@@ -407,7 +415,28 @@ async function waitForResponse(cdp, timeoutMs = 2700000) {
     if (!snapshot.stopVisible) {
       const stableEnough = stableCycles >= requiredStableCycles && stableMs >= minStableMs;
       const finishedVisible = snapshot.finished;
+      const voiceVisible = snapshot.voiceVisible;
+      // Voice button appears when stop button transforms after completion
+      // If voice is visible, response is done regardless of thinking indicator
+      if (voiceVisible && currentLength > 0) {
+        return {
+          text: snapshot.text,
+          messageId: snapshot.messageId,
+          turnIndex: snapshot.turnIndex,
+        };
+      }
+      // For thinking models: if we detect a thinking indicator, keep waiting even if stable
+      // The thinking block has no stop button but is not the final response
       if ((finishedVisible || stableEnough) && currentLength > 0) {
+        // Check if this is a thinking block (has thinking indicator but no finished actions)
+        const isThinkingBlock = snapshot.hasThinkingIndicator && !snapshot.finished;
+        if (isThinkingBlock) {
+          // Reset stability and keep waiting for actual response
+          stableCycles = 0;
+          lastChangeAt = Date.now();
+          await delay(400);
+          continue;
+        }
         return {
           text: snapshot.text,
           messageId: snapshot.messageId,
