@@ -107,11 +107,20 @@ function clearCache() {
   cachedConfigPath = null;
 }
 
+function getBrowserConfig() {
+  const config = loadConfig();
+  return {
+    browserType: config.browserType || null,
+    browserPath: config.browserPath || null,
+  };
+}
+
 module.exports = {
   loadConfig,
   getConfigPath,
   createStarterConfig,
   clearCache,
+  getBrowserConfig,
   STARTER_CONFIG,
   COUNCIL_CONFIG,
 };
