@@ -6,7 +6,7 @@
 
 **Architecture:** The auto-launch logic lives in `cli.cjs` (where socket connection errors occur). A new `browser-launcher.cjs` module handles browser launching and extension readiness probing. The install script saves browser config to `surf.json`.
 
-**Tech Stack:** Node.js child_process for launching, net.Socket for PING/PONG probe, surf.json for config persistence
+**Tech Stack:** Node.js child_process for launching, net.Socket for probe via `tab.list` command, surf.json for config persistence
 
 ---
 
@@ -142,62 +142,90 @@ function launchBrowser(browserType, browserPath) {
 }
 
 /**
- * Check if the surf extension is ready by attempting PING/PONG round-trip
+ * Check if the surf extension is ready by sending a lightweight `tab.list` request
+ * and verifying we get a valid structured response.
  * @param {number} timeoutMs - timeout for the check
  * @returns {Promise<boolean>}
  */
-function isExtensionReady(timeoutMs = 2000) {
+function isExtensionReady(timeoutMs = 3000) {
   return new Promise((resolve) => {
     const sock = new net.Socket();
     let resolved = false;
+    const startTime = Date.now();
 
     const cleanup = () => {
       if (!resolved) {
         resolved = true;
-        sock.destroy();
+        try { sock.destroy(); } catch {}
       }
     };
 
-    sock.setTimeout(timeoutMs);
+    const timer = setTimeout(() => {
+      cleanup();
+      resolve(false);
+    }, timeoutMs);
 
     sock.on("connect", () => {
-      // Send PING message
+      // Send a lightweight tab.list probe
+      const req = {
+        type: "tool_request",
+        method: "execute_tool",
+        params: { tool: "tab.list", args: {} },
+        id: `probe-${Date.now()}`,
+      };
+
       try {
-        sock.write(JSON.stringify({ type: "PING", id: `ping-${Date.now()}` }) + "\n");
+        sock.write(JSON.stringify(req) + "\n");
       } catch {
         cleanup();
+        clearTimeout(timer);
         resolve(false);
         return;
       }
 
-      // Wait for PONG response
       let data = "";
-      const pongHandler = (chunk) => {
+      const responseHandler = (chunk) => {
         data += chunk.toString();
-        if (data.includes("PONG")) {
-          sock.removeListener("data", pongHandler);
-          cleanup();
-          resolve(true);
+        // Parse responses as they arrive (may come as multiple JSON lines)
+        const lines = data.split("\n").filter((l) => l.trim());
+        for (const line of lines) {
+          try {
+            const msg = JSON.parse(line);
+            if (msg.id === req.id && msg.result !== undefined) {
+              // Valid structured response received
+              sock.removeListener("data", responseHandler);
+              cleanup();
+              clearTimeout(timer);
+              resolve(true);
+              return;
+            }
+            if (msg.type === "error" || (msg.error && msg.error.code)) {
+              // Error response means extension is connected (even if error)
+              sock.removeListener("data", responseHandler);
+              cleanup();
+              clearTimeout(timer);
+              resolve(true);
+              return;
+            }
+          } catch {
+            // Not JSON yet, continue accumulating
+          }
         }
       };
 
-      sock.on("data", pongHandler);
-
-      sock.on("timeout", () => {
-        sock.removeListener("data", pongHandler);
-        cleanup();
-        resolve(false);
-      });
+      sock.on("data", responseHandler);
 
       sock.on("error", () => {
-        sock.removeListener("data", pongHandler);
+        sock.removeListener("data", responseHandler);
         cleanup();
+        clearTimeout(timer);
         resolve(false);
       });
     });
 
     sock.on("error", () => {
       cleanup();
+      clearTimeout(timer);
       resolve(false);
     });
 
@@ -373,10 +401,12 @@ git commit -m "feat(install): save browserType to surf.json on install"
 
 ---
 
-## Task 4: Update `cli.cjs` to use auto-launch
+## Task 4: Update `cli.cjs` to use auto-launch with request replay
 
 **Files:**
 - Modify: `native/cli.cjs`
+
+This is the most critical change — we need to refactor the socket communication into a reusable function that can replay the original request after successful browser launch.
 
 - [ ] **Step 1: Add require for browser-launcher**
 
@@ -386,71 +416,148 @@ Find the requires at the top of cli.cjs (around line 1-20) and add:
 const { ensureBrowserAndSocket } = require("./browser-launcher.cjs");
 ```
 
-- [ ] **Step 2: Find socket error handler to update**
+- [ ] **Step 2: Extract `sendRequest` into a reusable function**
 
-Search for `socket.on("error"` in cli.cjs (around line 3139). This is in the main CLI request handler.
+In cli.cjs, locate the `sendRequest` function (around line 3003). The current structure wraps socket communication inside a Promise. We need to extract the core socket+sendreceive logic so it can be called directly or retried after launch.
 
-The current code:
+Find this pattern in `sendRequest`:
 ```javascript
-socket.on("error", (err) => {
-  clearTimeout(timeout);
-  if (err.code === "ENOENT") {
-    console.error("Error: Socket not found. Is Chrome running with the surf extension?");
-    console.error("Hint: Run 'surf tab.new' or start the host with: node native/host.cjs");
-  } else if (err.code === "ECONNREFUSED") {
-    console.error("Error: Connection refused. Native host not running.");
-    console.error("Hint: Start the host with: node native/host.cjs");
-  } else if (err.code === "ETIMEDOUT" || err.message.includes("timeout")) {
-    console.error("Error: Connection timed out. Chrome windows may be stuck.");
-    console.error("Hint: Close Chrome manually or run: taskkill /F /IM chrome.exe");
-  } else {
-    console.error("Error:", err.message);
-  }
-  process.exit(1);
-});
+const sendRequest = (toolName, toolArgs = {}) => {
+  return new Promise((resolve, reject) => {
+    const sock = net.createConnection(SOCKET_PATH, () => {
+      // ... send request ...
+    });
+    sock.on("error", (e) => { ... });
+    sock.on("data", (d) => { ... resolve(...); });
+  });
+};
 ```
 
-Replace the ENOENT and ECONNREFUSED cases with auto-launch logic:
+**Create a new helper function** `doSendRequest(request, timeoutMs)` that takes a pre-built request object and handles socket connect → send → receive → cleanup:
 
 ```javascript
-socket.on("error", async (err) => {
-  clearTimeout(timeout);
-  if (err.code === "ENOENT" || err.code === "ECONNREFUSED") {
-    // Try auto-launch browser
-    try {
-      await ensureBrowserAndSocket();
-      // Retry the request by calling the original handler again
-      // Note: we need to restart the request flow
-      // For simplicity, show a message and suggest retry
-      console.error("Browser launched. Please retry your command.");
-      process.exit(1);
-    } catch (launchErr) {
-      console.error("Error: " + launchErr.message);
-      process.exit(1);
+/**
+ * Low-level socket request helper that can be called directly or retried.
+ * @param {object} request - The request object to send
+ * @param {number} timeoutMs - Socket timeout in ms
+ * @returns {Promise<any>} - Resolves with the result from extension
+ */
+function doSendRequest(request, timeoutMs = 30000) {
+  return new Promise((resolve, reject) => {
+    const sock = net.createConnection(SOCKET_PATH, () => {
+      sock.write(`${JSON.stringify(request)}\n`);
+    });
+
+    let timeout;
+    let settled = false;
+
+    const cleanup = () => {
+      settled = true;
+      clearTimeout(timeout);
+      try { sock.destroy(); } catch {}
+    };
+
+    timeout = setTimeout(() => {
+      if (!settled) {
+        cleanup();
+        reject(new Error("Request timed out"));
+      }
+    }, timeoutMs);
+
+    const handleData = (data) => {
+      try {
+        const msg = JSON.parse(data.toString());
+        if (msg.id === request.id) {
+          cleanup();
+          if (msg.error) {
+            reject(new Error(msg.error.message || "Request failed"));
+          } else {
+            resolve(msg.result);
+          }
+        }
+      } catch {}
+    };
+
+    sock.on("data", handleData);
+    sock.on("error", (e) => {
+      if (!settled) {
+        cleanup();
+        reject(e);
+      }
+    });
+    sock.on("close", () => {
+      if (!settled) {
+        cleanup();
+        reject(new Error("Connection closed"));
+      }
+    });
+  });
+}
+```
+
+- [ ] **Step 3: Create a `sendRequestWithAutoLaunch` wrapper**
+
+Add this wrapper function that handles the auto-launch flow:
+
+```javascript
+/**
+ * Send a request with automatic browser launch if needed.
+ * @param {string} toolName - Tool to call
+ * @param {object} toolArgs - Arguments to pass
+ * @param {number} timeoutMs - Timeout
+ * @returns {Promise<any>}
+ */
+async function sendRequestWithAutoLaunch(toolName, toolArgs = {}, timeoutMs = 30000) {
+  const request = {
+    type: "tool_request",
+    method: "execute_tool",
+    params: { tool: toolName, args: toolArgs },
+    id: `cli-${Date.now()}-${Math.random()}`,
+  };
+
+  try {
+    // Try direct request first
+    return await doSendRequest(request, timeoutMs);
+  } catch (err) {
+    // If socket error, try auto-launch
+    if (err.code === "ENOENT" || err.code === "ECONNREFUSED" || err.message.includes("Connection closed")) {
+      try {
+        await ensureBrowserAndSocket();
+        // Retry the request after successful launch
+        return await doSendRequest(request, timeoutMs);
+      } catch (launchErr) {
+        throw new Error(`Auto-launch failed: ${launchErr.message}`);
+      }
     }
-  } else if (err.code === "ETIMEDOUT" || err.message.includes("timeout")) {
-    console.error("Error: Connection timed out. Chrome windows may be stuck.");
-    console.error("Hint: Close Chrome manually or run: taskkill /F /IM chrome.exe");
-    process.exit(1);
-  } else {
-    console.error("Error:", err.message);
-    process.exit(1);
+    // For other errors (timeout, etc), just rethrow
+    throw err;
   }
-});
+}
 ```
 
-**Note:** The retry approach above exits after launch because the socket connection flow is complex to restart. A more sophisticated implementation would queue the original request and replay it. For now, we launch and ask user to retry.
+- [ ] **Step 4: Replace direct `sendRequest` calls with `sendRequestWithAutoLaunch`**
 
-- [ ] **Step 3: Verify syntax**
+Find all places where `sendRequest` is called and the pattern is:
+```javascript
+sendRequest("tool-name", args)
+  .then(...)
+  .catch(...);
+```
+
+Replace with `sendRequestWithAutoLaunch("tool-name", args)`.
+
+**Important:** The `sendRequest` function may still exist for backwards compatibility, but the main CLI command handlers should use `sendRequestWithAutoLaunch` instead.
+
+- [ ] **Step 5: Verify syntax**
 
 Run: `node -c native/cli.cjs`
 Expected: no output (success)
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
 git add native/cli.cjs
-git commit -m "feat(cli): auto-launch browser on socket connection failure"
+git commit -m "feat(cli): auto-launch browser with request replay on socket failure"
 ```
 
 ---
@@ -486,14 +593,27 @@ Expected: Edge should launch automatically, then the command should succeed.
 
 ---
 
+## Out of Scope (Separate Issues)
+
+The following issues were identified during review but are separate from the auto-launch feature:
+
+1. **Firefox installer registers wrong host** (`scripts/install-firefox-host.cjs`): Registers `host.cjs` (Chrome protocol) instead of `firefox-host.cjs`. Separate fix needed.
+
+2. **Firefox click/key duplicate `type` bug** (`native/firefox-host.cjs:173-186`): Click and key commands declare `type` twice, breaking event routing. Separate fix needed.
+
+These are tracked separately and do not block the auto-launch implementation.
+
+---
+
 ## Spec Coverage Check
 
 | Spec Requirement | Task |
 |-----------------|------|
-| PING/PONG handshake for readiness | Task 2: `isExtensionReady()` |
+| Extension readiness probe via `tab.list` | Task 2: `isExtensionReady()` uses `tab.list` command |
 | No process-existence check | Task 2: Only checks extension readiness |
 | Config save on install | Task 3: `install-native-host.cjs` saves to surf.json |
-| Auto-launch on socket error | Task 4: `cli.cjs` error handler |
+| Auto-launch on socket error | Task 4: `sendRequestWithAutoLaunch()` replays request |
+| Request replay after launch | Task 4: `doSendRequest()` + retry after `ensureBrowserAndSocket()` |
 | 30s timeout | Task 2: `waitForExtensionReady()` default |
 | Hidden window launch | Task 2: `launchBrowser()` uses `-WindowStyle Hidden` |
 
