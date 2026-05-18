@@ -10,6 +10,7 @@ const networkStore = require("./network-store.cjs");
 const { parseDoCommands } = require("./do-parser.cjs");
 const { executeDoSteps } = require("./do-executor.cjs");
 const { version: VERSION } = require("../package.json");
+const { ensureBrowserAndSocket } = require("./browser-launcher.cjs");
 
 const IS_WIN = process.platform === "win32";
 const SURF_TMP = IS_WIN ? path.join(os.tmpdir(), "surf") : "/tmp";
@@ -385,17 +386,17 @@ const TOOLS = {
         ],
       },
       aimode: {
-        desc: "Query Google AI Mode (udm=50=auto, nem=143=pro)",
+        desc: "Query Google AI Mode (nem=143=pro default, udm=50=auto with --auto)",
         args: ["query"],
         opts: {
           "with-page": "Include current page context",
           timeout: "Timeout in seconds (default: 120)",
-          pro: "Use nem=143 (pro mode) instead of udm=50 (auto)",
+          auto: "Use udm=50 (auto mode) instead of nem=143 (pro)",
         },
         examples: [
-          { cmd: 'aimode "what is quantum computing"', desc: "Basic query (auto mode)" },
+          { cmd: 'aimode "what is quantum computing"', desc: "Basic query (pro mode, nem=143)" },
           { cmd: 'aimode "summarize" --with-page', desc: "With page context" },
-          { cmd: 'aimode "question" --pro', desc: "Use pro mode (nem=143)" },
+          { cmd: 'aimode "question" --auto', desc: "Use auto mode (udm=50)" },
         ],
       },
       gemini: {
@@ -3046,14 +3047,107 @@ const sendRequest = (toolName, toolArgs = {}) => {
   });
 };
 
+/**
+ * Low-level socket request helper that can be called directly or retried.
+ * @param {object} request - The request object to send
+ * @param {number} timeoutMs - Socket timeout in ms
+ * @returns {Promise<any>} - Resolves with the result from extension
+ */
+function doSendRequest(request, timeoutMs = 30000) {
+  return new Promise((resolve, reject) => {
+    const sock = net.createConnection(SOCKET_PATH, () => {
+      sock.write(`${JSON.stringify(request)}\n`);
+    });
+
+    let timeout;
+    let settled = false;
+
+    const cleanup = () => {
+      settled = true;
+      clearTimeout(timeout);
+      try { sock.destroy(); } catch {}
+    };
+
+    timeout = setTimeout(() => {
+      if (!settled) {
+        cleanup();
+        reject(new Error("Request timed out"));
+      }
+    }, timeoutMs);
+
+    const handleData = (data) => {
+      try {
+        const msg = JSON.parse(data.toString());
+        if (msg.id === request.id) {
+          cleanup();
+          if (msg.error) {
+            reject(new Error(msg.error.message || "Request failed"));
+          } else {
+            resolve(msg.result);
+          }
+        }
+      } catch {}
+    };
+
+    sock.on("data", handleData);
+    sock.on("error", (e) => {
+      if (!settled) {
+        cleanup();
+        reject(e);
+      }
+    });
+    sock.on("close", () => {
+      if (!settled) {
+        cleanup();
+        reject(new Error("Connection closed"));
+      }
+    });
+  });
+}
+
+/**
+ * Send a request with automatic browser launch if needed.
+ * @param {string} toolName - Tool to call
+ * @param {object} toolArgs - Arguments to pass
+ * @param {number} timeoutMs - Timeout
+ * @returns {Promise<any>}
+ */
+async function sendRequestWithAutoLaunch(toolName, toolArgs = {}, timeoutMs = 30000) {
+  const request = {
+    type: "tool_request",
+    method: "execute_tool",
+    params: { tool: toolName, args: toolArgs },
+    id: `cli-${Date.now()}-${Math.random()}`,
+    ...globalOpts,
+  };
+
+  try {
+    // Try direct request first
+    return await doSendRequest(request, timeoutMs);
+  } catch (err) {
+    // If socket error, try auto-launch
+    if (err.code === "ENOENT" || err.code === "ECONNREFUSED" || err.message.includes("Connection closed")) {
+      try {
+        await ensureBrowserAndSocket();
+        // Retry the request after successful launch
+        return await doSendRequest(request, timeoutMs);
+      } catch (launchErr) {
+        throw new Error(`Auto-launch failed: ${launchErr.message}`);
+      }
+    }
+    // For other errors (timeout, etc), just rethrow
+    throw err;
+  }
+}
+
 const performAutoCapture = async () => {
   const timestamp = Date.now();
   const screenshotPath = path.join(SURF_TMP, `surf-error-${timestamp}.png`);
 
   try {
     const [screenshotResp, consoleResp] = await Promise.all([
-      sendRequest("screenshot", { savePath: screenshotPath }),
-      sendRequest("console", {}),
+      sendRequestWithAutoLaunch("screenshot", { savePath: screenshotPath }),
+      sendRequestWithAutoLaunch("console", {}),
     ]);
 
     if (screenshotResp.result) {
@@ -3136,15 +3230,75 @@ socket.on("data", (data) => {
   }
 });
 
-socket.on("error", (err) => {
+socket.on("error", async (err) => {
   clearTimeout(timeout);
-  if (err.code === "ENOENT") {
-    console.error("Error: Socket not found. Is Chrome running with the surf extension?");
-    console.error("Hint: Run 'surf tab.new' or start the host with: node native/host.cjs");
-  } else if (err.code === "ECONNREFUSED") {
-    console.error("Error: Connection refused. Native host not running.");
-    console.error("Hint: Start the host with: node native/host.cjs");
-  } else if (err.code === "ETIMEDOUT" || err.message.includes("timeout")) {
+
+  // Attempt auto-launch for socket errors
+  if (err.code === "ENOENT" || err.code === "ECONNREFUSED") {
+    try {
+      console.error("Socket not ready. Attempting auto-launch...");
+      await ensureBrowserAndSocket();
+
+      // Recreate socket and retry the request
+      const retrySocket = net.createConnection(SOCKET_PATH, () => {
+        retrySocket.write(`${JSON.stringify(request)}\n`);
+      });
+
+      let retryTimeout;
+      retryTimeout = setTimeout(() => {
+        retrySocket.destroy();
+        console.error("Error: Retry timed out.");
+        process.exit(1);
+      }, requestTimeout);
+
+      let buffer = "";
+      retrySocket.on("data", (data) => {
+        buffer += data.toString();
+        const lines = buffer.split("\n");
+        buffer = lines.pop();
+
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          try {
+            const msg = JSON.parse(line);
+            if (msg.type === "extension_disconnected") {
+              clearTimeout(retryTimeout);
+              retrySocket.end();
+              console.error("Error: Extension disconnected during retry.");
+              process.exit(1);
+              return;
+            }
+            clearTimeout(retryTimeout);
+            handleResponse(msg).catch(() => {
+              process.exit(1);
+            });
+          } catch {
+            clearTimeout(retryTimeout);
+            process.exit(1);
+          }
+        }
+      });
+
+      retrySocket.on("error", (e) => {
+        clearTimeout(retryTimeout);
+        console.error("Error:", e.message);
+        process.exit(1);
+      });
+
+      retrySocket.on("close", () => {
+        clearTimeout(retryTimeout);
+      });
+
+      return;
+    } catch (launchErr) {
+      console.error("Auto-launch failed:", launchErr.message);
+      process.exit(1);
+      return;
+    }
+  }
+
+  // For other errors, show original behavior
+  if (err.code === "ETIMEDOUT" || err.message.includes("timeout")) {
     console.error("Error: Connection timed out. Chrome windows may be stuck.");
     console.error("Hint: Close Chrome manually or run: taskkill /F /IM chrome.exe");
   } else {
