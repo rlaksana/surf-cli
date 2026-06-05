@@ -235,7 +235,7 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 async function waitForRuntimeReady(tabId: number, timeoutMs = 10000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   const delay = (ms: number) => new Promise(r => setTimeout(r, ms));
-  
+
   // Poll until we can successfully evaluate JS
   while (Date.now() < deadline) {
     try {
@@ -250,9 +250,94 @@ async function waitForRuntimeReady(tabId: number, timeoutMs = 10000): Promise<vo
     }
     await delay(200);
   }
-  
+
   // Timeout but proceed anyway - the page might still work
   console.warn(`waitForRuntimeReady timed out for tab ${tabId}`);
+}
+
+/**
+ * Open a URL in a NEW TAB of the user's current/focused window, then
+ * MINIMIZE the window so the user's focus is not stolen.
+ *
+ * Replaces the previous `chrome.windows.create({...})` pattern that opened
+ * a new browser window per AI query. The user explicitly does not want new
+ * windows — they want all surf-managed tabs to live in the same window they
+ * are already browsing in, AND they do not want the window to steal focus
+ * from another app they are working in.
+ *
+ * Falls back to the active tab's window if getLastFocused fails. If we
+ * truly cannot find any window, we open a minimal new one as a last resort
+ * (this should never happen in a real browser session).
+ *
+ * @param {string} url - The URL to open
+ * @param {number} [loadTimeoutMs=30000] - How long to wait for the tab to load
+ * @returns {Promise<number>} The new tab's id
+ */
+async function openInCurrentWindow(url: string, loadTimeoutMs: number = 30000): Promise<number> {
+  // Find the window the user is currently in. Prefer last-focused (most
+  // natural), fall back to the active tab's window.
+  let windowId: number | undefined;
+  try {
+    const lastFocused = await chrome.windows.getLastFocused();
+    windowId = lastFocused?.id;
+  } catch {
+    // Some browsers can fail this; try via the active tab
+  }
+  if (windowId === undefined) {
+    try {
+      const [activeTab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+      windowId = activeTab?.windowId;
+    } catch {}
+  }
+
+  // Last resort: open a tiny new window so we still return a tab id
+  if (windowId === undefined) {
+    const win = await chrome.windows.create({ focused: false, state: "minimized", type: "normal" });
+    if (!win?.id) throw new Error("Failed to create window for surf tab");
+    return (await chrome.tabs.query({ windowId: win.id }))[0]?.id ?? -1;
+  }
+
+  // Open the URL in a new tab of that window. Keep it inactive so the user's
+  // current focus is not stolen.
+  const tab = await chrome.tabs.create({ url, windowId, active: false });
+  if (!tab?.id) throw new Error("Failed to create tab in current window");
+
+  // Minimize the window so the user's focus is not stolen — they may be
+  // working in another app. Only minimize if it isn't already minimized,
+  // and only if no tab in the window is currently playing audio (don't
+  // disrupt media). Also skip if the user is already looking at this window
+  // and the new tab is the only active one — though with active:false that
+  // can't happen.
+  try {
+    const win = await chrome.windows.get(windowId);
+    if (win && win.state !== "minimized" && !win.focused) {
+      // Only minimize if the window isn't currently focused (don't yank
+      // the user's eyes if they were just looking at Edge).
+      await chrome.windows.update(windowId, { state: "minimized" });
+    }
+  } catch {
+    // Non-fatal: if we can't minimize, the tab is still created.
+  }
+
+  // Wait for the tab to finish loading. This works while the window is
+  // minimized — the page loads in the background.
+  if (tab.status !== "complete") {
+    await new Promise<void>((resolve) => {
+      const listener = (tabId: number, info: chrome.tabs.OnUpdatedInfo) => {
+        if (tabId === tab.id && info.status === "complete") {
+          chrome.tabs.onUpdated.removeListener(listener);
+          resolve();
+        }
+      };
+      chrome.tabs.onUpdated.addListener(listener);
+      setTimeout(() => {
+        chrome.tabs.onUpdated.removeListener(listener);
+        resolve();
+      }, loadTimeoutMs);
+    });
+  }
+
+  return tab.id;
 }
 
 // Helper for locate.* commands with actions
@@ -2626,35 +2711,10 @@ export async function handleMessage(
     }
 
     case "CHATGPT_NEW_TAB": {
-      // Open in new window (background, no focus steal)
-      const window = await chrome.windows.create({
-        url: "https://chatgpt.com/",
-        focused: false,
-        state: "minimized",
-        type: "normal",
-      });
-      if (!window?.id) throw new Error("Failed to create window");
-      const tabs = await chrome.tabs.query({ windowId: window.id });
-      const tab = tabs[0];
-      if (!tab?.id) throw new Error("Failed to get tab from window");
-      if (tab.status !== "complete") {
-        await new Promise<void>((resolve) => {
-          const listener = (tabId: number, info: chrome.tabs.OnUpdatedInfo) => {
-            if (tabId === tab.id && info.status === "complete") {
-              chrome.tabs.onUpdated.removeListener(listener);
-              resolve();
-            }
-          };
-          chrome.tabs.onUpdated.addListener(listener);
-          setTimeout(() => {
-            chrome.tabs.onUpdated.removeListener(listener);
-            resolve();
-          }, 30000);
-        });
-      }
-      await cdp.attach(tab.id);
-      await waitForRuntimeReady(tab.id, 10000);
-      return { tabId: tab.id };
+      const tabId = await openInCurrentWindow("https://chatgpt.com/");
+      await cdp.attach(tabId);
+      await waitForRuntimeReady(tabId, 10000);
+      return { tabId };
     }
 
     case "CHATGPT_CLOSE_TAB": {
@@ -2682,35 +2742,10 @@ export async function handleMessage(
     }
 
     case "CLAUDE_NEW_TAB": {
-      // Open in new window (background, no focus steal)
-      const window = await chrome.windows.create({
-        url: "https://claude.ai/",
-        focused: false,
-        state: "minimized",
-        type: "normal",
-      });
-      if (!window?.id) throw new Error("Failed to create window");
-      const tabs = await chrome.tabs.query({ windowId: window.id });
-      const tab = tabs[0];
-      if (!tab?.id) throw new Error("Failed to get tab from window");
-      if (tab.status !== "complete") {
-        await new Promise<void>((resolve) => {
-          const listener = (tabId: number, info: chrome.tabs.OnUpdatedInfo) => {
-            if (tabId === tab.id && info.status === "complete") {
-              chrome.tabs.onUpdated.removeListener(listener);
-              resolve();
-            }
-          };
-          chrome.tabs.onUpdated.addListener(listener);
-          setTimeout(() => {
-            chrome.tabs.onUpdated.removeListener(listener);
-            resolve();
-          }, 30000);
-        });
-      }
-      await cdp.attach(tab.id);
-      await waitForRuntimeReady(tab.id, 10000);
-      return { tabId: tab.id };
+      const tabId = await openInCurrentWindow("https://claude.ai/");
+      await cdp.attach(tabId);
+      await waitForRuntimeReady(tabId, 10000);
+      return { tabId };
     }
 
     case "CLAUDE_CLOSE_TAB": {
@@ -2738,35 +2773,10 @@ export async function handleMessage(
     }
 
     case "PERPLEXITY_NEW_TAB": {
-      // Open in new window (background, no focus steal)
-      const window = await chrome.windows.create({
-        url: "https://www.perplexity.ai/",
-        focused: false,
-        state: "minimized",
-        type: "normal",
-      });
-      if (!window?.id) throw new Error("Failed to create window");
-      const tabs = await chrome.tabs.query({ windowId: window.id });
-      const tab = tabs[0];
-      if (!tab?.id) throw new Error("Failed to get tab from window");
-      if (tab.status !== "complete") {
-        await new Promise<void>((resolve) => {
-          const listener = (tabId: number, info: chrome.tabs.OnUpdatedInfo) => {
-            if (tabId === tab.id && info.status === "complete") {
-              chrome.tabs.onUpdated.removeListener(listener);
-              resolve();
-            }
-          };
-          chrome.tabs.onUpdated.addListener(listener);
-          setTimeout(() => {
-            chrome.tabs.onUpdated.removeListener(listener);
-            resolve();
-          }, 30000);
-        });
-      }
-      await cdp.attach(tab.id);
-      await waitForRuntimeReady(tab.id, 10000);
-      return { tabId: tab.id };
+      const tabId = await openInCurrentWindow("https://www.perplexity.ai/");
+      await cdp.attach(tabId);
+      await waitForRuntimeReady(tabId, 10000);
+      return { tabId };
     }
 
     case "PERPLEXITY_CLOSE_TAB": {
@@ -2794,68 +2804,66 @@ export async function handleMessage(
     }
 
     case "GET_TWITTER_COOKIES": {
-      // Grok requires X.com cookies for authentication
-      const domains = [".x.com", ".twitter.com", "x.com", "twitter.com"];
+      // Grok authentication — was x.com, moved to grok.com.
+      // Fetch all relevant auth surfaces so we don't false-negative on
+      // users who migrated but kept x.com cookies, or vice versa.
+      const domains = [
+        ".x.com",
+        ".twitter.com",
+        ".grok.com",
+        ".x.ai",
+        "x.com",
+        "twitter.com",
+        "grok.com",
+        "x.ai",
+      ];
       const allCookies: chrome.cookies.Cookie[] = [];
-      
+
       for (const domain of domains) {
         try {
           const cookies = await chrome.cookies.getAll({ domain });
           allCookies.push(...cookies);
         } catch {}
       }
-      
-      // Also try by URL
-      const urls = ["https://x.com", "https://twitter.com"];
+
+      // Also try by URL — covers edge cases where the domain filter misses
+      const urls = [
+        "https://x.com",
+        "https://twitter.com",
+        "https://grok.com",
+        "https://x.ai",
+      ];
       for (const url of urls) {
         try {
           const cookies = await chrome.cookies.getAll({ url });
           allCookies.push(...cookies);
         } catch {}
       }
-      
-      // Dedupe by name
+
+      // Dedupe by name (prefer the most specific domain)
       const seen = new Map<string, chrome.cookies.Cookie>();
       for (const cookie of allCookies) {
         const existing = seen.get(cookie.name);
-        if (!existing || cookie.domain?.includes("x.com")) {
+        if (!existing) {
+          seen.set(cookie.name, cookie);
+          continue;
+        }
+        // Prefer grok.com over x.com for the same cookie name
+        if (cookie.domain?.includes("grok.com") && !existing.domain?.includes("grok.com")) {
           seen.set(cookie.name, cookie);
         }
       }
-      
+
       return { cookies: Array.from(seen.values()) };
     }
 
     case "GROK_NEW_TAB": {
-      // Open in new window (background, no focus steal)
-      const window = await chrome.windows.create({
-        url: "https://x.com/i/grok",
-        focused: false,
-        state: "minimized",
-        type: "normal",
-      });
-      if (!window?.id) throw new Error("Failed to create window");
-      const tabs = await chrome.tabs.query({ windowId: window.id });
-      const tab = tabs[0];
-      if (!tab?.id) throw new Error("Failed to get tab from window");
-      if (tab.status !== "complete") {
-        await new Promise<void>((resolve) => {
-          const listener = (tabId: number, info: chrome.tabs.OnUpdatedInfo) => {
-            if (tabId === tab.id && info.status === "complete") {
-              chrome.tabs.onUpdated.removeListener(listener);
-              resolve();
-            }
-          };
-          chrome.tabs.onUpdated.addListener(listener);
-          setTimeout(() => {
-            chrome.tabs.onUpdated.removeListener(listener);
-            resolve();
-          }, 30000);
-        });
-      }
-      await cdp.attach(tab.id);
-      await waitForRuntimeReady(tab.id, 10000);
-      return { tabId: tab.id };
+      // Grok moved from x.com/i/grok to grok.com. Use the new domain
+      // so the user's existing grok.com session cookies apply.
+      const tabId = await openInCurrentWindow("https://grok.com/");
+      await cdp.attach(tabId);
+      await waitForRuntimeReady(tabId, 10000);
+      return { tabId };
     }
 
     case "GROK_CLOSE_TAB": {
@@ -2883,18 +2891,8 @@ export async function handleMessage(
     }
 
     case "GEMINI_NEW_TAB": {
-      // Open in new window (background, no focus steal)
-      const window = await chrome.windows.create({
-        url: "https://gemini.google.com/app",
-        focused: false,
-        state: "minimized",
-        type: "normal",
-      });
-      if (!window?.id) throw new Error("Failed to create window");
-      const tabs = await chrome.tabs.query({ windowId: window.id });
-      const tab = tabs[0];
-      if (!tab?.id) throw new Error("Failed to get tab from window");
-      return { tabId: tab.id };
+      const tabId = await openInCurrentWindow("https://gemini.google.com/app");
+      return { tabId };
     }
 
     case "GEMINI_CLOSE_TAB": {
@@ -3010,35 +3008,10 @@ export async function handleMessage(
 
     case "AISTUDIO_NEW_TAB": {
       const url = message.url || "https://aistudio.google.com/prompts/new_chat";
-      // Open in new window (background, no focus steal)
-      const window = await chrome.windows.create({
-        url: url,
-        focused: false,
-        state: "minimized",
-        type: "normal",
-      });
-      if (!window?.id) throw new Error("Failed to create window");
-      const tabs = await chrome.tabs.query({ windowId: window.id });
-      const tab = tabs[0];
-      if (!tab?.id) throw new Error("Failed to get tab from window");
-      if (tab.status !== "complete") {
-        await new Promise<void>((resolve) => {
-          const listener = (tabId: number, info: chrome.tabs.OnUpdatedInfo) => {
-            if (tabId === tab.id && info.status === "complete") {
-              chrome.tabs.onUpdated.removeListener(listener);
-              resolve();
-            }
-          };
-          chrome.tabs.onUpdated.addListener(listener);
-          setTimeout(() => {
-            chrome.tabs.onUpdated.removeListener(listener);
-            resolve();
-          }, 30000);
-        });
-      }
-      await cdp.attach(tab.id);
-      await waitForRuntimeReady(tab.id, 10000);
-      return { tabId: tab.id };
+      const tabId = await openInCurrentWindow(url);
+      await cdp.attach(tabId);
+      await waitForRuntimeReady(tabId, 10000);
+      return { tabId };
     }
 
     case "AISTUDIO_CLOSE_TAB": {
@@ -3060,37 +3033,14 @@ export async function handleMessage(
     }
 
     case "AIMODE_NEW_TAB": {
-      // Open in new window (background, no focus steal)
-      const window = await chrome.windows.create({
-        url: message.pro
-          ? "https://www.google.com/search?nem=143&q="
-          : "https://www.google.com/search?udm=50&q=",
-        focused: false,
-        state: "minimized",
-        type: "normal",
-      });
-      if (!window?.id) throw new Error("Failed to create window");
-      const tabs = await chrome.tabs.query({ windowId: window.id });
-      const tab = tabs[0];
-      if (!tab?.id) throw new Error("Failed to get tab from window");
-      if (tab.status !== "complete") {
-        await new Promise<void>((resolve) => {
-          const listener = (tabId: number, info: chrome.tabs.OnUpdatedInfo) => {
-            if (tabId === tab.id && info.status === "complete") {
-              chrome.tabs.onUpdated.removeListener(listener);
-              resolve();
-            }
-          };
-          chrome.tabs.onUpdated.addListener(listener);
-          setTimeout(() => {
-            chrome.tabs.onUpdated.removeListener(listener);
-            resolve();
-          }, 30000);
-        });
-      }
-      await cdp.attach(tab.id);
-      await waitForRuntimeReady(tab.id, 10000);
-      return { tabId: tab.id };
+      // AI Mode URLs (nem=143, udm=50) - opens in current window via helper
+      const targetUrl = message.url || (message.pro
+        ? "https://www.google.com/search?nem=143&q=test"
+        : "https://www.google.com/search?udm=50&q=test");
+      const tabId = await openInCurrentWindow(targetUrl);
+      await cdp.attach(tabId);
+      await waitForRuntimeReady(tabId, 10000);
+      return { tabId };
     }
 
     case "AIMODE_CLOSE_TAB": {

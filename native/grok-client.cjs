@@ -68,10 +68,26 @@ function hasRequiredCookies(cookies) {
   if (!cookies || !Array.isArray(cookies)) {
     return false;
   }
-  // auth_token is the primary session cookie for X.com
-  // ct0 is a CSRF token that's set dynamically, not strictly required for page load
-  const authToken = cookies.find((c) => c.name === "auth_token" && c.value);
-  return Boolean(authToken);
+  // Auth surfaces (in priority order):
+  //   1. x.com legacy:   auth_token cookie scoped to x.com
+  //   2. grok.com new:   x-userid cookie (set by grok.com after login)
+  //                     — verified live: grok.com does not use auth_token,
+  //                       grok_session, or session_id. x-userid is the
+  //                       primary session marker.
+  // Either is sufficient — Grok moved from x.com to grok.com.
+  const hasXCom = cookies.some(
+    (c) =>
+      c.name === "auth_token" &&
+      c.value &&
+      (!c.domain || c.domain.includes("x.com") || c.domain.includes("twitter.com"))
+  );
+  const hasGrokCom = cookies.some(
+    (c) =>
+      c.name === "x-userid" &&
+      c.value &&
+      (!c.domain || c.domain.includes("grok.com") || c.domain.includes("x.ai"))
+  );
+  return hasXCom || hasGrokCom;
 }
 
 async function evaluate(cdp, expression) {
@@ -113,9 +129,11 @@ async function checkLoginStatus(cdp) {
     `(() => {
     const body = document.body.innerText.toLowerCase();
     const hasLoginButton = !!document.querySelector('a[href*="/login"], [data-testid="loginButton"]');
-    const hasGrokUI = body.includes('ask anything') || body.includes('grok');
+    // Grok UI changed: original (x.com) had "ask anything" placeholder;
+    // new grok.com has "what do you want to know?" placeholder.
+    const hasGrokUI = body.includes('ask anything') || body.includes('what do you want to know') || body.includes('grok');
     const hasPremiumPrompt = body.includes('subscribe') || body.includes('premium required');
-    
+
     return {
       loggedIn: !hasLoginButton && hasGrokUI,
       hasPremium: hasGrokUI && !hasPremiumPrompt,
@@ -137,9 +155,11 @@ async function waitForGrokReady(cdp, timeoutMs = 20000) {
       `(() => {
       // Check for Grok-specific elements
       const hasInput = !!document.querySelector('textarea, [contenteditable="true"][role="textbox"], [data-testid="grokComposerInput"]');
-      const hasGrokBranding = document.body.innerText.includes('Grok') || 
+      const hasGrokBranding = document.body.innerText.includes('Grok') ||
                                !!document.querySelector('[data-testid*="grok"]');
-      const isGrokPage = location.pathname.includes('/grok');
+      // Grok moved from x.com/i/grok to grok.com. Accept either path.
+      const isGrokPage = location.pathname.includes('/grok') ||
+                          location.hostname.endsWith('grok.com');
       const isLoginPage = location.pathname.includes('/login') || location.pathname.includes('/i/flow');
       
       return {
@@ -693,12 +713,18 @@ async function query(options) {
   const startTime = Date.now();
   log("Starting Grok query");
 
-  // Check cookies for X.com authentication
-  const { cookies } = await getCookies();
-  if (!hasRequiredCookies(cookies)) {
-    throw new Error("X.com login required - log in to x.com in Chrome first");
+  // Cookie pre-check is OPTIONAL — the page-load login detection below is
+  // authoritative. Cookies for x.com/grok.com may not be available if the
+  // surf CLI was launched from a different browser context, so we log the
+  // count but don't fail the query on cookie absence.
+  let cookies = [];
+  try {
+    const cookieResult = await getCookies();
+    cookies = cookieResult?.cookies || cookieResult || [];
+    log(`Got ${cookies.length} cookies (pre-check)`);
+  } catch (cookieErr) {
+    log(`Cookie pre-check failed (non-fatal): ${cookieErr.message}`);
   }
-  log(`Got ${cookies.length} cookies`);
 
   // Create tab
   const tabInfo = await createTab();

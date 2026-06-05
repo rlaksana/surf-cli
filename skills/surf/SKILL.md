@@ -1,6 +1,6 @@
 ---
 name: surf
-description: Control Chrome browser via CLI for testing, automation, and debugging. Use when the user needs browser automation, screenshots, form filling, page inspection, network/CPU emulation, DevTools streaming, or AI queries via Gemini/Perplexity/Grok/AI Studio/Claude. ChatGPT is temporarily disabled.
+description: Control Chrome browser via CLI for testing, automation, and debugging. Use when the user needs browser automation, screenshots, form filling, page inspection, network/CPU emulation, DevTools streaming, or AI queries via Gemini/Perplexity/Grok/AI Studio/Claude. ChatGPT is temporarily disabled. For Google AI Mode, use `aimode` (defaults to pro/nem=143, use `--auto` for auto/udm=50).
 ---
 
 # Surf Browser Automation

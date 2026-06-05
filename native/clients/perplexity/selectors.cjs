@@ -19,11 +19,11 @@ module.exports = {
     'button[data-testid="stop-button"]',
   ],
   doneToken: [
-    'button[aria-label*="copy"]',
-    'button[aria-label*="Copy"]',
-    '[class*="related"]',
-    '[class*="follow-up"]',
-    'a[href*="/search/"]', // search result link = response done
+    'aria-label="Copy"',
+    'aria-label="copy"',
+    'data-testid="copy-button"',
+    'aria-label="Regenerate"',
+    'aria-label="regenerate"',
   ],
   rateLimitText: [/rate limit/i, /too many requests/i, /try again in/i, /slow down/i],
   errorText: [/something went wrong/i, /error/i, /failed/i, /not found/i],

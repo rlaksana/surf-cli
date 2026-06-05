@@ -200,7 +200,7 @@ function installWindowsRegistry(browser, extensionId, wrapperPath) {
 function getBrowserPathForCli(browser) {
   if (!IS_WIN) return null;
   const paths = {
-    msedge: "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
+    edge: "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
     chrome: "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
     chromium: "C:\\Program Files\\Chromium\\Application\\chrome.exe",
     brave: "C:\\Program Files\\BraveSoftware\\Brave-Browser\\Application\\brave.exe",

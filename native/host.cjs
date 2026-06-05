@@ -874,7 +874,7 @@ function handleToolRequest(msg, socket) {
   }
 
   if (extensionMsg.type === "AIMODE_QUERY") {
-    const { query, withPage, pro, timeout } = extensionMsg;
+    const { query, withPage, auto, timeout } = extensionMsg;
 
     queueAiRequest(async () => {
       let pageContext = null;
@@ -904,7 +904,7 @@ function handleToolRequest(msg, socket) {
 
       const result = await aimodeClient.query({
         prompt: fullPrompt,
-        pro: pro || false,
+        pro: !auto,
         timeout: timeout || 120000,
         getCookies: () =>
           new Promise((resolve) => {
@@ -917,7 +917,7 @@ function handleToolRequest(msg, socket) {
             });
             writeMessage({ type: "GET_GOOGLE_COOKIES", id: cookieId });
           }),
-        createTab: () =>
+        createTab: (url) =>
           new Promise((resolve) => {
             const tabCreateId = ++requestCounter;
             pendingToolRequests.set(tabCreateId, {
@@ -926,7 +926,7 @@ function handleToolRequest(msg, socket) {
               tool: "create_tab",
               onComplete: (r) => resolve(r),
             });
-            writeMessage({ type: "AIMODE_NEW_TAB", pro: pro || false, id: tabCreateId });
+            writeMessage({ type: "AIMODE_NEW_TAB", url: url, id: tabCreateId });
           }),
         closeTab: (tabIdToClose) =>
           new Promise((resolve) => {
@@ -1113,13 +1113,18 @@ function handleToolRequest(msg, socket) {
       return result;
     })
       .then((result) => {
+        // gemini-client returns { text, thoughts, metadata, images, ... }
+        // but CLI expects `response` field. Normalize.
         const response = {
-          response: result.response,
-          model: result.model,
+          response: result.response ?? result.text ?? result.output ?? "",
+          model: result.model ?? result.effectiveModel,
           tookMs: result.tookMs,
         };
         if (result.imagePath) {
           response.imagePath = result.imagePath;
+        }
+        if (result.images?.length) {
+          response.imagePath = result.images[0].url || result.images[0].path;
         }
         sendToolResponse(socket, originalId, response, null);
       })

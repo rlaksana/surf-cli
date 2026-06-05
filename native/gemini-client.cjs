@@ -800,8 +800,15 @@ async function runGeminiWebViaPage(input) {
         const ggImgs = Array.from(document.querySelectorAll('img[src*="gg-dl"]'))
           .filter(i => i.naturalWidth >= 512)
           .map(i => i.src);
-        const loading = !!document.querySelector('mat-progress-bar, .loading-indicator, message-loading');
-        const turns = document.querySelectorAll('message-content');
+        // Loading: mat-progress-bar is the Material UI progress indicator.
+        // (message-loading was tried as a custom element tag but Gemini
+        // doesn't use that — removed.)
+        const loading = !!document.querySelector('mat-progress-bar, .loading-indicator');
+        // Response turns: Gemini renders responses inside elements with
+        // class containing "message". The old selector 'message-content'
+        // was a custom-element tag (not used by Gemini) — replaced with
+        // a class-substring selector that matches the actual DOM.
+        const turns = document.querySelectorAll('[class*="message"]');
         const lastTurn = turns.length ? turns[turns.length - 1] : null;
         const text = lastTurn ? lastTurn.textContent?.trim() : "";
         return JSON.stringify({ ggImgs, loading, text, turns: turns.length });
@@ -854,13 +861,17 @@ async function runGeminiWebViaPage(input) {
       effectiveModel: model,
       _pageTabId: tabId,
     };
-  } catch (err) {
-    if (tabId) {
+  } finally {
+    // Always close the tab — both success and failure paths.
+    // The caller relies on this for tab hygiene; a leaked tab means
+    // the user's window accumulates orphan Gemini tabs over time.
+    if (tabId && closeTab) {
       try {
         await closeTab(tabId);
-      } catch {}
+      } catch {
+        // Swallow close errors — query already succeeded/failed.
+      }
     }
-    throw err;
   }
 }
 

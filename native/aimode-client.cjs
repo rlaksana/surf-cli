@@ -214,51 +214,73 @@ async function getAnswerContent(cdp, log = () => {}) {
     const result = await evaluate(
       cdp,
       `(() => {
-        // Primary: Try data-subtree="aimc" - AI response with UI elements (FULL response)
-        const aimc = document.querySelector('[data-subtree="aimc"]');
-        if (aimc) {
-          const text = aimc.textContent.trim();
-          // Extract just the response before "AI responses may include mistakes"
-          const idx = text.indexOf('AI responses may include mistakes');
-          if (idx > 0) {
-            return text.substring(0, idx).trim();
-          }
-          return text;
-        }
-
-        // Secondary: Try data-subtree="aimfl" - clean AI response text (shorter)
+        // Try aimfl first - it's the cleaner text without UI
         const aimfl = document.querySelector('[data-subtree="aimfl"]');
         if (aimfl) {
           const text = aimfl.textContent.trim();
           if (text.length > 0) return text;
         }
 
-        // Fallback: legacy selectors
+        // Fallback: legacy selectors for AI answer
         const legacySelectors = ['.X7NTVe', '.GybnWb', '.reply-content', '.AdD1h'];
         for (const selector of legacySelectors) {
           const el = document.querySelector(selector);
-          if (el) {
-            return el.textContent.trim();
+          if (el) return el.textContent.trim();
+        }
+
+        // Try aimc but only get text before any UI elements
+        const aimc = document.querySelector('[data-subtree="aimc"]');
+        if (aimc) {
+          // Get just the paragraphs, not the UI
+          const paras = aimc.querySelectorAll('p');
+          if (paras.length > 0) {
+            return Array.from(paras).map(p => p.textContent.trim()).join('\\n');
           }
+          // Fallback: get text content but clean it
+          const text = aimc.textContent.trim();
+          const copyIdx = text.indexOf('CopyShare');
+          if (copyIdx > 0) return text.substring(0, copyIdx).trim();
+          return text;
         }
 
-        // Check for any element containing significant text
-        const main = document.querySelector('main, #main, [role="main"]');
-        if (main && main.textContent.length > 100) {
-          return main.textContent.trim().substring(0, 3000);
-        }
-
-        // Last resort: body text cleaned
-        return document.body.textContent.trim().replace(/\\s+/g, ' ').substring(0, 3000);
+        return '';
       })()`,
     );
 
-    return result || "";
+    return cleanResponse(result || "");
   } catch (err) {
     log(`Error in getAnswerContent: ${err.message}`);
     // If evaluation fails, return empty to trigger fallback
     return "";
   }
+}
+
+function cleanResponse(text) {
+  if (!text) return "";
+
+  // Find where the UI elements start and cut there
+  const uiMarkers = ['CopyShare', 'This public link is valid', 'Creating a public link'];
+  let cutIdx = text.length;
+
+  for (const marker of uiMarkers) {
+    const idx = text.indexOf(marker);
+    if (idx > 0 && idx < cutIdx) {
+      cutIdx = idx;
+    }
+  }
+
+  let cleaned = text.substring(0, cutIdx);
+
+  // Remove source citations like "[+3]"
+  cleaned = cleaned.replace(/\s*\[\+\d+\]/g, "");
+  // Remove "(Source +1)" style citations
+  cleaned = cleaned.replace(/\s*\([A-Za-z0-9\s]+\s*\+\d+\)/g, "");
+  // Remove "X sites" at the end
+  cleaned = cleaned.replace(/\n\d+\s+sites\s*$/gim, "");
+  // Clean up multiple newlines
+  cleaned = cleaned.replace(/\n{3,}/g, "\n\n").trim();
+
+  return cleaned;
 }
 
 async function query(options) {
@@ -289,16 +311,15 @@ async function query(options) {
   }
   debugLog(`Got ${cookies.length} cookies`);
 
-  // For aimode, we'll navigate directly to the search URL instead of using CDP
-  // This avoids issues with tab creation timing
+  // Create tab - AIMODE_NEW_TAB handler creates a neutral window and
+  // navigates to the search URL via CDP Page.navigate (bypasses Chrome interception)
   const fullSearchUrl = searchUrl + encodeURIComponent(query);
   debugLog(`Will navigate to: ${fullSearchUrl}`);
 
-  // Create a basic tab info - we'll use CDP navigate instead
-  const tabInfo = await createTab();
+  const tabInfo = await createTab(fullSearchUrl);
   const { tabId } = tabInfo;
   if (!tabId) {
-    throw new Error("Failed to create tab");
+    throw new Error("Failed to create tab: " + (tabInfo.error || JSON.stringify(tabInfo)));
   }
   debugLog(`Created tab ${tabId}`);
 
@@ -306,15 +327,8 @@ async function query(options) {
   const _inputCdp = (method, params) => cdpCommand(tabId, method, params);
 
   try {
-    // Wait for tab to be ready
-    await delay(2000);
-
-    // Navigate to Google search with the query
-    debugLog(`Navigating to: ${fullSearchUrl}`);
-
-    // Navigate using CDP
-    await cdp(`window.location.href = "${fullSearchUrl}"`);
-
+    // Wait for Page.navigate (issued by service worker) to complete
+    debugLog("Waiting for page to load after CDP navigation...");
     await waitForPageLoad(cdp);
     debugLog("Page loaded");
 

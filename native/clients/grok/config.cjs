@@ -15,11 +15,22 @@ module.exports = {
   },
   validation: {
     method: "http_ping",
-    targetUrl: "https://x.com/i/grok",
+    // Grok moved from x.com to grok.com. Try grok.com first; legacy x.com
+    // is still valid for users who haven't migrated.
+    targetUrl: "https://grok.com/",
     successStatus: [200, 204],
   },
   cookies: {
-    requiredCookies: [{ name: "auth_token" }],
+    // Grok moved from x.com to grok.com as the primary domain. The cookie
+    // validator scans the current tab's domain, so we accept either path.
+    // If surf-cli is on a grok.com tab, check the grok.com cookie namespace;
+    // if on x.com, the legacy auth_token cookie.
+    requiredCookies: [
+      { name: "auth_token" },
+      { name: "grok_session" },
+      { name: "session_id" },
+    ],
+    allowedDomains: ["grok.com", "x.com"],
   },
   timeout: {
     response: 60000,

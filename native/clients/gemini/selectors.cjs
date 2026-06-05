@@ -19,7 +19,7 @@ module.exports = {
     'button[data-testid="stop-generating"]',
     "mat-progress-bar",
   ],
-  doneToken: ["message-content", '[data-testid="done"]', '[class*="done"]'],
+  doneToken: [".message-content", '[data-testid="done"]', '[class*="done"]'],
   rateLimitText: [
     /rate limit/i,
     /too many requests/i,

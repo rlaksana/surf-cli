@@ -1,4 +1,4 @@
-const { spawn } = require("child_process");
+const { spawn, execSync, execFileSync } = require("child_process");
 const net = require("net");
 const path = require("path");
 const os = require("os");
@@ -8,7 +8,7 @@ const IS_WIN = process.platform === "win32";
 const SOCKET_PATH = IS_WIN ? "//./pipe/surf" : "/tmp/surf.sock";
 
 const BROWSER_PATHS = {
-  msedge: IS_WIN
+  edge: IS_WIN
     ? "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe"
     : "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
   chrome: IS_WIN
@@ -28,12 +28,55 @@ const BROWSER_PATHS = {
     : "/Applications/Helium.app/Contents/MacOS/Helium",
 };
 
+// Process name used to detect a running browser instance.
+// Windows uses .exe; macOS uses the bundle's display name for `pgrep -f`.
+const BROWSER_PROCESS_NAMES = {
+  edge: IS_WIN ? "msedge.exe" : "msedge",
+  chrome: IS_WIN ? "chrome.exe" : "Google Chrome",
+  chromium: IS_WIN ? "chromium.exe" : "Chromium",
+  brave: IS_WIN ? "brave.exe" : "Brave Browser",
+  arc: IS_WIN ? "Arc.exe" : "Arc",
+  helium: IS_WIN ? "helium.exe" : "Helium",
+};
+
 /**
- * Launch browser in background mode (hidden window)
+ * Check if the configured browser is already running.
+ * Used to avoid spawning a duplicate browser window when the user
+ * has Edge/Chrome already open — we want to attach to the existing
+ * session, not fragment it.
+ * @param {string} browserType
+ * @returns {boolean}
+ */
+function isBrowserRunning(browserType) {
+  const procName = BROWSER_PROCESS_NAMES[browserType];
+  if (!procName) return false;
+
+  try {
+    if (IS_WIN) {
+      // tasklist exits 0 even on no match; check stdout for the "INFO:" sentinel.
+      // Use execFileSync (no shell) to avoid metacharacter interpretation.
+      const filter = `IMAGENAME eq ${procName}`;
+      const output = execFileSync("tasklist", ["/FI", filter, "/NH"], {
+        encoding: "utf8",
+      });
+      return !output.includes("INFO:");
+    }
+    // macOS / Linux: pgrep exits 1 when no match
+    execFileSync("pgrep", ["-f", procName], { stdio: "ignore" });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Launch browser via PowerShell Start-Process (runs in correct user session)
  * @param {string} browserType - e.g., "msedge", "chrome"
  * @param {string} [browserPath] - optional explicit path
+ * @param {string} [url] - optional URL to open
+ * @returns {number|null} - spawned process PID or null
  */
-function launchBrowser(browserType, browserPath) {
+function launchBrowser(browserType, browserPath, url) {
   const execPath = browserPath || BROWSER_PATHS[browserType];
 
   if (!execPath) {
@@ -41,19 +84,58 @@ function launchBrowser(browserType, browserPath) {
   }
 
   if (IS_WIN) {
-    // Windows: use Start-Process for hidden window via spawn (safer than execSync)
-    spawn("powershell", [
-      "-Command",
-      "Start-Process",
-      "-FilePath", execPath,
-      "-WindowStyle", "Hidden"
-    ], { stdio: "ignore", detached: true });
+    // Windows: use PowerShell Start-Process to run in correct user session context
+    // This avoids the session 0 isolation that causes Edge to crash when spawned via execSync('start ...')
+    const urlArg = url ? `"${url}"` : "";
+
+    try {
+      // Use spawn (async) rather than execSync so we don't block
+      const ps = spawn("powershell", [
+        "-NoProfile",
+        "-Command",
+        `Start-Process -FilePath "${execPath}"${urlArg ? ` -ArgumentList ${urlArg}` : ""} -PassThru | Select-Object -ExpandProperty Id`,
+      ], {
+        detached: true,
+        stdio: ["ignore", "pipe", "pipe"],
+        windowsHide: true,
+      });
+
+      let pid = null;
+      ps.stdout.on("data", (data) => {
+        const output = data.toString().trim();
+        const parsed = parseInt(output, 10);
+        if (!isNaN(parsed)) {
+          pid = parsed;
+        }
+      });
+
+      // Detach so the PowerShell process is not killed when Node exits
+      ps.unref();
+      return pid;
+    } catch {
+      // Fallback: try direct start without URL
+      try {
+        const child = spawn("powershell", [
+          "-NoProfile",
+          "-Command",
+          `Start-Process -FilePath "${execPath}"`,
+        ], { detached: true, stdio: "ignore", windowsHide: true });
+        child.unref();
+        return null;
+      } catch {
+        return null;
+      }
+    }
   } else if (process.platform === "darwin") {
     // macOS: use open command
-    spawn("open", ["-a", execPath], { detached: true, stdio: "ignore" });
+    const child = spawn("open", ["-a", execPath], { detached: true, stdio: "ignore" });
+    child.unref();
+    return child.pid;
   } else {
     // Linux: launch in background
-    spawn(execPath, ["--new-window"], { detached: true, stdio: "ignore" });
+    const child = spawn(execPath, url ? [url] : ["--new-window"], { detached: true, stdio: "ignore" });
+    child.unref();
+    return child.pid;
   }
 }
 
@@ -197,7 +279,19 @@ async function ensureBrowserAndSocket() {
     return; // Already connected
   }
 
-  // Launch browser
+  // If the browser is already running (e.g., user opened it manually),
+  // do NOT spawn a duplicate window — that fragments the user's session
+  // and creates a fresh, often logged-out instance. Just wait for the
+  // extension to become responsive.
+  if (isBrowserRunning(browserType)) {
+    console.error(
+      `${browserType} is already running. Waiting for extension to connect...`
+    );
+    await waitForExtensionReady(30000);
+    return;
+  }
+
+  // Cold start: browser is not running, so launch it.
   console.error(`Launching ${browserType}...`);
   launchBrowser(browserType, browserPath);
 
@@ -208,6 +302,7 @@ async function ensureBrowserAndSocket() {
 module.exports = {
   launchBrowser,
   isExtensionReady,
+  isBrowserRunning,
   waitForExtensionReady,
   ensureBrowserAndSocket,
   BROWSER_PATHS,
