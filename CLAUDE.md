@@ -100,7 +100,8 @@ skills/                    # AI agent skill files for surf integration
 - **Perplexity** (perplexity-client.cjs): Research mode, file attachments
 - **Claude** (claude-client.cjs): Claude API integration
 - **AI Studio** (aistudio-client.cjs, aistudio-build.cjs): Google AI Studio, app building
-- All use browser cookies—no API keys needed
+- **AI Mode** (aimode-client.cjs): Google AI Mode via search, no login required
+- All use browser cookies—no API keys needed (except aimode, which is public)
 
 ### 5. MCP Server (native/mcp-server.cjs)
 - Implements @modelcontextprotocol/sdk
@@ -178,6 +179,7 @@ npm run lint                                            # verify (warnings OK, e
 | `find` | `search` |
 | `go` | `navigate` |
 | `net` | `network` |
+| `network.dump` | `network.get` |
 
 ## Command Groups
 
@@ -195,12 +197,12 @@ npm run lint                                            # verify (warnings OK, e
 | `cookie.*` | `list`, `get`, `set`, `clear` |
 | `emulate.*` | `network`, `cpu`, `geo`, `device`, `viewport`, `touch` |
 | `perf.*` | `start`, `stop`, `metrics` |
-| `network.*` | `get`, `body`, `curl`, `origins`, `clear`, `stats`, `export`, `path` |
+| `network.*` | `get`, `body`, `curl`, `origins`, `clear`, `stats`, `export`, `path`, `dump` |
 
 ## AI Mode (aimode)
 
-- `surf aimode "query"` - Uses udm=50 (auto mode, has copy button)
-- `surf aimode "query" --pro` - Uses nem=143 (pro mode)
+- `surf aimode "query"` - Uses nem=143 (pro mode, default)
+- `surf aimode "query" --auto` - Uses udm=50 (auto mode, has copy button)
 
 ## Process Management
 
