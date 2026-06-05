@@ -526,7 +526,10 @@ async function query(options) {
       tookMs: Date.now() - startTime,
     };
   } finally {
-    await closeTab(tabId).catch(() => {});
+    await Promise.race([
+      closeTab(tabId),
+      new Promise(resolve => setTimeout(resolve, 5000)),
+    ]).catch(() => {});
   }
 }
 

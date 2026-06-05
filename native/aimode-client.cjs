@@ -383,7 +383,10 @@ async function query(options) {
     };
   } finally {
     if (tabId) {
-      await closeTab(tabId).catch((_e) => {});
+      await Promise.race([
+        closeTab(tabId),
+        new Promise(resolve => setTimeout(resolve, 5000)),
+      ]).catch(() => {});
     }
   }
 }

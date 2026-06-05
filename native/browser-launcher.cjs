@@ -11,6 +11,9 @@ const BROWSER_PATHS = {
   edge: IS_WIN
     ? "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe"
     : "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+  msedge: IS_WIN
+    ? "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe"
+    : "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
   chrome: IS_WIN
     ? "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
     : "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
@@ -32,6 +35,7 @@ const BROWSER_PATHS = {
 // Windows uses .exe; macOS uses the bundle's display name for `pgrep -f`.
 const BROWSER_PROCESS_NAMES = {
   edge: IS_WIN ? "msedge.exe" : "msedge",
+  msedge: IS_WIN ? "msedge.exe" : "msedge",
   chrome: IS_WIN ? "chrome.exe" : "Google Chrome",
   chromium: IS_WIN ? "chromium.exe" : "Chromium",
   brave: IS_WIN ? "brave.exe" : "Brave Browser",
@@ -48,6 +52,11 @@ const BROWSER_PROCESS_NAMES = {
  * @returns {boolean}
  */
 function isBrowserRunning(browserType) {
+  // Normalize legacy configs that used "msedge" instead of "edge"
+  if (browserType === "msedge") {
+    browserType = "edge";
+  }
+
   const procName = BROWSER_PROCESS_NAMES[browserType];
   if (!procName) return false;
 
@@ -59,7 +68,26 @@ function isBrowserRunning(browserType) {
       const output = execFileSync("tasklist", ["/FI", filter, "/NH"], {
         encoding: "utf8",
       });
-      return !output.includes("INFO:");
+      if (!output.includes("INFO:")) {
+        return true;
+      }
+      // Fallback: PowerShell Get-Process works across Windows locales
+      // and catches cases where tasklist filtering is unreliable.
+      try {
+        const psName = procName.replace(/\.exe$/i, "");
+        execFileSync(
+          "powershell",
+          [
+            "-NoProfile",
+            "-Command",
+            `exit (Get-Process -Name '${psName}' -ErrorAction SilentlyContinue) ? 0 : 1`,
+          ],
+          { stdio: "ignore" },
+        );
+        return true;
+      } catch {
+        return false;
+      }
     }
     // macOS / Linux: pgrep exits 1 when no match
     execFileSync("pgrep", ["-f", procName], { stdio: "ignore" });

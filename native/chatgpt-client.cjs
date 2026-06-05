@@ -70,8 +70,13 @@ function hasRequiredCookies(cookies) {
   return Boolean(sessionCookie);
 }
 
-async function evaluate(cdp, expression) {
-  const result = await cdp(expression);
+async function evaluate(cdp, expression, timeoutMs = 10000) {
+  const result = await Promise.race([
+    cdp(expression),
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error("CDP evaluate timeout")), timeoutMs)
+    ),
+  ]);
   if (result.exceptionDetails) {
     const desc =
       result.exceptionDetails.exception?.description ||
@@ -356,6 +361,10 @@ async function waitForResponse(cdp, timeoutMs = 2700000) {
   const requiredStableCycles = 6;
   const minStableMs = 1200;
   let lastChangeAt = Date.now();
+  // Safety: if the text has been stable for a very long time but selectors
+  // are broken (e.g. stop button still "visible"), force completion so the
+  // CLI doesn't hang forever.
+  const FORCE_COMPLETE_MS = 30000;
   while (Date.now() < deadline) {
     const snapshot = await evaluate(
       cdp,
@@ -412,6 +421,16 @@ async function waitForResponse(cdp, timeoutMs = 2700000) {
       stableCycles++;
     }
     const stableMs = Date.now() - lastChangeAt;
+    // Safety: if text has been stable for 30s+ and has content, force return.
+    // This prevents the CLI from hanging forever when selectors are stale
+    // (e.g. stop button always "visible", thinking indicator never clears).
+    if (stableMs >= FORCE_COMPLETE_MS && currentLength > 0) {
+      return {
+        text: snapshot.text,
+        messageId: snapshot.messageId,
+        turnIndex: snapshot.turnIndex,
+      };
+    }
     if (!snapshot.stopVisible) {
       const stableEnough = stableCycles >= requiredStableCycles && stableMs >= minStableMs;
       const finishedVisible = snapshot.finished;
@@ -585,7 +604,19 @@ async function query(options) {
     };
   } finally {
     if (tabId) {
-      await closeTab(tabId).catch((_e) => {});
+      console.error("[ChatGPT] Closing tab:", tabId);
+      try {
+        await Promise.race([
+          closeTab(tabId),
+          new Promise((_, reject) =>
+            setTimeout(() =>
+              reject(new Error("closeTab timeout")), 5000)
+          ),
+        ]);
+        console.error("[ChatGPT] Tab closed successfully:", tabId);
+      } catch (e) {
+        console.error("[ChatGPT] Tab close failed:", e);
+      }
     }
   }
 }

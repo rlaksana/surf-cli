@@ -55,8 +55,13 @@ function hasRequiredCookies(cookies) {
   return Boolean(validCookie);
 }
 
-async function evaluate(cdp, expression) {
-  const result = await cdp(expression);
+async function evaluate(cdp, expression, timeoutMs = 10000) {
+  const result = await Promise.race([
+    cdp(expression),
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error("CDP evaluate timeout")), timeoutMs)
+    ),
+  ]);
   if (result.exceptionDetails) {
     const desc =
       result.exceptionDetails.exception?.description ||
@@ -351,7 +356,10 @@ async function query(options) {
       tookMs: Date.now() - startTime,
     };
   } finally {
-    await closeTab(tabId).catch(() => {});
+    await Promise.race([
+      closeTab(tabId),
+      new Promise(resolve => setTimeout(resolve, 5000)),
+    ]).catch(() => {});
   }
 }
 

@@ -831,7 +831,10 @@ async function query(options) {
       tookMs: Date.now() - startTime,
     };
   } finally {
-    await closeTab(tabId).catch(() => {});
+    await Promise.race([
+      closeTab(tabId),
+      new Promise(resolve => setTimeout(resolve, 5000)),
+    ]).catch(() => {});
   }
 }
 
@@ -1010,7 +1013,10 @@ async function validate(options) {
   } catch (e) {
     result.errors.push(`Validation error: ${e.message}`);
   } finally {
-    await closeTab(tabId).catch(() => {});
+    await Promise.race([
+      closeTab(tabId),
+      new Promise(resolve => setTimeout(resolve, 5000)),
+    ]).catch(() => {});
   }
 
   result.tookMs = Date.now() - startTime;

@@ -275,7 +275,7 @@ async function waitForRuntimeReady(tabId: number, timeoutMs = 10000): Promise<vo
  */
 async function openInCurrentWindow(url: string, loadTimeoutMs: number = 30000): Promise<number> {
   // Find the window the user is currently in. Prefer last-focused (most
-  // natural), fall back to the active tab's window.
+  // natural), fall back to the active tab's window, then any normal window.
   let windowId: number | undefined;
   try {
     const lastFocused = await chrome.windows.getLastFocused();
@@ -287,6 +287,22 @@ async function openInCurrentWindow(url: string, loadTimeoutMs: number = 30000): 
     try {
       const [activeTab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
       windowId = activeTab?.windowId;
+    } catch {}
+  }
+  // Fallback 3: any normal window (minimized or not) — avoids creating a new
+  // window when getLastFocused fails because every existing window is minimized.
+  if (windowId === undefined) {
+    try {
+      const allWindows = await chrome.windows.getAll({ windowTypes: ["normal"] });
+      const normalWin = allWindows.find((w) => w.type === "normal" && w.id !== undefined);
+      windowId = normalWin?.id;
+    } catch {}
+  }
+  // Fallback 4: any tab at all (last resort before creating a window)
+  if (windowId === undefined) {
+    try {
+      const allTabs = await chrome.tabs.query({});
+      windowId = allTabs[0]?.windowId;
     } catch {}
   }
 
@@ -2719,13 +2735,20 @@ export async function handleMessage(
 
     case "CHATGPT_CLOSE_TAB": {
       const chatTabId = message.tabId;
+      console.error("[SW] CHATGPT_CLOSE_TAB received, tabId:", chatTabId);
       if (chatTabId) {
         try {
           await cdp.detach(chatTabId);
-        } catch {}
+          console.error("[SW] CDP detached for tab", chatTabId);
+        } catch (e) {
+          console.error("[SW] CDP detach failed:", e);
+        }
         try {
           await chrome.tabs.remove(chatTabId);
-        } catch {}
+          console.error("[SW] Tab removed:", chatTabId);
+        } catch (e) {
+          console.error("[SW] Tab remove failed:", e);
+        }
       }
       return { success: true };
     }
