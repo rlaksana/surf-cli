@@ -214,21 +214,11 @@ async function getAnswerContent(cdp, log = () => {}) {
     const result = await evaluate(
       cdp,
       `(() => {
-        // Try aimfl first - it's the cleaner text without UI
-        const aimfl = document.querySelector('[data-subtree="aimfl"]');
-        if (aimfl) {
-          const text = aimfl.textContent.trim();
-          if (text.length > 0) return text;
-        }
-
-        // Fallback: legacy selectors for AI answer
-        const legacySelectors = ['.X7NTVe', '.GybnWb', '.reply-content', '.AdD1h'];
-        for (const selector of legacySelectors) {
-          const el = document.querySelector(selector);
-          if (el) return el.textContent.trim();
-        }
-
-        // Try aimc but only get text before any UI elements
+        // Try aimc first - it contains the full response text.
+        // [data-subtree="aimfl"] is an INNER element (e.g. first token /
+        // header) that may contain only a fragment of the response. Using
+        // it as the primary selector truncated long answers to their first
+        // item (e.g. "Apple" for a 5-fruit list).
         const aimc = document.querySelector('[data-subtree="aimc"]');
         if (aimc) {
           // Get just the paragraphs, not the UI
@@ -241,6 +231,21 @@ async function getAnswerContent(cdp, log = () => {}) {
           const copyIdx = text.indexOf('CopyShare');
           if (copyIdx > 0) return text.substring(0, copyIdx).trim();
           return text;
+        }
+
+        // Fallback: legacy selectors for AI answer
+        const legacySelectors = ['.X7NTVe', '.GybnWb', '.reply-content', '.AdD1h'];
+        for (const selector of legacySelectors) {
+          const el = document.querySelector(selector);
+          if (el) return el.textContent.trim();
+        }
+
+        // Last resort: aimfl. Only used if aimc and legacy selectors
+        // both miss. May return a partial response.
+        const aimfl = document.querySelector('[data-subtree="aimfl"]');
+        if (aimfl) {
+          const text = aimfl.textContent.trim();
+          if (text.length > 0) return text;
         }
 
         return '';

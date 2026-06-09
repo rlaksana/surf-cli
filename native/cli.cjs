@@ -432,22 +432,38 @@ const TOOLS = {
         ],
       },
       perplexity: {
-        desc: "Search with Perplexity AI (uses browser session)",
+        desc: "Search with Perplexity AI (uses browser session, default: Claude Sonnet 4.6 Thinking)",
         args: ["query"],
         opts: {
           "with-page": "Include current page context",
           mode: "Mode: search (default), research",
-          model: "Model (Pro users): sonar, gpt-4o, claude, etc.",
+          model:
+            "Model id. Default: claude46sonnetthinking. Top Pro thinking models: " +
+            "gpt54_thinking, gemini31pro_high, claude46sonnetthinking, kimik26thinking, " +
+            "nv_nemotron_3_ultra. See https://www.perplexity.ai/rest/models/config for the full list.",
+          focus:
+            "Focus areas (comma-separated): writing, web, social, scholar, edgar (Finance)",
+          space: "Perplexity Space ID (e.g. from your spaces page)",
           timeout: "Timeout in seconds (default: 120)",
         },
         examples: [
-          { cmd: 'perplexity "what is quantum computing"', desc: "Basic search" },
+          {
+            cmd: 'perplexity "what is quantum computing"',
+            desc: "Default model (Claude Sonnet 4.6 Thinking)",
+          },
           { cmd: 'perplexity "explain this page" --with-page', desc: "With page context" },
           {
             cmd: 'perplexity "deep dive into transformers" --mode research',
             desc: "Research mode",
           },
-          { cmd: 'perplexity "latest AI news" --model sonar', desc: "Specify model (Pro)" },
+          {
+            cmd: 'perplexity "latest AI news" --model gemini31pro_high --focus web',
+            desc: "Higher-intelligence model + web focus",
+          },
+          {
+            cmd: 'perplexity "..." --model gpt54_thinking',
+            desc: "Top Pro reasoning model",
+          },
         ],
       },
       grok: {
@@ -3550,9 +3566,11 @@ async function handleResponse(response) {
   } else if (tool === "perplexity" && data?.response) {
     console.log(data.response);
     const meta = [];
-    if (data.sources) meta.push(`${data.sources} sources`);
     if (data.mode) meta.push(data.mode);
     if (data.model && data.model !== "default") meta.push(data.model);
+    if (data.focus) meta.push(`focus=${data.focus}`);
+    if (data.spaceId) meta.push(`space=${data.spaceId}`);
+    if (data.partial) meta.push("partial");
     meta.push(`${((data.tookMs || 0) / 1000).toFixed(1)}s`);
     console.error(`\n[${meta.join(" | ")}]`);
     if (data.url) console.error(`URL: ${data.url}`);

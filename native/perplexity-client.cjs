@@ -2,10 +2,36 @@
  * Perplexity Web Client for surf-cli
  *
  * CDP-based client for perplexity.ai using browser automation.
- * Similar approach to the ChatGPT client.
+ * Uses Perplexity's deep-link URL pattern to skip the typePrompt /
+ * selectModel / submitPrompt dance:
+ *   https://www.perplexity.ai/#?q={query}&model={model}&focus={focus}&space={spaceId}
+ *
+ * The page boots already in a search-ready state with model + focus
+ * pre-selected, and the user's query is auto-submitted by Perplexity.
+ * We only have to wait for the response.
  */
 
 const PERPLEXITY_URL = "https://www.perplexity.ai/";
+
+/**
+ * Build a Perplexity deep-link URL that boots the page already configured
+ * with query, model, focus and space. Unspecified params are omitted.
+ *
+ * Perplexity accepts comma-separated focus values: "writing,web,social,scholar,edgar".
+ * Unknown models/focus/space are silently ignored by Perplexity — caller is
+ * responsible for passing valid values (see surf-cli docs for available lists).
+ */
+function buildDeepLinkUrl({ prompt, model, focus, spaceId } = {}) {
+  const hash = new URLSearchParams();
+  if (prompt) hash.set("q", prompt);
+  if (model) hash.set("model", model);
+  if (focus) hash.set("focus", focus);
+  if (spaceId) hash.set("space", spaceId);
+  if (hash.toString()) {
+    return `${PERPLEXITY_URL}#?${hash.toString()}`;
+  }
+  return PERPLEXITY_URL;
+}
 
 // ============================================================================
 // Helpers
@@ -507,19 +533,26 @@ async function query(options) {
     prompt,
     model,
     mode = "search",
+    focus,
+    spaceId,
     timeout = 120000,
     createTab,
     closeTab,
     cdpEvaluate,
-    cdpCommand,
     log = () => {},
   } = options;
 
   const startTime = Date.now();
   log("Starting Perplexity query");
 
-  // Create tab
-  const tabInfo = await createTab();
+  // Build deep-link URL — Perplexity boots the page already configured with
+  // the query, model, focus, and space. Skips typePrompt + selectModel +
+  // selectMode + submitPrompt entirely.
+  const deepLinkUrl = buildDeepLinkUrl({ prompt, model, focus, spaceId });
+  log(`Deep-link URL: ${deepLinkUrl}`);
+
+  // Create tab with deep-link URL
+  const tabInfo = await createTab(deepLinkUrl);
   log(`createTab returned: ${JSON.stringify(tabInfo)}`);
   const { tabId } = tabInfo || {};
 
@@ -529,61 +562,26 @@ async function query(options) {
   log(`Created tab ${tabId}`);
 
   const cdp = (expr) => cdpEvaluate(tabId, expr);
-  const inputCdp = (method, params) => cdpCommand(tabId, method, params);
 
   try {
-    // Wait for page load
+    // Wait for page load (boots the deep-link)
     await waitForPageLoad(cdp);
     log("Page loaded");
 
-    // Check login status (informational)
-    const loginStatus = await checkLoginStatus(cdp);
-    log(`Login: ${loginStatus.loggedIn ? "yes" : "anonymous"}${loginStatus.isPro ? " (Pro)" : ""}`);
-
-    // Wait for input
-    await waitForPromptReady(cdp);
-    log("Prompt ready");
-
-    // Select mode if not default
-    if (mode && mode.toLowerCase() !== "search") {
-      try {
-        const selectedMode = await selectMode(cdp, mode);
-        log(`Mode: ${selectedMode}`);
-      } catch (e) {
-        log(`Mode selection failed: ${e.message}`);
-      }
-    }
-
-    // Select model if specified
-    if (model) {
-      try {
-        const selectedModel = await selectModel(cdp, model);
-        log(`Model: ${selectedModel}`);
-      } catch (e) {
-        log(`Model selection failed: ${e.message}`);
-      }
-    }
-
-    // Type prompt
-    await typePrompt(cdp, inputCdp, prompt);
-    log("Prompt typed");
-
-    // Submit
-    await submitPrompt(cdp, inputCdp);
-    log("Submitted, waiting for response...");
-
-    // Wait for response
+    // Wait for response — Perplexity auto-submits once the deep-link boots,
+    // and we poll for the .prose response container to fill + stabilize.
     const response = await waitForResponse(cdp, timeout);
     log(
-      `Response: ${response.text.length} chars, ${response.sources} sources${response.partial ? " (partial)" : ""}`,
+      `Response: ${response.text.length} chars${response.partial ? " (partial)" : ""}`,
     );
 
     return {
       response: response.text,
-      sources: response.sources,
       url: response.url,
       model: model || "default",
       mode: mode || "search",
+      focus: focus || null,
+      spaceId: spaceId || null,
       partial: response.partial || false,
       tookMs: Date.now() - startTime,
     };
@@ -595,4 +593,4 @@ async function query(options) {
   }
 }
 
-module.exports = { query, PERPLEXITY_URL };
+module.exports = { query, buildDeepLinkUrl, PERPLEXITY_URL };

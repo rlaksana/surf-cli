@@ -56,12 +56,33 @@ surf gemini "wide banner" --generate-image /tmp/banner.png --aspect-ratio 16:9
 ```
 
 ### Perplexity
+
+Uses the **deep-link URL pattern** (`https://www.perplexity.ai/#?q=...&model=...&focus=...&space=...`) so the page boots already configured — no need to script the typePrompt / selectModel / submitPrompt dance.
+
+**Default model:** `claude46sonnetthinking` (Claude Sonnet 4.6 Thinking). Picked as the most reliable for exact-format output in head-to-head PONG tests against other Pro thinking models.
+
 ```bash
-surf perplexity "what is quantum computing"
-surf perplexity "explain this page" --with-page   # Include page context
-surf perplexity "deep dive" --mode research       # Research mode (Pro)
-surf perplexity "latest news" --model sonar       # Model selection (Pro)
+surf perplexity "what is quantum computing"            # Default: Claude Sonnet 4.6 Thinking
+surf perplexity "explain this page" --with-page        # Include page context
+surf perplexity "deep dive" --mode research            # Research mode (Pro)
+surf perplexity "latest news" --focus web               # Web focus
+surf perplexity "ticker $AAPL" --focus edgar            # Finance (SEC filings)
+surf perplexity "..." --space <spaceId>                # Run inside a Perplexity Space
 ```
+
+**Model selection** (Pro users): use the `reasoning_model` field from `https://www.perplexity.ai/rest/models/config` as the `--model` value — that's the model id Perplexity uses for Thinking mode. Top Pro thinking picks:
+
+| Model | Notes |
+|---|---|
+| `claude46sonnetthinking` (default) | Best format compliance |
+| `gemini31pro_high` | Highest intelligence among Pro picks |
+| `gpt54_thinking` | Top Pro reasoning |
+| `kimik26thinking` | Strong reasoning alt |
+| `nv_nemotron_3_ultra` | NVIDIA Nemotron 3 Ultra |
+
+**Max-tier models** (e.g. `gpt55_thinking`, `claude48opusthinking`) are silently rejected for Pro subscribers — pick a Pro-tier `reasoning_model` id.
+
+**Focus values:** `writing, web, social, scholar, edgar` (comma-separated, e.g. `--focus writing,scholar`).
 
 ### Claude
 ```bash
@@ -564,6 +585,7 @@ surf wait.element ".missing" --auto-capture --timeout 2000
 12. **Window isolation** - Use `window.new` + `--window-id` to keep agent work separate from your browsing
 13. **Semantic locators** - `locate.role`, `locate.text`, `locate.label` for more robust element finding
 14. **Frame context** - Use `frame.switch` before interacting with iframe content
+15. **Perplexity default = Claude Sonnet 4.6 Thinking** - Picked for format compliance; override with `--model <id>` from `/rest/models/config`. Perplexity's "Thinking" toggle is the `reasoning_model` field, not a URL flag — pass that id to `?model=...`
 
 ## Socket API
 

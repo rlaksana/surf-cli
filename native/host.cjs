@@ -657,7 +657,7 @@ function handleToolRequest(msg, socket) {
   }
 
   if (extensionMsg.type === "PERPLEXITY_QUERY") {
-    const { query, mode, model, withPage, timeout } = extensionMsg;
+    const { query, mode, model, withPage, timeout, focus, space: spaceId } = extensionMsg;
 
     queueAiRequest(async () => {
       let pageContext = null;
@@ -685,12 +685,23 @@ function handleToolRequest(msg, socket) {
         fullPrompt = `Page: ${pageContext.url}\n\n${pageContext.text}\n\n---\n\n${query}`;
       }
 
+      // Default to Claude Sonnet 4.6 Thinking: most reliable for exact-format
+      // output across Pro thinking models (PONG test winner). User can override
+      // with --model <id>. See https://www.perplexity.ai/rest/models/config
+      // for the full list; the `reasoning_model` field is what you pass for
+      // Thinking mode. Max-tier models (e.g. gpt55_thinking, claude48opusthinking)
+      // require a Max subscription and are silently rejected by Perplexity for
+      // Pro users — prefer *_thinking ids marked as `tier: pro`.
+      const PERPLEXITY_DEFAULT_MODEL = "claude46sonnetthinking";
+
       const result = await perplexityClient.query({
         prompt: fullPrompt,
         mode: mode || "search",
-        model,
+        model: model || PERPLEXITY_DEFAULT_MODEL,
+        focus,
+        spaceId,
         timeout: timeout || 120000,
-        createTab: () =>
+        createTab: (url) =>
           new Promise((resolve) => {
             const tabCreateId = ++requestCounter;
             pendingToolRequests.set(tabCreateId, {
@@ -699,7 +710,9 @@ function handleToolRequest(msg, socket) {
               tool: "create_tab",
               onComplete: (r) => resolve(r),
             });
-            writeMessage({ type: "PERPLEXITY_NEW_TAB", id: tabCreateId });
+            // URL is built by the client (deep-link #?q=...&model=...).
+            // When the client has no URL (e.g. no prompt), falls back to home.
+            writeMessage({ type: "PERPLEXITY_NEW_TAB", url, id: tabCreateId });
           }),
         closeTab: (tabIdToClose) =>
           new Promise((resolve) => {
@@ -745,10 +758,12 @@ function handleToolRequest(msg, socket) {
           originalId,
           {
             response: result.response,
-            sources: result.sources,
             url: result.url,
             mode: result.mode,
             model: result.model,
+            focus: result.focus,
+            spaceId: result.spaceId,
+            partial: result.partial,
             tookMs: result.tookMs,
           },
           null,

@@ -2796,7 +2796,11 @@ export async function handleMessage(
     }
 
     case "PERPLEXITY_NEW_TAB": {
-      const tabId = await openInCurrentWindow("https://www.perplexity.ai/");
+      // Deep-link URL pattern: https://www.perplexity.ai/#?q=...&model=...&focus=...&space=...
+      // When message.url is set, the page boots already in a search-ready state
+      // and we can skip the typePrompt + selectModel + submitPrompt dance.
+      const targetUrl = message.url || "https://www.perplexity.ai/";
+      const tabId = await openInCurrentWindow(targetUrl);
       await cdp.attach(tabId);
       await waitForRuntimeReady(tabId, 10000);
       return { tabId };
