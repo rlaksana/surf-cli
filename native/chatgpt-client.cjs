@@ -394,9 +394,17 @@ async function waitForResponse(cdp, timeoutMs = 2700000) {
           return { text: '', stopVisible: Boolean(document.querySelector(STOP_SELECTOR)), finished: false };
         }
         const messageRoot = lastAssistantTurn.querySelector(ASSISTANT_SELECTOR) || lastAssistantTurn;
+        // For thinking models, the response may live inside the thinking block
+        // (collapsed) or after it. Try the .markdown / .prose selectors first
+        // (the final answer area), then fall back to the thinking block content,
+        // then the entire assistant turn as a last resort. This prevents the
+        // "stuck on empty text" failure when the model is still thinking.
+        const thinkingBlock = lastAssistantTurn.querySelector('[data-message-model-slug*="thinking"]');
         const contentRoot = messageRoot.querySelector('.markdown') ||
                            messageRoot.querySelector('[data-message-content]') ||
                            messageRoot.querySelector('.prose') ||
+                           (thinkingBlock && thinkingBlock.querySelector('.markdown')) ||
+                           thinkingBlock ||
                            messageRoot;
         const text = (contentRoot?.innerText || contentRoot?.textContent || '').trim();
         const stopVisible = Boolean(document.querySelector(STOP_SELECTOR));
@@ -795,6 +803,11 @@ function isChatGPTResponseComplete(snapshot, minStableCycles, minStableMs) {
   }
   if (snapshot.hasFinishedActions) {
     return true;
+  }
+  // Thinking model: if the response is a thinking block only (no finished
+  // actions yet), the model is still mid-think — do not treat as complete.
+  if (snapshot.hasThinkingIndicator && !snapshot.hasFinishedActions) {
+    return false;
   }
   // Not finished: check stability thresholds
   if (typeof minStableCycles === "number" && minStableCycles < 6) {

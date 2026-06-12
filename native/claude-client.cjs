@@ -13,10 +13,10 @@ const SELECTORS = {
   sendButton:
     'button[aria-label="Send message"], button[data-testid="send-button"], button[type="submit"]',
   assistantMessage:
-    '[data-is-streaming="false"], .font-claude-response, [data-turn-author="assistant"]',
-  stopButton: '[data-testid="stop-button"], button[aria-label="Stop"]',
+    '[data-is-streaming="false"], .font-claude-response, [data-turn-author="assistant"], [data-testid="assistant-message"]',
+  stopButton: '[data-testid="stop-button"], button[aria-label="Stop"], button[aria-label="Stop generating"]',
   conversationTurn:
-    '[data-is-streaming="false"], .font-claude-response, [data-turn-author="assistant"]',
+    '[data-is-streaming="false"], .font-claude-response, [data-turn-author="assistant"], [data-testid="assistant-message"], .claude-message',
 };
 
 function delay(ms) {
@@ -162,7 +162,11 @@ async function typePrompt(cdp, inputCdp, prompt) {
       if (!node) return false;
 
       // Clear existing content
-      node.value = '';
+      if (node.tagName === 'TEXTAREA' || node.tagName === 'INPUT') {
+        node.value = '';
+      } else if (node.isContentEditable) {
+        node.textContent = '';
+      }
 
       // Focus the input
       node.focus();
@@ -171,7 +175,7 @@ async function typePrompt(cdp, inputCdp, prompt) {
     })()`,
   );
 
-  // Type the prompt
+  // Type the prompt using CDP Input.insertText
   await inputCdp("Input.insertText", { text: prompt });
 
   // Small delay after typing
@@ -179,7 +183,25 @@ async function typePrompt(cdp, inputCdp, prompt) {
 }
 
 async function clickSend(cdp, inputCdp) {
-  // Try multiple methods to click send
+  // Primary: press Enter (most reliable for Claude's contenteditable input)
+  await inputCdp("Input.dispatchKeyEvent", {
+    type: "keyDown",
+    key: "Enter",
+    code: "Enter",
+    windowsVirtualKeyCode: 13,
+    nativeVirtualKeyCode: 13,
+    text: "\r",
+  });
+  await inputCdp("Input.dispatchKeyEvent", {
+    type: "keyUp",
+    key: "Enter",
+    code: "Enter",
+    windowsVirtualKeyCode: 13,
+    nativeVirtualKeyCode: 13,
+    text: "\r",
+  });
+
+  // Fallback: try clicking send button
   const clicked = await evaluate(
     cdp,
     `(() => {
@@ -195,20 +217,6 @@ async function clickSend(cdp, inputCdp) {
       return false;
     })()`,
   );
-
-  if (!clicked) {
-    // Fallback: try pressing Enter
-    await inputCdp("Input.dispatchKeyEvent", {
-      type: "keyDown",
-      key: "Enter",
-      text: "\r",
-    });
-    await inputCdp("Input.dispatchKeyEvent", {
-      type: "keyUp",
-      key: "Enter",
-      text: "\r",
-    });
-  }
 
   await delay(500);
 }

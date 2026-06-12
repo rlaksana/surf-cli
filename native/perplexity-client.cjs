@@ -439,25 +439,51 @@ async function waitForResponse(cdp, timeoutMs = 120000) {
     await delay(200);
   }
 
-  // Wait a bit for the response area to render
-  await delay(1000);
+  // Wait for response area to render — Perplexity deep-link needs time to auto-submit
+  // and fetch results. Perplexity can take 15-30s for complex queries.
+  await delay(15000);
 
   // Now poll for response completion
   while (Date.now() < deadline) {
     const snapshot = await evaluate(
       cdp,
       `(function() {
+      // Try multiple selectors to find the answer content (Perplexity UI changes frequently)
+      let text = '';
       const prose = document.querySelector('.prose');
-      const text = prose ? prose.innerText : '';
+      if (prose) {
+        text = prose.innerText;
+      } else {
+        // Fallback: look for main content area
+        const mainContent = document.querySelector('main');
+        if (mainContent) {
+          text = mainContent.innerText;
+        } else {
+          // Final fallback: use body text, filtered
+          const bodyText = document.body.innerText;
+          // Try to extract just the answer portion
+          const answerStart = bodyText.indexOf('Searching the web');
+          if (answerStart > -1) {
+            text = bodyText.substring(answerStart);
+          } else {
+            text = bodyText;
+          }
+        }
+      }
       const hasStop = !!document.querySelector('button[aria-label*=stop], button[aria-label*=Stop]');
       const hasCopy = !!document.querySelector('button[aria-label*=copy], button[aria-label*=Copy]');
       const hasRelated = document.body.innerText.indexOf('Related') > -1;
+      const hasFollowUp = document.body.innerText.indexOf('Ask a follow-up') > -1 ||
+                           document.body.innerText.indexOf('Follow-ups') > -1;
+      const bodyText = document.body.innerText;
+      const hasAnswer = bodyText.indexOf('Answer') > -1 || bodyText.indexOf('Searching the web') > -1;
       return {
         text: text,
         generating: hasStop,
         hasActions: hasCopy,
         hasRelated: hasRelated,
-        hasFollowUp: false,
+        hasFollowUp: hasFollowUp,
+        hasAnswer: hasAnswer,
         sourcesCount: 0,
         url: location.href
       };
@@ -489,7 +515,9 @@ async function waitForResponse(cdp, timeoutMs = 120000) {
     const isStable = stableCycles >= requiredStableCycles && stableMs >= minStableMs;
     const hasCompletionIndicators =
       snapshot.hasActions || snapshot.hasRelated || snapshot.hasFollowUp;
-    const isDone = !snapshot.generating && (hasCompletionIndicators || isStable);
+    // If we have answer indicators and stable text, consider it done even without explicit completion UI
+    const hasAnswerIndicators = snapshot.hasAnswer && currentText.length > 50;
+    const isDone = !snapshot.generating && (hasCompletionIndicators || isStable || hasAnswerIndicators);
 
     if (isDone && currentText.length > 20) {
       // Clean up the response text
@@ -539,6 +567,7 @@ async function query(options) {
     createTab,
     closeTab,
     cdpEvaluate,
+    cdpCommand,
     log = () => {},
   } = options;
 
@@ -562,8 +591,14 @@ async function query(options) {
   log(`Created tab ${tabId}`);
 
   const cdp = (expr) => cdpEvaluate(tabId, expr);
+  const inputCdp = (method, params) => cdpCommand(tabId, method, params);
 
   try {
+    // Make tab active so Perplexity deep-link auto-submits
+    try {
+      await inputCdp("Page.bringToFront", {});
+    } catch {}
+
     // Wait for page load (boots the deep-link)
     await waitForPageLoad(cdp);
     log("Page loaded");

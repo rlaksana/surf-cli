@@ -319,6 +319,41 @@ describe("chatgpt-client", () => {
         ),
       ).toBe(false);
     });
+
+    it("returns false for thinking-model mid-think state (text + indicator, no finished actions)", () => {
+      // Reproduces the "stuck on empty text" bug: a thinking model has
+      // streamed its thinking block (so text is non-empty), the stop
+      // button is gone, but the model hasn't yet produced the final
+      // answer or finished actions. Treated as NOT complete so we keep
+      // waiting for the real response.
+      expect(
+        chatgptClient.isChatGPTResponseComplete(
+          {
+            text: "Thinking tokens streamed here...",
+            stopVisible: false,
+            hasFinishedActions: false,
+            hasThinkingIndicator: true,
+          },
+          6,
+          1200,
+        ),
+      ).toBe(false);
+    });
+
+    it("returns true once thinking model finishes (indicator + finished actions)", () => {
+      expect(
+        chatgptClient.isChatGPTResponseComplete(
+          {
+            text: "Final answer.",
+            stopVisible: false,
+            hasFinishedActions: true,
+            hasThinkingIndicator: true,
+          },
+          6,
+          1200,
+        ),
+      ).toBe(true);
+    });
   });
 
   describe("query", () => {
