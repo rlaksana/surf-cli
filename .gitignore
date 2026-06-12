@@ -17,6 +17,7 @@ FEATURE_COMPARISON.md
 .quint/
 .serena/
 .mcp.json
+.codegraph/
 
 # Research artifacts (per-project investigation outputs)
 .research/
