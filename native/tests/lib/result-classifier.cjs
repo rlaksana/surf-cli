@@ -18,14 +18,16 @@
 function classify({ stdout, stderr, exitCode, tookMs, responseLength }) {
   const combined = `${stdout}\n${stderr}`.toLowerCase();
 
-  // PASS: non-empty response, exit 0
-  if (exitCode === 0 && responseLength > 0) {
-    return { status: "PASS", failureKind: null };
-  }
-
-  // Detect transient categories BEFORE generic ones (so login-required
-  // doesn't get masked by "error" classification).
-  if (combined.includes("login required") || combined.includes("login check failed")) {
+  // Detect transient categories BEFORE the generic PASS check. A non-empty
+  // response is NOT a pass if the page is actually a login wall (grok returns
+  // the modal text in stdout with a 200 exit), or if the request was
+  // rate-limited, or if the network failed.
+  if (
+    combined.includes("login required") ||
+    combined.includes("login check failed") ||
+    combined.includes("connect your 𝕏 account") ||  // grok.com login wall
+    combined.includes("connect your x account")     // fallback (no unicode)
+  ) {
     return { status: "FAIL", failureKind: "login-required" };
   }
   if (
@@ -42,6 +44,11 @@ function classify({ stdout, stderr, exitCode, tookMs, responseLength }) {
     combined.includes("econnreset")
   ) {
     return { status: "FAIL", failureKind: "network" };
+  }
+
+  // PASS: non-empty response, exit 0 (after all transient checks pass)
+  if (exitCode === 0 && responseLength > 0) {
+    return { status: "PASS", failureKind: null };
   }
 
   // Complete-timeout: hit our 90s wall (exit 124 = timeout from `timeout` cmd)

@@ -29,6 +29,21 @@ describe("classify()", () => {
     assert.equal(result.failureKind, "login-required");
   });
 
+  it("returns FAIL with kind=login-required when stdout contains grok login wall", () => {
+    // Grok returns the login modal text in stdout when not signed in
+    // (not in stderr, so we must scan combined). The chat wall
+    // includes "Connect your 𝕏 account".
+    const result = classify({
+      stdout: "Imagine\nWhat do you want to know?\nConnect your 𝕏 account\nUnlock early features\n",
+      stderr: "",
+      exitCode: 0,
+      tookMs: 8000,
+      responseLength: 65,  // non-empty
+    });
+    assert.equal(result.status, "FAIL");
+    assert.equal(result.failureKind, "login-required");
+  });
+
   it("returns FAIL with kind=rate-limit when stdout/stderr contains 429", () => {
     const result = classify({
       stdout: "",
