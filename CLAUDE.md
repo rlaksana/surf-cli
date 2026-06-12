@@ -262,6 +262,35 @@ The MCP server (`native/mcp-server.cjs`) provides Model Context Protocol integra
 - CDP failures: Ensure debuggable tabs exist
 - Permission denied on socket: Check that no other surf instance is running
 
+### Stability test (AI provider self-heal)
+
+```bash
+npm run test:ai
+```
+
+Runs a PONG smoke test against all 7 AI providers (chatgpt, gemini, claude, perplexity, grok, aistudio, aimode). Sequential, ~10 min total. Produces:
+
+- Console table with status, time, char count, failureKind per provider
+- JSON report at `.research/ai-smoke-<timestamp>/report.json`
+- On failure: 4-state a11y tree snapshots at `.research/ai-smoke-<timestamp>/<provider>/snapshots/{empty,submitting,streaming,completed}.txt`
+
+**failureKind values:**
+
+- `selector` / `complete-timeout` / `error` → regression. AI agent reads the snapshots, diffs against `native/clients/<provider>/selectors.cjs`, proposes fix.
+- `login-required` / `rate-limit` / `network` → transient, not a regression. Retry later.
+
+When the test fails, the AI agent (in conversation) reads the report and snapshots, classifies as selector-drift, and proposes a fix:
+
+```bash
+# Example self-heal loop
+npm run test:ai  # FAIL on chatgpt with kind=selector
+# AI reads .research/ai-smoke-*/report.json
+# AI diffs snapshots against native/clients/chatgpt/selectors.cjs
+# AI proposes new selector, user approves
+# AI edits selectors.cjs
+npm run test:ai  # PASS
+```
+
 ## AI Completion Detection — Broken Selector Recovery Guide
 
 When `surf <ai> "PONG"` returns empty, `"Done"`, or times out even though the response is visible in the browser, the bug is almost always a **selector that no longer matches the live UI**. This section is the playbook.
