@@ -151,7 +151,12 @@ function delay(ms) {
 
 function surfSubcommand(args, timeoutMs = 10000) {
   return new Promise((resolve, reject) => {
-    const child = cp.spawn("surf", args, { stdio: ["ignore", "pipe", "pipe"] });
+    // shell: true is required on Windows (npm `.cmd` shim issue; see
+    // surf-client.cjs comment). Args are hardcoded.
+    const child = cp.spawn("surf", args, {
+      stdio: ["ignore", "pipe", "pipe"],
+      shell: true,
+    });
     let stdout = "";
     let stderr = "";
     const timer = setTimeout(() => {

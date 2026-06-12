@@ -41,7 +41,14 @@ async function runProvider({ provider, prompt, timeoutMs = 90000, extraArgs = []
 
     let child;
     try {
-      child = cp.spawn("surf", args, { stdio: ["ignore", "pipe", "pipe"] });
+      // shell: true is required on Windows because the `surf` binary is
+      // installed as a `.cmd` shim by npm; Node's spawn() doesn't append
+      // PATHEXT. The args are all hardcoded here (no user input), so
+      // there's no command-injection risk.
+      child = cp.spawn("surf", args, {
+        stdio: ["ignore", "pipe", "pipe"],
+        shell: true,
+      });
     } catch (e) {
       resolve({
         status: null,
