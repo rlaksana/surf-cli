@@ -46,6 +46,7 @@
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
     "test:ui": "vitest --ui",
+    "test:ai": "node native/tests/ai-provider-smoke.cjs",
     "install:native": "node scripts/install-native-host.cjs",
     "uninstall:native": "node scripts/uninstall-native-host.cjs"
   },
