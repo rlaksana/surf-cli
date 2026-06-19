@@ -2,7 +2,7 @@
 
 **Date:** 2026-06-19
 **Status:** Approved — ready for implementation
-**Scope:** 5 files, ~10 lines of substantive change
+**Scope:** 3 source files, ~12 lines of substantive change (plus this spec)
 
 ## Goal
 
@@ -36,7 +36,7 @@ and produces a valid response.
   (`perplexity-client.cjs:209-296`). The deep-link is the primary path; if
   the live PONG test passes, the fallback is not exercised.
 
-## Files to Change (5)
+## Files to Change (3 source files)
 
 ### 1. `native/host.cjs`
 
