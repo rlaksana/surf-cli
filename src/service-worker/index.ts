@@ -3099,7 +3099,7 @@ export async function handleMessage(
     case "CHATGPT_NEW_TAB": {
       const tab = await chrome.tabs.create({
         url: "https://chatgpt.com/",
-        active: true,
+        active: false,
       });
       if (!tab.id) throw new Error("Failed to create tab");
       const currentTab = await chrome.tabs.get(tab.id);
@@ -3151,7 +3151,7 @@ export async function handleMessage(
     case "PERPLEXITY_NEW_TAB": {
       const tab = await chrome.tabs.create({
         url: "https://www.perplexity.ai/",
-        active: true,
+        active: false,
       });
       if (!tab.id) throw new Error("Failed to create tab");
       const currentTab = await chrome.tabs.get(tab.id);
@@ -3236,7 +3236,7 @@ export async function handleMessage(
     case "GROK_NEW_TAB": {
       const tab = await chrome.tabs.create({
         url: "https://x.com/i/grok",
-        active: true,
+        active: false,
       });
       if (!tab.id) throw new Error("Failed to create tab");
       const currentTab = await chrome.tabs.get(tab.id);
@@ -3288,7 +3288,7 @@ export async function handleMessage(
     case "GEMINI_NEW_TAB": {
       const tab = await chrome.tabs.create({
         url: "https://gemini.google.com/app",
-        active: true,
+        active: false,
       });
       if (!tab.id) throw new Error("Failed to create tab");
       return { tabId: tab.id };
@@ -3337,7 +3337,7 @@ export async function handleMessage(
 
     case "AISTUDIO_NEW_TAB": {
       const url = message.url || "https://aistudio.google.com/prompts/new_chat";
-      const tab = await chrome.tabs.create({ url, active: true });
+      const tab = await chrome.tabs.create({ url, active: false });
       if (!tab.id) throw new Error("Failed to create tab");
       const currentTab = await chrome.tabs.get(tab.id);
       if (currentTab.status !== "complete") {
