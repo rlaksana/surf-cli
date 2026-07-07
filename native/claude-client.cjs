@@ -9,9 +9,7 @@ const CLAUDE_URL = "https://claude.ai/";
 
 const SELECTORS = {
   promptTextarea:
-    'textarea[placeholder*="How can I help you"], textarea[placeholder*="message"], #composer-input, [data-testid="composer-input"], div[contenteditable="true"][role="textbox"]',
-  sendButton:
-    'button[aria-label="Send message"], button[data-testid="send-button"], button[type="submit"]',
+    'div[contenteditable="true"][role="textbox"]',
   assistantMessage:
     '[data-is-streaming="false"], .font-claude-response, [data-turn-author="assistant"], [data-testid="assistant-message"]',
   stopButton: '[data-testid="stop-button"], button[aria-label="Stop"], button[aria-label="Stop generating"]',
@@ -45,12 +43,13 @@ function hasRequiredCookies(cookies) {
   if (!cookies || !Array.isArray(cookies)) {
     return false;
   }
-  // Check for session-related cookies (sessionKey, any session cookie)
-  // or device ID cookies that indicate authenticated session
+  // Claude.ai web uses session cookies for auth. Anthropic API cookies
+  // (anthropic-device-id, ARID) are NOT valid here — those authenticate
+  // the API at console.anthropic.com / api.anthropic.com, not claude.ai.
+  // Accept sessionKey or any session-prefixed cookie (covers session-key
+  // and future variations).
   const validCookie = cookies.find(
-    (c) =>
-      c.value &&
-      (c.name.includes("session") || c.name === "anthropic-device-id" || c.name === "ARID"),
+    (c) => c.value && (c.name === "sessionKey" || c.name.startsWith("session"))
   );
   return Boolean(validCookie);
 }
