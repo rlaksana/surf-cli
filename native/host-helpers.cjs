@@ -1076,6 +1076,16 @@ function mapToolToMessage(tool, args, tabId) {
         timeout: a.timeout ? parseInt(a.timeout, 10) * 1000 : 2700000,
         ...baseMsg 
       };
+    case "claude":
+      if (!a.query) throw new Error("query required");
+      return {
+        type: "CLAUDE_QUERY",
+        query: a.query,
+        model: a.model,
+        withPage: a["with-page"],
+        timeout: a.timeout ? parseInt(a.timeout, 10) * 1000 : 300000,
+        ...baseMsg
+      };
     case "gemini":
       if (!a.query && !a["generate-image"]) throw new Error("query required");
       return {
