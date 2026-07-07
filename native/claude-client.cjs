@@ -200,24 +200,28 @@ async function clickSend(cdp, inputCdp) {
     text: "\r",
   });
 
-  // Fallback: try clicking send button
-  const clicked = await evaluate(
-    cdp,
-    `(() => {
-      ${buildClickDispatcher()}
-      const selectors = ${JSON.stringify(SELECTORS.sendButton.split(", "))};
-      for (const selector of selectors) {
-        const btn = document.querySelector(selector);
-        if (btn) {
-          dispatchClickSequence(btn);
-          return true;
+  // Fallback: try clicking send button. SELECTORS.sendButton is undefined
+  // for the live Claude.ai UI (no separate send button exists; the rightmost
+  // composer toolbar icon activates voice dictation when clicked). Skip the
+  // fallback entirely when sendButton is not configured.
+  if (SELECTORS.sendButton) {
+    await evaluate(
+      cdp,
+      `(() => {
+        ${buildClickDispatcher()}
+        const selectors = ${JSON.stringify(SELECTORS.sendButton.split(", "))};
+        for (const selector of selectors) {
+          const btn = document.querySelector(selector);
+          if (btn) {
+            dispatchClickSequence(btn);
+            return true;
+          }
         }
-      }
-      return false;
-    })()`,
-  );
-
-  await delay(500);
+        return false;
+      })()`,
+    );
+    await delay(500);
+  }
 }
 
 async function waitForResponse(cdp, timeoutMs) {
