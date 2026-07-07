@@ -374,4 +374,4 @@ async function query(options) {
   }
 }
 
-module.exports = { query, hasRequiredCookies, CLAUDE_URL };
+module.exports = { query, hasRequiredCookies, SELECTORS, CLAUDE_URL };
