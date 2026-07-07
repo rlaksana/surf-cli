@@ -2728,6 +2728,7 @@ const PRIMARY_ARG_MAP = {
   ai: "query",
   gemini: "query",
   chatgpt: "query",
+  claude: "query",
   perplexity: "query",
   grok: "query",
   aistudio: "query",
@@ -3300,7 +3301,7 @@ const socket = net.createConnection(SOCKET_PATH, () => {
   socket.write(JSON.stringify(request) + "\n");
 });
 
-const AI_TOOLS = ["smoke", "chatgpt", "gemini", "perplexity", "grok", "aistudio", "aistudio.build", "aimode", "ai"];
+const AI_TOOLS = ["smoke", "chatgpt", "claude", "gemini", "perplexity", "grok", "aistudio", "aistudio.build", "aimode", "ai"];
 let requestTimeout = AI_TOOLS.includes(tool) ? 300000 : 30000;
 if (tool === "aistudio.build") {
   const userTimeoutSec = parseInt(options.timeout || "600", 10);
