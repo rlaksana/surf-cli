@@ -1,44 +1,38 @@
-# Add Claude as a Split-Style AI Provider
+# Add Claude as a Legacy AI Provider + Delete Unused Architecture
 
 **Date:** 2026-07-07
 **Status:** Draft (awaiting user review)
 **Author:** Surf brainstorming session (user + Claude)
+**Decision record:** Option A — wire legacy, delete dead split-style scaffolding
+
+## Decision Summary
+
+After gathering live evidence via page-agent MCP and re-investigating the
+unwired `native/core/` and `native/clients/` architecture, the user selected
+**Option A** (rejected Option B, the "split-style first adopter" path, and
+rejected Option C, "pause for architecture brainstorm"). Option A is the
+smallest change that:
+
+1. Makes `surf claude "PONG"` work end-to-end via the proven legacy pattern.
+2. Deletes the half-finished split-style architecture that has been dead code
+   since the `27d7f55 feat(sprint): complete AI client architecture sprint`
+   commit (2026-04-14) and never had a single caller.
+3. Updates Claude's selectors based on live page-agent evidence.
+
+This spec replaces the previous "split-style shim" draft (`853269e`).
 
 ## Problem
 
 `surf claude "PONG"` fails with `Error: Unknown tool: claude` (verified in
-`.research/ai-smoke-2026-07-07T04-16-46-553Z/report.json`). Claude is a
-legitimate first-class provider in this repo's history — `native/claude-client.cjs`,
-`native/host.cjs` `CLAUDE_QUERY` handler, `native/host-helpers.cjs` `case "claude"`,
-and `native/cli.cjs` dispatch were all added by `d54804f chore: sanitize workspace
-& snapshot code` (2026-03-11) — but the upstream merge `909c51d` resolved
-conflicts in favor of upstream, which never had Claude, and the dispatch
-disappeared from `host.cjs`, `host-helpers.cjs`, and `cli.cjs`. The legacy
-`claude-client.cjs` survived because it was a new file with no upstream
-equivalent.
+`.research/ai-smoke-2026-07-07T04-16-46-553Z/report.json`). The dispatch was
+added by `d54804f` (2026-03-11) and lost during the upstream merge `909c51d`
+which resolved conflicts in favor of upstream — upstream never had Claude.
+The legacy `native/claude-client.cjs` survived because it was a new file
+with no upstream equivalent.
 
-The current tree has **two Claude implementations, neither wired**:
-
-| File | Lines | Status |
-|---|---|---|
-| `native/claude-client.cjs` | 346 | Legacy monolithic CDP client, **unwired** |
-| `native/clients/claude/config.cjs` | 18 | Split-style config, **unwired** |
-| `native/clients/claude/selectors.cjs` | 20 | Split-style selectors, **unwired** |
-| `native/clients/claude/strategy.cjs` | 187 | Split-style CoT-aware strategy, **unwired** |
-| `dist/service-worker/` Claude handlers | — | **Never existed** |
-
-Compounding this, the split-style architecture itself is **dead code across all
-7 providers**. `native/core/client-runtime.cjs` (777 lines, 469 lines of tests)
-exposes `createClientRuntime()` but **has zero call sites**. `native/core/` also
-has 5 other modules (`completion-engine`, `signal-normalizer`, `cookie-validator`,
-`rate-limit-detector`, `error-detector`, `ttl-cache`, `strategy-contracts`) totaling
-~1500 lines of well-tested infrastructure that nothing calls. The split-style
-sprint `27d7f55 feat(sprint): complete AI client architecture sprint` shipped
-the scaffolding but no provider ever used it.
-
-Finally, **Claude.ai's live UI has drifted from the selector chains in both
-implementations**, captured 2026-07-07 via page-agent MCP against a logged-in
-Pro plan session:
+Compounding this, Claude.ai's live UI has drifted from the selector chain
+in `native/claude-client.cjs:SELECTORS`, captured 2026-07-07 via page-agent
+MCP against a logged-in Pro plan session:
 
 | Selector | Expected match | Live result |
 |---|---|---|
@@ -54,104 +48,108 @@ Pro plan session:
 | `[data-testid="stop-button"]`, `button[aria-label="Stop"]`, `button[aria-label="Stop generating"]` | stop | unverified (idle state) |
 | `[data-testid="thinking-block"]`, `.thinking-content`, `[data-state="thinking"]`, `[aria-busy="true"]` | thinking | unverified (idle state) |
 
-The legacy `claude-client.cjs:SELECTORS` chain (10-19) is **half dead** on
-composer + send, and **unverified** on response/stop/thinking.
+The composer is a contenteditable div; the send affordance requires a real
+Enter keypress (no separate button); the legacy `claude-client.cjs:185-202`
+already has the Enter dispatch logic — only the selectors need to be
+corrected.
+
+Finally, the **split-style architecture is 4-month-old dead code with zero
+callers**, which the user has decided to delete rather than resurrect:
+
+- `native/core/client-runtime.cjs` (777 LoC + 469 LoC tests) — exports
+  `createClientRuntime()`, never imported outside the runtime itself
+- `native/core/completion-engine.cjs` (153 LoC + 158 LoC tests)
+- `native/core/signal-normalizer.cjs` (203 LoC, no test file)
+- `native/core/cookie-validator.cjs` (392 LoC + 416 LoC tests)
+- `native/core/rate-limit-detector.cjs` (161 LoC + 175 LoC tests)
+- `native/core/error-detector.cjs` (191 LoC + 244 LoC tests)
+- `native/core/strategy-contracts.cjs` (210 LoC, no test file)
+- `native/core/ttl-cache.cjs` (124 LoC, no test file)
+- `native/clients/{chatgpt,gemini,grok,perplexity,aistudio,aimode}/{config,selectors,strategy}.cjs`
+  (7 directories, ~830 LoC, all unwired)
+- `native/clients/claude/{config,selectors,strategy}.cjs` (3 files, 225 LoC, unwired)
+
+The total dead-code footprint: **~3000 LoC across 22 files**. All created in
+the same sprint (`27d7f55`, 2026-04-14). The migration of any provider to
+use the runtime was scoped out of that sprint and never picked up. The
+sprint plan file `.research/ai-client-fix-sprint-plan.md` documents the
+original 1-9 task list; tasks for actual provider migration were not in
+scope.
 
 ## Goal
 
-Add Claude as a working AI provider in `surf`, accessible as `surf claude "..."`,
-that passes the `npm run test:ai` PONG smoke test. Use the **split-style
-architecture** (`native/clients/claude/`) as the first provider to actually
-exercise the previously-dormant `createClientRuntime` infrastructure. Delete
-the legacy monolithic `native/claude-client.cjs` to avoid carrying two
-implementations of the same provider.
+Add Claude as a working AI provider in `surf`, accessible as
+`surf claude "..."`, that passes the `npm run test:ai` PONG smoke test.
+Use the proven legacy pattern (same as the other 6 providers) and update
+selectors based on live UI evidence. Delete the unused split-style
+architecture to remove confusion and reduce maintenance surface.
+
+Implementation notes:
+
+- Selector recovery for streaming-state selectors (assistant-message,
+  stop-button, thinking-block) when the live UI has not been observed
+  streaming. This work will be done as part of the implementation, driven
+  by `npm run test:ai` and the `CLAUDE.md` selector-recovery playbook.
+  This spec only locks down the composer (idle state) selectors and the
+  send path.
+- Cookies hardening. The legacy `hasRequiredCookies` accepts `session`,
+  `anthropic-device-id`, or `ARID`. Only `sessionKey` is correct for
+  claude.ai web. The implementation will narrow this — the spec does not
+  pin the exact list, but the smoke test will reveal what works against
+  the live page.
 
 Out of scope:
 
-- Migrating the other 6 providers (chatgpt, gemini, perplexity, grok, aistudio,
-  aimode) to the split-style architecture. That is a follow-up decision that
-  needs its own brainstorm and its own evidence.
-- Selector recovery for streaming-state selectors (assistant-message, stop-button,
-  thinking-block) when the live UI has not been observed streaming. This work
-  will be done as part of the implementation, driven by `npm run test:ai` and
-  the `CLAUDE.md` selector-recovery playbook. This spec only locks down the
-  composer (idle state) selectors and the send path.
-- Cookies hardening. The legacy `hasRequiredCookies` accepts `session`,
-  `anthropic-device-id`, or `ARID`. Only `sessionKey` is correct for
-  claude.ai web (the other two are Anthropic API cookies). The implementation
-  will narrow this — the spec does not pin the exact list, but the smoke test
-  will reveal what works against the live page.
-- Council skill, file upload, image attachment, voice mode interaction. None
-  of these are documented requirements. YAGNI.
-- Continuous monitoring / scheduling. The PONG smoke test is the verification
-  loop.
+- Migrating any provider to the split-style architecture. The architecture
+  itself is being deleted (see "DELETION" section below).
+- Council skill, file upload, image attachment, voice mode interaction.
+  None are documented requirements. YAGNI.
+- Continuous monitoring / scheduling. The PONG smoke test is the
+  verification loop.
 
-## Architecture: Split-Style Client + Hybrid Runtime
+## Architecture: Wire Legacy `claude-client.cjs` + Delete Dead Code
 
-### The shim: `native/clients/claude/client.cjs` (new)
+### The client: `native/claude-client.cjs` (existing, 346 LoC, update selectors)
 
-A thin module that:
+The legacy client already implements the right pattern. Two changes:
 
-1. **Wires the runtime** for completion detection:
+1. **Update `SELECTORS.promptTextarea`** (currently lines 11-12): drop
+   the 5 textarea-based selectors that no longer match. Keep:
    ```js
-   const { createClientRuntime } = require("../../core/client-runtime.cjs");
-   const config = require("./config.cjs");
-   const strategy = require("./strategy.cjs");
-   const runtime = createClientRuntime("claude", config, strategy);
+   promptTextarea:
+     'div[contenteditable="true"][role="textbox"]',
    ```
 
-2. **Exposes `query(options)` matching the contract every other provider uses**
-   (see `native/chatgpt-client.cjs` for the contract shape). The host's
-   `handleToolRequest` already knows how to call this shape.
+2. **Remove `SELECTORS.sendButton`** entirely (currently lines 13-14).
+   The send path is Enter-only — `clickSend` at `claude-client.cjs:185-202`
+   already dispatches `Input.dispatchKeyEvent` with `key: "Enter"`. The
+   send-button selector chain is dead code that confuses readers and adds
+   fallback code paths that have no effect.
 
-3. **Bridges the runtime to the host's helper-closure pattern.** The runtime
-   speaks CDP over `/tmp/surf.sock` directly. The host passes in `getCookies`,
-   `createTab`, `closeTab`, `cdpEvaluate`, `cdpCommand`, `log` via the
-   `options` argument. The shim **uses host's helpers for tab/cookie/eval/command
-   lifecycle** (the proven pattern, used by all 6 other providers), and **uses
-   the runtime only for completion polling** (the part Claude is weakest at,
-   per `9c387f3 fix(ai-clients): ChatGPT thinking model + Claude/Perplexity
-   selector fixes`).
+3. **Streaming-state selectors** (`assistantMessage`, `stopButton`,
+   `conversationTurn`): **leave as-is for the first implementation**.
+   The smoke test will reveal which branches fire; the `CLAUDE.md`
+   selector-recovery playbook handles iteration.
 
-   This hybrid keeps the shim small (~150-200 lines), reuses the runtime for
-   its intended purpose (signal-based completion detection), and avoids
-   re-implementing tab/cookie/eval/command plumbing that host.cjs already
-   handles for the other 6 providers.
+4. **Cookie narrowing** (`claude-client.cjs:50-56`): narrow
+   `hasRequiredCookies` to require `sessionKey` (and possibly a
+   `lastActiveOrg` or similar). The exact list will be set during
+   implementation based on what works against the live page. Acceptable
+   to start with the existing list and tighten on first smoke failure.
 
-4. **Returns the canonical response shape**:
-   ```js
-   { response: string, model: string, tookMs: number }
-   ```
-   to match `chatgptClient.query`, `geminiClient.query`, etc.
-
-### The existing split-style modules: keep, with selector updates
-
-- **`native/clients/claude/config.cjs`** (18 lines): already extends
-  `chatgpt/config.cjs`, overrides `selectors` and `completion` (`cotAware: true`).
-  **No change needed** unless cookie list is updated — that's a follow-up.
-
-- **`native/clients/claude/selectors.cjs`** (20 lines): **update** the
-  `promptTextarea` and `sendButton` chains. The composer chain must lead
-  with `div[contenteditable="true"][role="textbox"]` (verified FOUND). The
-  `sendButton` chain is **removed** (the click path doesn't submit; Enter
-  key dispatch is the correct path, already in legacy `claude-client.cjs:185-202`).
-  Streaming-state selectors (`responseContainer`, `stopButton`, `doneToken`,
-  `thinkingBlock`) **stay as-is** for the first implementation; smoke-test
-  failure will drive iteration.
-
-- **`native/clients/claude/strategy.cjs`** (187 lines): already implements
-  CoT-aware `checkCompletion` with thinking-block guard, rate-limit detection,
-  and error detection. **No change needed** for this work; the strategy is
-  the value of the split-style architecture.
+5. **No change** to the rest of the file: `evaluate`, `waitForPageLoad`,
+   `checkLoginStatus`, `waitForPromptReady`, `typePrompt`, `clickSend`,
+   `waitForResponse`, `getAssistantContent`, `query` all stay. The CDP
+   logic is correct; only selectors and cookies are wrong.
 
 ### The host: `native/host.cjs`
 
 Add the require and the dispatch, mirroring the existing chatgpt pattern
 (`host.cjs:482-545`) but adapted for Claude (no file upload):
 
-1. **Require** the new shim:
+1. **Require** the client:
    ```js
-   const claudeClient = require("./clients/claude/client.cjs");
+   const claudeClient = require("./claude-client.cjs");
    ```
 
 2. **Add `case "CLAUDE_QUERY"`** to `handleToolRequest`, ~80 lines:
@@ -160,7 +158,7 @@ Add the require and the dispatch, mirroring the existing chatgpt pattern
    - `closeTab` → `CLAUDE_CLOSE_TAB` message
    - `cdpEvaluate` → `CLAUDE_EVALUATE` message
    - `cdpCommand` → `CLAUDE_CDP_COMMAND` message
-   - All messages are routed through `pendingToolRequests` / `writeMessage`
+   - All messages routed through `pendingToolRequests` / `writeMessage`
      exactly like chatgpt.
    - Return shape: `{ response, model, tookMs }`.
 
@@ -211,19 +209,56 @@ Add 5 cases + 1 allow-list entry, mirroring `CHATGPT_NEW_TAB` /
 - `case "CLAUDE_EVALUATE"`: `cdp.evaluateScript(...)`. Mirror
   `CHATGPT_EVALUATE` at `service-worker/index.ts:3146-3148`.
 - `case "GET_CLAUDE_COOKIES"`: `chrome.cookies.getAll({ domain: ".claude.ai" })`.
-  **This is the only non-trivial deviation** — chatgpt's
-  `GET_CHATGPT_COOKIES` is handler-specific; Claude needs the same pattern
-  but for the claude.ai domain. Implementation mirrors the chatgpt handler.
+  This is the only non-trivial deviation — chatgpt's `GET_CHATGPT_COOKIES`
+  is handler-specific; Claude needs the same pattern but for the claude.ai
+  domain. Implementation mirrors the chatgpt handler.
 
-Also add the 5 message types to the `allowedMessages` / message-allow-list
-at `service-worker/index.ts:3582-3588`.
+Also add the 5 message types to the `allowedMessages` /
+message-allow-list at `service-worker/index.ts:3582-3588`.
 
-### The legacy client: delete
+### The legacy client: keep (do not delete)
 
-After the shim is wired and verified, **delete `native/claude-client.cjs`**
-(346 lines). This is a one-line removal. Reversible via git if needed.
-Justification: carrying two implementations of the same provider invites
-future drift and confuses readers.
+After the dispatch is wired, `native/claude-client.cjs` is the **only**
+Claude implementation. Do not delete. The split-style `native/clients/claude/*`
+files ARE deleted (see below), but the legacy client is the production path.
+
+### DELETION: split-style architecture (the cleanup half of this spec)
+
+**This is a destructive change.** It must be approved by the user before
+execution. The full deletion list:
+
+| Path | Action | Reason |
+|---|---|---|
+| `native/core/client-runtime.cjs` | delete | zero callers, dead since 2026-04-14 |
+| `native/core/client-runtime.test.cjs` | delete | same |
+| `native/core/completion-engine.cjs` | delete | zero callers |
+| `native/core/completion-engine.test.cjs` | delete | same |
+| `native/core/signal-normalizer.cjs` | delete | zero callers, no test file |
+| `native/core/cookie-validator.cjs` | delete | zero callers |
+| `native/core/cookie-validator.test.cjs` | delete | same |
+| `native/core/rate-limit-detector.cjs` | delete | zero callers |
+| `native/core/rate-limit-detector.test.cjs` | delete | same |
+| `native/core/error-detector.cjs` | delete | zero callers |
+| `native/core/error-detector.test.cjs` | delete | same |
+| `native/core/strategy-contracts.cjs` | delete | zero callers, no test file |
+| `native/core/ttl-cache.cjs` | delete | zero callers, no test file |
+| `native/clients/` (entire directory) | delete | all 7 subdirectories unwired |
+| `biome.json` `files.includes` entries for `native/core/` and `native/clients/` | remove | no longer relevant |
+| `vitest.config.ts` `include` entries for `native/core/*` test files | remove | no longer relevant |
+| `package.json` test script if it references these paths | adjust | no longer relevant |
+
+The deletion is **fully reversible via git** (`git revert`). The risk is
+not data loss but discovery: future readers may wonder "where did the
+split-style architecture go?" The deletion commit message will document
+this and reference this spec.
+
+**Special case: `.research/ai-client-fix-sprint-plan.md`** — the sprint
+plan file (249 LoC, added in `27d7f55`). This documents the original
+intent of the architecture. **Keep it** as historical reference; it
+explains *why* the architecture existed even after it's deleted.
+
+**Total deletion footprint:** ~3000 LoC across ~22 files plus config
+updates in 3 build files.
 
 ## Data Flow
 
@@ -235,17 +270,18 @@ CLI (cli.cjs)
 Native Host (host.cjs → handleToolRequest)
   ↓ recognizes "claude" tool
   ↓ calls claudeClient.query({ prompt, getCookies, createTab, ... })
-Shim (clients/claude/client.cjs)
-  ↓ createClientRuntime('claude', config, strategy) → runtime.init()
-  ↓ getCookies() → GET_CLAUDE_COOKIES → service-worker → returns cookies
+Client (claude-client.cjs)
+  ↓ hasRequiredCookies(cookies) → OK
   ↓ createTab() → CLAUDE_NEW_TAB → service-worker → returns tabId
-  ↓ typing: cdpEvaluate + cdpCommand (Input.insertText, Enter keydown)
-  ↓ polling: runtime.pollCompletion() in a loop with timeout
-    ↓ domSnapshot via CDP accessibility tree
-    ↓ strategy.checkCompletion(ctx, signals) → CoT-aware verdict
-    ↓ returns Verdict { done, reason, confidence, activeSignals }
+  ↓ waitForPageLoad(cdp) → page ready
+  ↓ checkLoginStatus(cdp) → logged in
+  ↓ waitForPromptReady(cdp) → composer visible
+  ↓ typePrompt(cdp, inputCdp, prompt) → text in contenteditable
+  ↓ clickSend(cdp, inputCdp) → Enter key dispatched
+  ↓ waitForResponse(cdp, timeout) → polls content until stable
+    ↓ evaluates SELECTORS.stopButton, SELECTORS.assistantMessage
+    ↓ returns when content stable + stop button gone
   ↓ closeTab() → CLAUDE_CLOSE_TAB
-  ↓ runtime.destroy()
   ↓ returns { response, model, tookMs }
 Native Host (host.cjs)
   ↓ returns result via writeMessage
@@ -262,11 +298,11 @@ string the smoke test can classify:
 |---|---|---|
 | Login required (no claude.ai session cookies) | `login-required` | `hasRequiredCookies` returns false |
 | Prompt composer never appears | `error` | `waitForPromptReady` timeout |
-| Click send does not submit | `error` | page-state check (composer still has text) |
-| Response never completes | `complete-timeout` | `runtime.pollCompletion` returns done:false at `maxTimeout` |
-| Response selector misses content | `selector` | `response.length === 0` after `done:true` |
-| Claude rate-limits the user | `rate-limit` | `rateLimitDetector` matches `pageContent` |
-| Claude returns a server error | `error` | `errorDetector` matches `pageContent` |
+| Click send does not submit (Enter ignored) | `error` | page-state check (composer still has text) |
+| Response never completes | `complete-timeout` | `waitForResponse` timeout |
+| Response selector misses content | `selector` | `response.text === ""` after timeout |
+| Claude rate-limits the user | `rate-limit` | rate-limit text patterns in pageContent |
+| Claude returns a server error | `error` | error text patterns in pageContent |
 | CDP/extension disconnect | `error` | `cdpEvaluate` / `cdpCommand` throws |
 
 The smoke test (`native/tests/ai-provider-smoke.cjs`) already classifies
@@ -277,21 +313,19 @@ classification contract. No new failure modes are introduced.
 
 ### Unit tests (in `test/unit/claude-client.test.ts`)
 
-The shim is small (~150-200 lines) and pure orchestration, but its bridge
-between host helpers and the runtime is the riskiest part. Mock the
-`createClientRuntime` factory and assert the shim calls it with the right
-`clientId`, `config`, `strategy`, and options. Cover:
+Cover the changes in `claude-client.cjs`:
 
-- `query()` calls `runtime.init()` exactly once.
-- `query()` calls `runtime.pollCompletion()` until `done:true` or timeout.
-- `query()` calls `runtime.destroy()` in `finally`.
-- `query()` returns the runtime's response wrapped in `{ response, model, tookMs }`.
-- `query()` rejects with a clear error if `hasRequiredCookies` returns false.
-- `query()` rejects with a clear error if `createTab` fails to return a tabId.
-- `query()` does **not** leak the tab — `closeTab` is always called, even on
-  error, with a 5s timeout (mirroring `claude-client.cjs:367-371`).
+- `hasRequiredCookies` accepts a claude.ai session cookie.
+- `hasRequiredCookies` rejects when only Anthropic API cookies are present.
+- `query()` rejects with "Claude.ai login required" if no valid cookies.
+- `query()` rejects with "Failed to create Claude.ai tab" if createTab fails.
+- `query()` calls `closeTab` in `finally`, even on error.
+- The exported `SELECTORS.promptTextarea` matches the contenteditable div
+  selector (assert exact string).
 
-Mock the `host` helper closures so the unit tests don't need a real socket.
+These are **small, focused tests** for the changes. The legacy CDP logic
+(typing, send, wait) is not unit-tested today and adding tests for it is
+out of scope.
 
 ### Integration test: `npm run test:ai`
 
@@ -308,54 +342,44 @@ iterates all 7 providers including Claude. The implementation is "done" when:
 ### Live verification: page-agent MCP
 
 When the smoke test fails with `kind=selector` or `kind=complete-timeout`,
-the diagnostic loop is the same as the existing `CLAUDE.md` selector-recovery
-playbook, with page-agent MCP as the browser-driving surface:
-
-1. User runs `npm run test:ai`; Claude fails.
-2. User invokes page-agent MCP to navigate to `https://claude.ai/new` in a
-   fresh tab.
-3. Page-agent reports the live DOM (a limitation we hit: page-agent cannot
-   dispatch Enter; for streaming-state selectors, the user will need to
-   manually send a prompt in a parallel tab and have page-agent snapshot
-   the streaming DOM, or use `surf js "..."` for direct `Runtime.evaluate`
-   via the native host's socket).
-4. Diff the snapshot against `selectors.cjs`; update selectors; rerun smoke.
-
-This is the recovery loop the user already has. The implementation does
-not change the recovery loop — it only makes the initial wiring land on
-the right baseline (composer contenteditable, send via Enter).
+the diagnostic loop is the existing `CLAUDE.md` selector-recovery playbook,
+with page-agent MCP as the browser-driving surface. The implementation
+does not change the recovery loop — it only makes the initial wiring
+land on the right baseline (composer contenteditable, send via Enter).
 
 ## Risks
 
-1. **First-mover risk on `createClientRuntime`.** No other provider uses the
-   runtime, so any runtime bug that doesn't surface in its 469-line unit
-   suite will hit Claude first. Mitigation: the shim's unit tests mock
-   `createClientRuntime`, so the runtime is exercised only at integration
-   time. The smoke test catches regressions.
-
-2. **Streaming-state selector drift.** Page-agent could not capture
-   streaming DOM (no Enter dispatch). The first smoke test run will reveal
-   whether the current `assistant-message` / `stop-button` / `thinking-block`
-   selectors in `selectors.cjs` still match. If they don't, the
+1. **Streaming-state selector drift.** Page-agent could not capture
+   streaming DOM (no Enter dispatch in the MCP toolset). The first smoke
+   test run will reveal whether the current `assistant-message` /
+   `stop-button` / `thinking-block` selectors in
+   `native/claude-client.cjs:15-19` still match. If they don't, the
    `CLAUDE.md` selector-recovery playbook applies.
 
-3. **Cookies hardening.** The legacy `hasRequiredCookies` accepts cookies
+2. **Cookies hardening.** The legacy `hasRequiredCookies` accepts cookies
    that don't apply to claude.ai web (`anthropic-device-id`, `ARID`). The
    implementation will narrow this to claude.ai session cookies. If too
    narrow, smoke test fails with `login-required` and we widen; if too
    broad, we accept false positives and tighten.
 
-4. **Service-worker message types are added but unverified in a logged-in
-   Chrome session.** The implementation can compile and lint clean without
-   a live browser. The smoke test is the only real validation. If the
-   user can't run `npm run test:ai` interactively, the implementation may
-   ship broken.
+3. **Service-worker message types are added but unverified in a
+   logged-in Chrome session.** The implementation can compile and lint
+   clean without a live browser. The smoke test is the only real
+   validation. If the user can't run `npm run test:ai` interactively,
+   the implementation may ship broken.
 
-5. **The architecture question is deferred, not resolved.** Other providers
-   (chatgpt, gemini, perplexity, grok, aistudio, aimode) stay on legacy.
-   The split-style architecture's 3000 lines stay half-dormant. This is
-   intentional per the user's selection of Option B, but it means a future
-   "migrate all 7 providers" sprint is still needed.
+4. **Mass deletion risk.** The split-style architecture (~3000 LoC across
+   ~22 files) is being deleted in one commit. If a hidden caller exists
+   (not detected by grep — e.g., dynamic require, build-time codegen),
+   deletion will break the build. Mitigation: run `npm run check`,
+   `npm run lint`, `npm run test` before committing; `npm run build` to
+   verify the build output. Reversible via git if anything breaks.
+
+5. **The deletion removes tests, not just code.** `client-runtime.test.cjs`
+   (469 LoC), `cookie-validator.test.cjs` (416 LoC), and others were
+   test suites that had no production caller. Deleting them removes
+   future maintenance surface but also removes "free" regression
+   coverage. Acceptable per the user's Option A decision.
 
 6. **Page-agent MCP can't drive Enter or evaluate JS in this environment.**
    The implementation will compile and the smoke test will run, but the
@@ -366,19 +390,36 @@ the right baseline (composer contenteditable, send via Enter).
 
 The implementation is complete when:
 
-- [ ] `npm run build` produces a host.cjs that includes the Claude dispatch.
+- [ ] `native/claude-client.cjs:SELECTORS.promptTextarea` is updated to
+      `div[contenteditable="true"][role="textbox"]` (verified via
+      page-agent on a logged-in Pro plan session).
+- [ ] `native/claude-client.cjs:SELECTORS.sendButton` is removed.
+- [ ] `native/host.cjs` requires `./claude-client.cjs` and handles
+      `CLAUDE_QUERY`.
+- [ ] `native/host-helpers.cjs:mapToolToMessage` has a `case "claude"`.
+- [ ] `native/cli.cjs` has a `claude` block in `TOOLS` help, an entry
+      in `PRIMARY_ARG_MAP`, and an entry in `AI_TOOLS`.
+- [ ] `src/service-worker/index.ts` has 5 new message handlers
+      (`CLAUDE_NEW_TAB`, `CLAUDE_CLOSE_TAB`, `CLAUDE_CDP_COMMAND`,
+      `CLAUDE_EVALUATE`, `GET_CLAUDE_COOKIES`) and they are in the
+      allowed-messages list.
+- [ ] `npm run build` produces a working dist/.
 - [ ] `npm run check` and `npm run lint` pass clean.
 - [ ] `npm run test -- test/unit/claude-client.test.ts` passes the new
-      shim unit tests.
-- [ ] `npm run test:ai` runs the Claude case and either:
-      - returns a non-empty `response` containing "PONG" (ideal), or
-      - fails with `failureKind: login-required` (acceptable: no
-        session cookie in CI), or
-      - fails with `failureKind: selector` (acceptable: surfaces the
-        recovery loop, which the user drives via page-agent MCP).
-- [ ] `surf claude --help` shows the same help shape as `surf chatgpt --help`.
-- [ ] `native/claude-client.cjs` is deleted.
-- [ ] No new files in `dist/` reference removed types or symbols.
+      unit tests.
+- [ ] `npm run test:ai` runs the Claude case and either returns
+      "PONG" or fails with `failureKind: login-required` or
+      `failureKind: selector` (acceptable, surfaces recovery loop).
+- [ ] `surf claude --help` shows the same help shape as
+      `surf chatgpt --help`.
+- [ ] `native/core/` and `native/clients/` are deleted.
+- [ ] `biome.json`, `vitest.config.ts`, and `package.json` are updated
+      to remove references to deleted paths.
+- [ ] `.research/ai-client-fix-sprint-plan.md` is kept (historical
+      reference, explains why the split-style existed).
+- [ ] Other 6 providers do not regress (chatgpt, gemini, perplexity,
+      grok, aistudio, aimode smoke tests still PASS or fail with the
+      same kind as before).
 
 ## Open Questions
 
@@ -388,19 +429,16 @@ remaining gaps will be resolved during implementation via the smoke test
 
 ## Follow-up Work (deferred, not in scope)
 
-- Migrate the other 6 providers to split-style. Pre-condition: this
-  implementation proves `createClientRuntime` works on a real chat workload.
-- Decide what to do with the 7 other `native/clients/<name>/` directories
-  (chatgpt, gemini, perplexity, grok, aistudio, aimode) — keep as-is,
-  migrate, or delete.
-- Replace `native/core/cookie-validator.cjs` HTTP-ping validation with
-  the new `GET_CLAUDE_COOKIES` + `hasRequiredCookies` flow used in legacy
-  `claude-client.cjs` (or vice versa — the two patterns are not consistent
-  across the codebase).
+- Selector recovery for streaming-state selectors (assistant-message,
+  stop-button, thinking-block) after the first smoke test reveals what
+  the live UI exposes.
+- Cookie narrowing — the exact list of claude.ai session cookies that
+  indicates a valid login. Implementation will iterate based on smoke
+  test results.
 - Add file-upload support if Anthropic ever ships it in claude.ai web
   (currently web-only has text + image-paste; API has documents).
-- Add council skill provider wrapper at
-  `skills/surf-council/providers/claude.cjs` to match the existing pattern
-  (chatgpt, gemini, aimode). Note: the council skill directory was not
-  present in the working tree at the time of this spec — upstream merge
-  may have removed it. This is a separate investigation.
+- Add a council skill provider wrapper at
+  `skills/surf-council/providers/claude.cjs` if/when the council skill
+  is restored. Note: the council skill directory was not present in the
+  working tree at the time of this spec — upstream merge may have
+  removed it. This is a separate investigation.
