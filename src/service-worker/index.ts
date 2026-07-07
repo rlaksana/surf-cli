@@ -3193,6 +3193,17 @@ export async function handleMessage(
       return result;
     }
 
+    case "CLAUDE_CDP_COMMAND": {
+      const { method, params } = message;
+      const result = await cdp.sendCommand(message.tabId, method, params || {});
+      return result;
+    }
+
+    case "CLAUDE_EVALUATE": {
+      const result = await cdp.evaluateScript(message.tabId, message.expression);
+      return result;
+    }
+
     case "PERPLEXITY_NEW_TAB": {
       const tab = await chrome.tabs.create({
         url: "https://www.perplexity.ai/",
