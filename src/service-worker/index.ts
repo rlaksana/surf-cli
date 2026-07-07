@@ -3096,6 +3096,11 @@ export async function handleMessage(
       return { cookies: [...cookies, ...openaiCookies] };
     }
 
+    case "GET_CLAUDE_COOKIES": {
+      const cookies = await chrome.cookies.getAll({ domain: ".claude.ai" });
+      return { cookies };
+    }
+
     case "CHATGPT_NEW_TAB": {
       const tab = await chrome.tabs.create({
         url: "https://chatgpt.com/",
