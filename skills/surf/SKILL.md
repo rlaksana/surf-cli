@@ -1,6 +1,6 @@
 ---
 name: surf
-description: Control Chrome browser via CLI for testing, automation, and debugging. Use when the user needs browser automation, screenshots, form filling, page inspection, network/CPU emulation, DevTools streaming, or AI queries via Gemini/Perplexity/Grok/AI Studio/Claude. ChatGPT is temporarily disabled. For Google AI Mode, use `aimode` (defaults to pro/nem=143, use `--auto` for auto/udm=50).
+description: Control Chrome browser via CLI for testing, automation, and debugging. Use when the user needs browser automation, screenshots, form filling, page inspection, network/CPU emulation, DevTools streaming, or AI queries via the default `aimode` provider (Google AI Mode — no login required; `nem=143` pro / `udm=50` auto) plus Gemini/Perplexity/Grok/AI Studio/Claude. ChatGPT is temporarily disabled.
 ---
 
 # Surf Browser Automation
@@ -50,9 +50,26 @@ surf animate-audit --selector ".thing" --duration 2000 --fps 10
 
 ## AI Assistants (No API Keys)
 
-Query AI models using your browser's logged-in session. Must be logged into the respective service in Chrome.
+Query AI models using your browser's logged-in session. Most require a login; **AI Mode (`aimode`) is the default** because it needs no login and works out of the box.
 
-**ChatGPT is temporarily disabled** - use Gemini, Claude, Perplexity, Grok, or AI Studio instead.
+**ChatGPT is temporarily disabled** - use AI Mode (default), Gemini, Claude, Perplexity, Grok, or AI Studio instead.
+
+### AI Mode (Google) — DEFAULT
+
+Google's AI-powered search at `google.com/search?udm=50` (auto) or `?nem=143` (pro). No login required, public endpoint.
+
+```bash
+surf aimode "explain quantum computing"          # Default: pro mode (nem=143)
+surf aimode "berita hari ini"                     # Indonesian: works (auto mode)
+surf aimode "summarize" --auto                    # Force auto mode (udm=50, has copy button)
+surf aimode "deep dive" --timeout 300             # Extended timeout (default 120s)
+```
+
+**When to pick pro vs auto:**
+- `--auto` (`udm=50`) — standard AI Mode, faster, exposes a copy button on the response
+- default (`nem=143`) — pro mode, deeper reasoning, slower on complex prompts
+
+**Why this is the default:** no auth needed, no rate-limit hit on free queries, and Indonesian/Indonesian-context prompts work reliably because Google handles the full search+generation pipeline.
 
 ### Gemini
 ```bash

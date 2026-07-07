@@ -3378,6 +3378,50 @@ export async function handleMessage(
       return await cdp.evaluateScript(message.tabId, message.expression);
     }
 
+    case "AIMODE_NEW_TAB": {
+      // URL is pre-built by the native host (AIMODE_URL_PRO or AIMODE_URL_AUTO).
+      const url = message.url || "https://www.google.com/search?udm=50&q=";
+      const tab = await chrome.tabs.create({ url, active: false });
+      if (!tab.id) throw new Error("Failed to create tab");
+      const currentTab = await chrome.tabs.get(tab.id);
+      if (currentTab.status !== "complete") {
+        await new Promise<void>((resolve) => {
+          const listener = (tabId: number, info: chrome.tabs.OnUpdatedInfo) => {
+            if (tabId === tab.id && info.status === "complete") {
+              chrome.tabs.onUpdated.removeListener(listener);
+              resolve();
+            }
+          };
+          chrome.tabs.onUpdated.addListener(listener);
+          setTimeout(() => {
+            chrome.tabs.onUpdated.removeListener(listener);
+            resolve();
+          }, 30000);
+        });
+      }
+      await cdp.attach(tab.id);
+      await waitForRuntimeReady(tab.id, 10000);
+      return { tabId: tab.id };
+    }
+
+    case "AIMODE_CLOSE_TAB": {
+      const aimodeTabId = message.tabId;
+      if (aimodeTabId) {
+        try { await cdp.detach(aimodeTabId); } catch {}
+        try { await chrome.tabs.remove(aimodeTabId); } catch {}
+      }
+      return { success: true };
+    }
+
+    case "AIMODE_CDP_COMMAND": {
+      const { method, params } = message;
+      return await cdp.sendCommand(message.tabId, method, params || {});
+    }
+
+    case "AIMODE_EVALUATE": {
+      return await cdp.evaluateScript(message.tabId, message.expression);
+    }
+
     case "DOWNLOADS_SEARCH": {
       const results = await chrome.downloads.search(message.searchParams || {});
       return {
@@ -3541,6 +3585,7 @@ const COMMANDS_WITHOUT_TAB = new Set([
   "GROK_NEW_TAB", "GROK_CLOSE_TAB", "GROK_EVALUATE", "GROK_CDP_COMMAND",
   "GEMINI_NEW_TAB", "GEMINI_CLOSE_TAB", "GEMINI_FETCH_URL", "AI_UPLOAD_FILE_TO_TAB", "UPLOAD_FILE_TO_TAB",
   "AISTUDIO_NEW_TAB", "AISTUDIO_CLOSE_TAB", "AISTUDIO_EVALUATE", "AISTUDIO_CDP_COMMAND",
+  "AIMODE_NEW_TAB", "AIMODE_CLOSE_TAB", "AIMODE_EVALUATE", "AIMODE_CDP_COMMAND",
   "DOWNLOADS_SEARCH",
   "WINDOW_NEW", "WINDOW_LIST", "WINDOW_FOCUS", "WINDOW_CLOSE", "WINDOW_RESIZE",
   "EMULATE_DEVICE_LIST"

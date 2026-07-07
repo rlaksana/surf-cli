@@ -1133,6 +1133,17 @@ function mapToolToMessage(tool, args, tabId) {
         ...baseMsg
       };
     }
+    case "aimode": {
+      if (!a.query) throw new Error("query required");
+
+      return {
+        type: "AIMODE_QUERY",
+        query: a.query,
+        pro: a.auto ? false : true, // --auto flag → udm=50 (auto), default → nem=143 (pro)
+        timeout: a.timeout ? parseInt(a.timeout, 10) * 1000 : 120000,
+        ...baseMsg
+      };
+    }
     case "aistudio.build": {
       if (!a.query) throw new Error("query required");
 

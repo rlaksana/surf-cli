@@ -52,8 +52,18 @@ async function captureFourStates({ provider, outDir, timeoutMs = 60000 }) {
   let tabId = null;
 
   try {
-    // 1. Open a fresh tab
-    tabId = await openTab(url);
+    // 1. Open a fresh tab. If openTab throws/times out, still try to locate
+    // the tab by URL — chrome.tabs.create may have succeeded even when
+    // our parse failed.
+    try {
+      tabId = await openTab(url);
+    } catch (e) {
+      errors.push(`openTab failed: ${e.message}`);
+    }
+    if (tabId === null || tabId === undefined) {
+      // Last-resort: scan open tabs for one whose URL matches our target.
+      tabId = await findTabByUrlPrefix(url);
+    }
     await delay(3000); // page load
 
     // 2. Capture "empty" state
@@ -185,6 +195,29 @@ async function openTab(url) {
   const m = stdout.match(/^\[(\d+)\]/);
   if (!m) throw new Error(`could not parse tabId from: ${stdout}`);
   return Number.parseInt(m[1], 10);
+}
+
+/**
+ * Locate a tab whose URL starts with `prefix`. Used as a fallback when
+ * openTab fails to parse its tabId (e.g. browser lock contention on
+ * Windows) but Chrome may have actually opened the tab.
+ *
+ * @param {string} prefix
+ * @returns {Promise<number|null>}
+ */
+async function findTabByUrlPrefix(prefix) {
+  try {
+    const { stdout } = await surfSubcommand(["tab.list"], 10000);
+    const target = prefix.split("?")[0]; // ignore query string
+    for (const line of stdout.split(/\r?\n/)) {
+      const cols = line.split("\t");
+      if (cols.length < 3) continue;
+      const id = Number.parseInt(cols[0], 10);
+      const url = cols.slice(2).join("\t");
+      if (Number.isFinite(id) && url.startsWith(target)) return id;
+    }
+  } catch {}
+  return null;
 }
 
 async function closeTab(tabId) {

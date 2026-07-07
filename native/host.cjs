@@ -12,6 +12,7 @@ const perplexityClient = require("./perplexity-client.cjs");
 const grokClient = require("./grok-client.cjs");
 const aistudioClient = require("./aistudio-client.cjs");
 const aistudioBuild = require("./aistudio-build.cjs");
+const aimodeClient = require("./aimode-client.cjs");
 const { mapToolToMessage, mapComputerAction, formatToolContent, buildProviderUploadMessage } = require("./host-helpers.cjs");
 
 const IS_WIN = process.platform === "win32";
@@ -1092,7 +1093,77 @@ function handleToolRequest(msg, socket) {
     }).catch((err) => {
       sendToolResponse(socket, originalId, null, err.message);
     });
-    
+
+    return;
+  }
+
+  if (extensionMsg.type === "AIMODE_QUERY") {
+    const { query, pro, timeout } = extensionMsg;
+
+    queueAiRequest(async () => {
+      const EXT_CALL_TIMEOUT_MS = 30000;
+
+      const callExtension = (toolName, msg, timeoutMs = EXT_CALL_TIMEOUT_MS) => new Promise((resolve, reject) => {
+        const id = ++requestCounter;
+
+        const timeoutId = setTimeout(() => {
+          pendingToolRequests.delete(id);
+          reject(new Error(`Timeout waiting for extension: ${toolName}`));
+        }, timeoutMs);
+
+        pendingToolRequests.set(id, {
+          socket: null,
+          originalId: null,
+          tool: toolName,
+          onComplete: (r) => {
+            clearTimeout(timeoutId);
+            resolve(r);
+          }
+        });
+
+        writeMessage({ ...msg, id });
+      });
+
+      const result = await aimodeClient.query({
+        prompt: query || "",
+        pro: pro !== false, // default pro (nem=143); --auto flag in CLI sets pro=false (udm=50)
+        timeout: timeout || 120000,
+        getCookies: () => callExtension("get_cookies", { type: "GET_GOOGLE_COOKIES" }, 45000),
+        createTab: (url) => callExtension(
+          "create_tab",
+          { type: "AIMODE_NEW_TAB", url },
+          45000
+        ),
+        closeTab: (tabIdToClose) => callExtension(
+          "close_tab",
+          { type: "AIMODE_CLOSE_TAB", tabId: tabIdToClose },
+          45000
+        ),
+        cdpEvaluate: (tabId, expression) => callExtension(
+          "cdp_evaluate",
+          { type: "AIMODE_EVALUATE", tabId, expression }
+        ),
+        cdpCommand: (tabId, method, params) => callExtension(
+          "cdp_command",
+          { type: "AIMODE_CDP_COMMAND", tabId, method, params }
+        ),
+        log: (msg) => log(`[aimode] ${msg}`)
+      });
+
+      return result;
+    }).then((result) => {
+      const payload = {
+        response: result.response,
+        model: pro === false ? "udm=50 (auto)" : "nem=143 (pro)",
+        url: result.url,
+        tookMs: result.tookMs
+      };
+
+      sendToolResponse(socket, originalId, { output: JSON.stringify(payload) }, null);
+    }).catch((err) => {
+      sendToolResponse(socket, originalId, null, err.message);
+    });
+
     return;
   }
 

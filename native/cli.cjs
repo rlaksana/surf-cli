@@ -489,6 +489,19 @@ const TOOLS = {
           { cmd: 'aistudio.build "crm dashboard" --output ./out', desc: "Build and extract to directory" },
         ]
       },
+      "aimode": {
+        desc: "Query Google AI Mode (default AI provider; no login required)",
+        args: ["query"],
+        opts: {
+          auto: "Use auto mode (udm=50) instead of pro mode (nem=143, default)",
+          timeout: "Timeout in seconds (default: 120)",
+        },
+        examples: [
+          { cmd: 'aimode "explain quantum computing"', desc: "Pro mode (nem=143, default)" },
+          { cmd: 'aimode "berita hari ini" --auto', desc: "Auto mode (udm=50)" },
+          { cmd: 'aimode "summarize" --timeout 300', desc: "Extended timeout" },
+        ]
+      },
       "ai": {
         desc: "Analyze page with AI (requires GOOGLE_API_KEY)",
         args: ["query"],
@@ -2719,6 +2732,7 @@ const PRIMARY_ARG_MAP = {
   grok: "query",
   aistudio: "query",
   "aistudio.build": "query",
+  aimode: "query",
   navigate: "url",
   go: "url",
   js: "code",
@@ -3286,11 +3300,14 @@ const socket = net.createConnection(SOCKET_PATH, () => {
   socket.write(JSON.stringify(request) + "\n");
 });
 
-const AI_TOOLS = ["smoke", "chatgpt", "gemini", "perplexity", "grok", "aistudio", "aistudio.build", "ai"];
+const AI_TOOLS = ["smoke", "chatgpt", "gemini", "perplexity", "grok", "aistudio", "aistudio.build", "aimode", "ai"];
 let requestTimeout = AI_TOOLS.includes(tool) ? 300000 : 30000;
 if (tool === "aistudio.build") {
   const userTimeoutSec = parseInt(options.timeout || "600", 10);
   requestTimeout = (userTimeoutSec * 1000) + 60000;
+} else if (tool === "aimode") {
+  const userTimeoutSec = parseInt(options.timeout || "120", 10);
+  requestTimeout = (userTimeoutSec * 1000) + 30000;
 }
 const timeout = setTimeout(() => {
   console.error(`Error: Request timed out (${requestTimeout / 1000}s)`);
@@ -3368,6 +3385,10 @@ async function handleResponse(response) {
   }
 
   if (tool === 'aistudio' && typeof data === 'string') {
+    data = { response: data };
+  }
+
+  if (tool === 'aimode' && typeof data === 'string') {
     data = { response: data };
   }
 
@@ -3559,6 +3580,15 @@ async function handleResponse(response) {
     const meta = [];
     if (data.model) meta.push(data.model);
     if (data.thinkingTime) meta.push(`thought ${data.thinkingTime}s`);
+    if (Number.isFinite(data.tookMs)) meta.push(`${(data.tookMs / 1000).toFixed(1)}s`);
+    if (meta.length > 0) {
+      console.error(`\n[${meta.join(' | ')}]`);
+    }
+  } else if (tool === "aimode" && data?.response) {
+    console.log(data.response);
+
+    const meta = [];
+    if (data.model) meta.push(data.model);
     if (Number.isFinite(data.tookMs)) meta.push(`${(data.tookMs / 1000).toFixed(1)}s`);
     if (meta.length > 0) {
       console.error(`\n[${meta.join(' | ')}]`);

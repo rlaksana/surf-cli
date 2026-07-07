@@ -22,7 +22,10 @@ const STARTER_CONFIG = {
 };
 
 const COUNCIL_CONFIG = {
-  defaultProviders: ["chatgpt", "gemini", "aimode"],
+  // Order matters: council/fan-out queries iterate this list.
+  // aimode leads because it requires no login, has no rate limit on free
+  // queries, and handles Indonesian/Indonesian-context prompts reliably.
+  defaultProviders: ["aimode", "gemini", "chatgpt"],
   timeouts: {
     chatgpt: 300000, // 5 min
     gemini: 180000, // 3 min
