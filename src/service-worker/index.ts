@@ -3169,6 +3169,19 @@ export async function handleMessage(
       return { success: true };
     }
 
+    case "CLAUDE_CLOSE_TAB": {
+      const claudeTabId = message.tabId;
+      if (claudeTabId) {
+        try {
+          await cdp.detach(claudeTabId);
+        } catch {}
+        try {
+          await chrome.tabs.remove(claudeTabId);
+        } catch {}
+      }
+      return { success: true };
+    }
+
     case "CHATGPT_CDP_COMMAND": {
       const { method, params } = message;
       const result = await cdp.sendCommand(message.tabId, method, params || {});
