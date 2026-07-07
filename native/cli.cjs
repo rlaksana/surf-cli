@@ -382,7 +382,7 @@ const REMOVED_COMMANDS = {
 
 const TOOLS = {
   ai: {
-    desc: "AI assistants (ChatGPT, Gemini)",
+    desc: "AI assistants (ChatGPT, Claude, Gemini)",
     commands: {
       "chatgpt": {
         desc: "Send prompt to ChatGPT (uses browser cookies)",
@@ -398,6 +398,20 @@ const TOOLS = {
           { cmd: 'chatgpt "summarize" --with-page', desc: "With page context" },
           { cmd: 'chatgpt "review" --file code.ts', desc: "With file" },
           { cmd: 'chatgpt "analyze" --model gpt-4o', desc: "Specify model" },
+        ]
+      },
+      "claude": {
+        desc: "Send prompt to Claude.ai (uses browser cookies)",
+        args: ["query"],
+        opts: {
+          "with-page": "Include current page context",
+          model: "Model: claude-3-5-sonnet (default), claude-3-opus, etc.",
+          timeout: "Timeout in seconds (default: 300 = 5min)"
+        },
+        examples: [
+          { cmd: 'claude "explain this code"', desc: "Basic query" },
+          { cmd: 'claude "summarize" --with-page', desc: "With page context" },
+          { cmd: 'claude "review this code"', desc: "Code review" },
         ]
       },
       "gemini": {
