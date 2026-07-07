@@ -1,84 +1,54 @@
 #!/usr/bin/env node
-const net = require("node:net");
-const fs = require("node:fs");
-const path = require("node:path");
-const os = require("node:os");
-const https = require("node:https");
-const { execSync } = require("node:child_process");
+const net = require("net");
+const fs = require("fs");
+const path = require("path");
+const os = require("os");
+const https = require("https");
+const { execSync } = require("child_process");
 const { GoogleGenerativeAI } = require("@google/generative-ai");
 const chatgptClient = require("./chatgpt-client.cjs");
-const claudeClient = require("./claude-client.cjs");
-const aimodeClient = require("./aimode-client.cjs");
 const geminiClient = require("./gemini-client.cjs");
 const perplexityClient = require("./perplexity-client.cjs");
 const grokClient = require("./grok-client.cjs");
 const aistudioClient = require("./aistudio-client.cjs");
 const aistudioBuild = require("./aistudio-build.cjs");
-const { mapToolToMessage, mapComputerAction, formatToolContent } = require("./host-helpers.cjs");
+const { mapToolToMessage, mapComputerAction, formatToolContent, buildProviderUploadMessage } = require("./host-helpers.cjs");
 
 const IS_WIN = process.platform === "win32";
-const SURF_TMP = IS_WIN ? path.join(os.tmpdir(), "surf") : "/tmp";
-const SOCKET_PATH = IS_WIN ? "//./pipe/surf" : "/tmp/surf.sock";
-if (IS_WIN) {
-  try {
-    fs.mkdirSync(SURF_TMP, { recursive: true });
-  } catch {}
-}
-
-// Surf-specific error codes with actionable hints
-const SURF_ERRORS = {
-  SURF_TIMEOUT: {
-    code: "SURF_TIMEOUT",
-    message: "Surf command timed out.",
-    hint: "Chrome windows may be stuck. Try closing Chrome windows manually and retry. If problem persists, run: taskkill /F /IM chrome.exe",
-  },
-  SURF_ZOMBIE_DETECTED: {
-    code: "SURF_ZOMBIE_DETECTED",
-    message: "Zombie Chrome windows detected.",
-    hint: "Force closing zombie processes...",
-  },
-  SURF_NOT_RUNNING: {
-    code: "SURF_NOT_RUNNING",
-    message: "Surf is not running or socket is not available.",
-    hint: "Is Chrome running with the surf extension? Run: surf tab.new",
-  },
-};
+const { SOCKET_PATH, SURF_TMP } = require("./socket-path.cjs");
+if (IS_WIN) { try { fs.mkdirSync(SURF_TMP, { recursive: true }); } catch {} }
 
 // Cross-platform image resize (macOS: sips, Linux: ImageMagick)
 function resizeImage(filePath, maxSize) {
   const platform = process.platform;
-
+  
   try {
     if (platform === "darwin") {
       // macOS: use sips
-      execSync(
-        `sips --resampleHeightWidthMax ${maxSize} "${filePath}" --out "${filePath}" 2>/dev/null`,
-        { stdio: "pipe" },
-      );
-      const sizeInfo = execSync(`sips -g pixelWidth -g pixelHeight "${filePath}" 2>/dev/null`, {
-        encoding: "utf8",
-      });
+      execSync(`sips --resampleHeightWidthMax ${maxSize} "${filePath}" --out "${filePath}" 2>/dev/null`, { stdio: "pipe" });
+      const sizeInfo = execSync(`sips -g pixelWidth -g pixelHeight "${filePath}" 2>/dev/null`, { encoding: "utf8" });
       const width = parseInt(sizeInfo.match(/pixelWidth:\s*(\d+)/)?.[1] || "0", 10);
       const height = parseInt(sizeInfo.match(/pixelHeight:\s*(\d+)/)?.[1] || "0", 10);
       return { success: true, width, height };
+    } else {
+      // Linux/Windows: use ImageMagick (try IM6 first, then IM7)
+      const resizeArg = IS_WIN ? `"${maxSize}x${maxSize}>"` : `${maxSize}x${maxSize}\\>`;
+      try {
+        execSync(`convert "${filePath}" -resize ${resizeArg} "${filePath}"`, { stdio: "pipe" });
+      } catch {
+        // IM7 uses 'magick' as main command
+        execSync(`magick "${filePath}" -resize ${resizeArg} "${filePath}"`, { stdio: "pipe" });
+      }
+      // Get dimensions (IM7 may need 'magick identify' instead of just 'identify')
+      let sizeInfo;
+      try {
+        sizeInfo = execSync(`identify -format "%w %h" "${filePath}"`, { encoding: "utf8" });
+      } catch {
+        sizeInfo = execSync(`magick identify -format "%w %h" "${filePath}"`, { encoding: "utf8" });
+      }
+      const [width, height] = sizeInfo.trim().split(" ").map(Number);
+      return { success: true, width, height };
     }
-    // Linux/Windows: use ImageMagick (try IM6 first, then IM7)
-    const resizeArg = IS_WIN ? `"${maxSize}x${maxSize}>"` : `${maxSize}x${maxSize}\\>`;
-    try {
-      execSync(`convert "${filePath}" -resize ${resizeArg} "${filePath}"`, { stdio: "pipe" });
-    } catch {
-      // IM7 uses 'magick' as main command
-      execSync(`magick "${filePath}" -resize ${resizeArg} "${filePath}"`, { stdio: "pipe" });
-    }
-    // Get dimensions (IM7 may need 'magick identify' instead of just 'identify')
-    let sizeInfo;
-    try {
-      sizeInfo = execSync(`identify -format "%w %h" "${filePath}"`, { encoding: "utf8" });
-    } catch {
-      sizeInfo = execSync(`magick identify -format "%w %h" "${filePath}"`, { encoding: "utf8" });
-    }
-    const [width, height] = sizeInfo.trim().split(" ").map(Number);
-    return { success: true, width, height };
   } catch (e) {
     return { success: false, error: e.message };
   }
@@ -95,9 +65,7 @@ function queueAiRequest(handler) {
 }
 
 async function processAiQueue() {
-  if (aiRequestInProgress || aiRequestQueue.length === 0) {
-    return;
-  }
+  if (aiRequestInProgress || aiRequestQueue.length === 0) return;
   aiRequestInProgress = true;
   const { handler, resolve, reject } = aiRequestQueue.shift();
   try {
@@ -118,7 +86,7 @@ const DEFAULT_RETRY_OPTIONS = {
   initialDelayMs: 1000,
   maxDelayMs: 10000,
   backoffFactor: 2,
-  retryableStatusCodes: [429, 500, 502, 503, 504],
+  retryableStatusCodes: [429, 500, 502, 503, 504]
 };
 
 async function withRetry(fn, retryOptions = DEFAULT_RETRY_OPTIONS, retryCount = 0) {
@@ -128,7 +96,7 @@ async function withRetry(fn, retryOptions = DEFAULT_RETRY_OPTIONS, retryCount = 
     if (retryCount >= retryOptions.maxRetries) {
       throw error;
     }
-
+    
     let isRetryable = false;
     if (error instanceof Error) {
       const statusCodeMatch = error.message.match(/status code (\d+)/i);
@@ -136,39 +104,34 @@ async function withRetry(fn, retryOptions = DEFAULT_RETRY_OPTIONS, retryCount = 
         const statusCode = parseInt(statusCodeMatch[1], 10);
         isRetryable = retryOptions.retryableStatusCodes.includes(statusCode);
       } else {
-        const isNetworkError =
-          error.message.includes("network") ||
-          error.message.includes("timeout") ||
-          error.message.includes("connection");
-        const isContentError =
-          error.message.includes("exceeds maximum") ||
-          error.message.includes("too large") ||
-          error.message.includes("token limit");
+        const isNetworkError = error.message.includes('network') || 
+                          error.message.includes('timeout') ||
+                          error.message.includes('connection');
+        const isContentError = error.message.includes('exceeds maximum') ||
+                          error.message.includes('too large') ||
+                          error.message.includes('token limit');
         isRetryable = isNetworkError && !isContentError;
       }
     }
-
+    
     if (!isRetryable) {
       throw error;
     }
-
+    
     const delay = Math.min(
-      retryOptions.initialDelayMs * retryOptions.backoffFactor ** retryCount,
-      retryOptions.maxDelayMs,
+      retryOptions.initialDelayMs * Math.pow(retryOptions.backoffFactor, retryCount),
+      retryOptions.maxDelayMs
     );
     const jitter = 0.8 + Math.random() * 0.4;
     const delayWithJitter = Math.floor(delay * jitter);
-
-    await new Promise((resolve) => setTimeout(resolve, delayWithJitter));
+    
+    await new Promise(resolve => setTimeout(resolve, delayWithJitter));
     return withRetry(fn, retryOptions, retryCount + 1);
   }
 }
 
 const AI_PROMPTS = {
-  find: (
-    query,
-    pageContext,
-  ) => `You are analyzing a web page's accessibility tree. Find the element matching the user's description.
+  find: (query, pageContext) => `You are analyzing a web page's accessibility tree. Find the element matching the user's description.
 
 Page Context:
 ${pageContext}
@@ -186,51 +149,29 @@ ${query ? `Focus on: ${query}` : ""}
 
 Keep the summary under 300 characters. Focus on the page's purpose and main content.`,
 
-  extract: (
-    query,
-    pageContext,
-  ) => `Extract structured data from this web page based on the user's request.
+  extract: (query, pageContext) => `Extract structured data from this web page based on the user's request.
 
 Page Context:
 ${pageContext}
 
 User Request: "${query}"
 
-Respond with valid JSON only.`,
+Respond with valid JSON only.`
 };
 
 function detectQueryMode(query) {
   const q = query.toLowerCase();
-  if (
-    q.includes("find") ||
-    q.includes("where is") ||
-    q.includes("locate") ||
-    q.includes("click") ||
-    q.includes("button") ||
-    q.includes("link") ||
-    q.includes("input") ||
-    q.includes("field")
-  ) {
+  if (q.includes("find") || q.includes("where is") || q.includes("locate") || 
+      q.includes("click") || q.includes("button") || q.includes("link") ||
+      q.includes("input") || q.includes("field")) {
     return "find";
   }
-  if (
-    q.includes("summarize") ||
-    q.includes("summary") ||
-    q.includes("what is this") ||
-    q.includes("about") ||
-    q.includes("describe") ||
-    q.includes("overview")
-  ) {
+  if (q.includes("summarize") || q.includes("summary") || q.includes("what is this") ||
+      q.includes("about") || q.includes("describe") || q.includes("overview")) {
     return "summary";
   }
-  if (
-    q.includes("list") ||
-    q.includes("extract") ||
-    q.includes("all the") ||
-    q.includes("get all") ||
-    q.includes("show all") ||
-    q.includes("json")
-  ) {
+  if (q.includes("list") || q.includes("extract") || q.includes("all the") ||
+      q.includes("get all") || q.includes("show all") || q.includes("json")) {
     return "extract";
   }
   return "summary";
@@ -255,27 +196,29 @@ class GeminiClient {
     const mode = options.mode || detectQueryMode(query);
     const promptFn = AI_PROMPTS[mode];
     const prompt = promptFn(query, pageContext);
-
+    
     const result = await withRetry(async () => {
       const response = await this.model.generateContent(prompt);
       return response.response.text();
     });
-
+    
     let content = result.trim();
-
+    
     if (mode === "extract") {
-      content = content.replace(/^```(?:json)?\n?|\n?```$/g, "").trim();
+      content = content.replace(/^```(?:json)?\n?|\n?```$/g, '').trim();
     }
-
+    
     return { mode, content };
   }
 }
 
+
+
 async function handleApiRequest(msg, sendResponse) {
   const { url, method, headers, body, streamId } = msg;
-
+  
   log(`API_REQUEST: ${method} ${url} streamId=${streamId}`);
-
+  
   try {
     const urlObj = new URL(url);
     const options = {
@@ -288,9 +231,9 @@ async function handleApiRequest(msg, sendResponse) {
 
     const req = https.request(options, (res) => {
       log(`API response status: ${res.statusCode}`);
-
-      sendResponse({
-        type: "API_RESPONSE_START",
+      
+      sendResponse({ 
+        type: "API_RESPONSE_START", 
         streamId,
         status: res.statusCode,
         headers: res.headers,
@@ -350,11 +293,7 @@ const log = (msg) => {
 
 log("Host starting...");
 
-if (!IS_WIN) {
-  try {
-    fs.unlinkSync(SOCKET_PATH);
-  } catch {}
-}
+if (!IS_WIN) { try { fs.unlinkSync(SOCKET_PATH); } catch {} }
 
 const pendingRequests = new Map();
 const pendingToolRequests = new Map();
@@ -363,15 +302,15 @@ let requestCounter = 0;
 
 function sendToolResponse(socket, id, result, error) {
   const response = { type: "tool_response", id };
-
+  
   if (error) {
     response.error = { content: [{ type: "text", text: error }] };
   } else {
     response.result = { content: formatToolContent(result, log) };
   }
-
+  
   try {
-    socket.write(`${JSON.stringify(response)}\n`);
+    socket.write(JSON.stringify(response) + "\n");
   } catch (e) {
     log(`Error sending tool_response: ${e.message}`);
   }
@@ -381,22 +320,22 @@ function handleStreamRequest(msg, socket) {
   const { streamType, options, id: originalId } = msg;
   const tabId = msg.tabId;
   const streamId = ++requestCounter;
-
+  
   activeStreams.set(streamId, {
     socket,
     originalId,
     streamType,
   });
-
+  
   writeMessage({
     type: streamType,
     streamId,
     options: options || {},
     tabId,
   });
-
+  
   try {
-    socket.write(`${JSON.stringify({ type: "stream_started", streamId })}\n`);
+    socket.write(JSON.stringify({ type: "stream_started", streamId }) + "\n");
   } catch (e) {
     log(`Error sending stream_started: ${e.message}`);
   }
@@ -405,73 +344,68 @@ function handleStreamRequest(msg, socket) {
 function handleToolRequest(msg, socket) {
   const { method, params } = msg;
   const originalId = msg.id || null;
-
+  
   if (method !== "execute_tool") {
     sendToolResponse(socket, originalId, null, `Unknown method: ${method}`);
     return;
   }
-
+  
   const { tool, args } = params || {};
   const rawTabId = msg.tabId || params?.tabId || args?.tabId;
   const tabId = rawTabId !== undefined ? parseInt(rawTabId, 10) : undefined;
   const rawWindowId = msg.windowId || params?.windowId || args?.windowId;
   const windowId = rawWindowId !== undefined ? parseInt(rawWindowId, 10) : undefined;
-
+  
   // Validate parsed IDs
-  if (tabId !== undefined && Number.isNaN(tabId)) {
+  if (tabId !== undefined && isNaN(tabId)) {
     sendToolResponse(socket, originalId, null, "tabId must be a number");
     return;
   }
-  if (windowId !== undefined && Number.isNaN(windowId)) {
+  if (windowId !== undefined && isNaN(windowId)) {
     sendToolResponse(socket, originalId, null, "windowId must be a number");
     return;
   }
-
+  
   if (!tool) {
     sendToolResponse(socket, originalId, null, "No tool specified");
     return;
   }
-
+  
   const extensionMsg = mapToolToMessage(tool, args, tabId);
   if (!extensionMsg) {
     sendToolResponse(socket, originalId, null, `Unknown tool: ${tool}`);
     return;
   }
-
+  
   if (extensionMsg.type === "UNSUPPORTED_ACTION") {
     sendToolResponse(socket, originalId, null, extensionMsg.message);
     return;
   }
-
+  
   if (extensionMsg.type === "LOCAL_WAIT") {
     setTimeout(() => {
       sendToolResponse(socket, originalId, { success: true }, null);
     }, extensionMsg.seconds * 1000);
     return;
   }
-
+  
   if (extensionMsg.type === "BATCH_EXECUTE") {
     executeBatch(extensionMsg.actions, extensionMsg.tabId, socket, originalId);
     return;
   }
-
+  
   if (extensionMsg.type === "AI_ANALYZE") {
     if (!extensionMsg.query || !extensionMsg.query.trim()) {
       sendToolResponse(socket, originalId, null, "Query is required for AI analysis");
       return;
     }
-
+    
     const apiKey = process.env.GOOGLE_API_KEY;
     if (!apiKey) {
-      sendToolResponse(
-        socket,
-        originalId,
-        null,
-        "GOOGLE_API_KEY environment variable not set. Export it with: export GOOGLE_API_KEY='your-key'",
-      );
+      sendToolResponse(socket, originalId, null, "GOOGLE_API_KEY environment variable not set. Export it with: export GOOGLE_API_KEY='your-key'");
       return;
     }
-
+    
     const pageRequestId = ++requestCounter;
     pendingToolRequests.set(pageRequestId, {
       socket: null,
@@ -482,59 +416,42 @@ function handleToolRequest(msg, socket) {
           sendToolResponse(socket, originalId, null, `Failed to read page: ${pageResult.error}`);
           return;
         }
-
+        
         const pageContent = pageResult.pageContent || "";
         if (!pageContent) {
           sendToolResponse(socket, originalId, null, "No page content available");
           return;
         }
-
+        
         try {
           const gemini = getGeminiClient(apiKey);
-          const result = await gemini.analyze(extensionMsg.query, pageContent, {
-            mode: extensionMsg.mode,
-          });
-
+          const result = await gemini.analyze(extensionMsg.query, pageContent, { mode: extensionMsg.mode });
+          
           if (result.mode === "find") {
-            sendToolResponse(
-              socket,
-              originalId,
-              {
-                ref: result.content === "NOT_FOUND" ? null : result.content,
-                mode: result.mode,
-                aiResult: true,
-              },
-              null,
-            );
+            sendToolResponse(socket, originalId, { 
+              ref: result.content === "NOT_FOUND" ? null : result.content,
+              mode: result.mode,
+              aiResult: true
+            }, null);
           } else {
-            sendToolResponse(
-              socket,
-              originalId,
-              {
-                content: result.content,
-                mode: result.mode,
-                aiResult: true,
-              },
-              null,
-            );
+            sendToolResponse(socket, originalId, { 
+              content: result.content,
+              mode: result.mode,
+              aiResult: true
+            }, null);
           }
         } catch (err) {
           sendToolResponse(socket, originalId, null, `AI analysis failed: ${err.message}`);
         }
-      },
+      }
     });
-    writeMessage({
-      type: "READ_PAGE",
-      options: { filter: "interactive" },
-      tabId: extensionMsg.tabId,
-      id: pageRequestId,
-    });
+    writeMessage({ type: "READ_PAGE", options: { filter: "interactive" }, tabId: extensionMsg.tabId, id: pageRequestId });
     return;
   }
-
+  
   if (extensionMsg.type === "CHATGPT_QUERY") {
     const { query, model, withPage, file, timeout } = extensionMsg;
-
+    
     queueAiRequest(async () => {
       let pageContext = null;
       if (withPage) {
@@ -544,121 +461,108 @@ function handleToolRequest(msg, socket) {
             socket: null,
             originalId: null,
             tool: "read_page",
-            onComplete: resolve,
+            onComplete: resolve
           });
           writeMessage({ type: "GET_PAGE_TEXT", tabId: extensionMsg.tabId, id: pageId });
         });
         if (pageResult && !pageResult.error) {
           pageContext = {
             url: pageResult.url,
-            text: pageResult.text || pageResult.pageContent || "",
+            text: pageResult.text || pageResult.pageContent || ""
           };
         }
       }
-
+      
       let fullPrompt = query;
       if (pageContext) {
         fullPrompt = `Page: ${pageContext.url}\n\n${pageContext.text}\n\n---\n\n${query}`;
       }
-
+      
       const result = await chatgptClient.query({
         prompt: fullPrompt,
         model,
         file,
         timeout,
-        getCookies: () =>
-          new Promise((resolve) => {
-            const cookieId = ++requestCounter;
-            pendingToolRequests.set(cookieId, {
-              socket: null,
-              originalId: null,
-              tool: "get_cookies",
-              onComplete: (r) => resolve(r),
-            });
-            writeMessage({ type: "GET_CHATGPT_COOKIES", id: cookieId });
-          }),
-        createTab: () =>
-          new Promise((resolve) => {
-            const tabCreateId = ++requestCounter;
-            pendingToolRequests.set(tabCreateId, {
-              socket: null,
-              originalId: null,
-              tool: "create_tab",
-              onComplete: (r) => resolve(r),
-            });
-            writeMessage({ type: "CHATGPT_NEW_TAB", id: tabCreateId });
-          }),
-        closeTab: (tabIdToClose) =>
-          new Promise((resolve) => {
-            const tabCloseId = ++requestCounter;
-            pendingToolRequests.set(tabCloseId, {
-              socket: null,
-              originalId: null,
-              tool: "close_tab",
-              onComplete: (r) => resolve(r),
-            });
-            writeMessage({ type: "CHATGPT_CLOSE_TAB", tabId: tabIdToClose, id: tabCloseId });
-          }),
-        cdpEvaluate: (tabId, expression) =>
-          new Promise((resolve) => {
-            const evalId = ++requestCounter;
-            pendingToolRequests.set(evalId, {
-              socket: null,
-              originalId: null,
-              tool: "cdp_evaluate",
-              onComplete: (r) => resolve(r),
-            });
-            writeMessage({ type: "CHATGPT_EVALUATE", tabId, expression, id: evalId });
-          }),
-        cdpCommand: (tabId, method, params) =>
-          new Promise((resolve) => {
-            const cmdId = ++requestCounter;
-            pendingToolRequests.set(cmdId, {
-              socket: null,
-              originalId: null,
-              tool: "cdp_command",
-              onComplete: (r) => resolve(r),
-            });
-            writeMessage({ type: "CHATGPT_CDP_COMMAND", tabId, method, params, id: cmdId });
-          }),
-        uploadFile: (tabId, filePaths) =>
-          new Promise((resolve) => {
-            const uploadId = ++requestCounter;
-            pendingToolRequests.set(uploadId, {
-              socket: null,
-              originalId: null,
-              tool: "upload_file",
-              onComplete: (r) => resolve(r),
-            });
-            writeMessage({ type: "UPLOAD_FILE_TO_TAB", tabId, filePaths, id: uploadId });
-          }),
-        log: (msg) => log(`[chatgpt] ${msg}`),
+        getCookies: () => new Promise((resolve) => {
+          const cookieId = ++requestCounter;
+          pendingToolRequests.set(cookieId, {
+            socket: null,
+            originalId: null,
+            tool: "get_cookies",
+            onComplete: (r) => resolve(r)
+          });
+          writeMessage({ type: "GET_CHATGPT_COOKIES", id: cookieId });
+        }),
+        createTab: () => new Promise((resolve) => {
+          const tabCreateId = ++requestCounter;
+          pendingToolRequests.set(tabCreateId, {
+            socket: null,
+            originalId: null,
+            tool: "create_tab",
+            onComplete: (r) => resolve(r)
+          });
+          writeMessage({ type: "CHATGPT_NEW_TAB", id: tabCreateId });
+        }),
+        closeTab: (tabIdToClose) => new Promise((resolve) => {
+          const tabCloseId = ++requestCounter;
+          pendingToolRequests.set(tabCloseId, {
+            socket: null,
+            originalId: null,
+            tool: "close_tab",
+            onComplete: (r) => resolve(r)
+          });
+          writeMessage({ type: "CHATGPT_CLOSE_TAB", tabId: tabIdToClose, id: tabCloseId });
+        }),
+        cdpEvaluate: (tabId, expression) => new Promise((resolve) => {
+          const evalId = ++requestCounter;
+          pendingToolRequests.set(evalId, {
+            socket: null,
+            originalId: null,
+            tool: "cdp_evaluate",
+            onComplete: (r) => resolve(r)
+          });
+          writeMessage({ type: "CHATGPT_EVALUATE", tabId, expression, id: evalId });
+        }),
+        cdpCommand: (tabId, method, params) => new Promise((resolve) => {
+          const cmdId = ++requestCounter;
+          pendingToolRequests.set(cmdId, {
+            socket: null,
+            originalId: null,
+            tool: "cdp_command",
+            onComplete: (r) => resolve(r)
+          });
+          writeMessage({ type: "CHATGPT_CDP_COMMAND", tabId, method, params, id: cmdId });
+        }),
+        uploadFile: (tabId, filePaths) => new Promise((resolve) => {
+          const uploadId = ++requestCounter;
+          pendingToolRequests.set(uploadId, {
+            socket: null,
+            originalId: null,
+            tool: "upload_file",
+            onComplete: (r) => resolve(r)
+          });
+          writeMessage(buildProviderUploadMessage("chatgpt", tabId, filePaths, uploadId));
+        }),
+        log: (msg) => log(`[chatgpt] ${msg}`)
       });
-
+      
       return result;
-    })
-      .then((result) => {
-        sendToolResponse(
-          socket,
-          originalId,
-          {
-            response: result.response,
-            model: result.model,
-            tookMs: result.tookMs,
-          },
-          null,
-        );
-      })
-      .catch((err) => {
-        sendToolResponse(socket, originalId, null, err.message);
-      });
-
+    }).then((result) => {
+      sendToolResponse(socket, originalId, {
+        response: result.response,
+        model: result.model,
+        tookMs: result.tookMs
+      }, null);
+    }).catch((err) => {
+      sendToolResponse(socket, originalId, null, err.message);
+    });
+    
     return;
   }
-
+  
   if (extensionMsg.type === "PERPLEXITY_QUERY") {
-    const { query, mode, model, withPage, timeout, focus, space: spaceId } = extensionMsg;
-
+    const { query, mode, model, withPage, timeout } = extensionMsg;
+    
     queueAiRequest(async () => {
       let pageContext = null;
       if (withPage) {
@@ -668,352 +572,91 @@ function handleToolRequest(msg, socket) {
             socket: null,
             originalId: null,
             tool: "read_page",
-            onComplete: resolve,
+            onComplete: resolve
           });
           writeMessage({ type: "GET_PAGE_TEXT", tabId: extensionMsg.tabId, id: pageId });
         });
         if (pageResult && !pageResult.error) {
           pageContext = {
             url: pageResult.url,
-            text: pageResult.text || pageResult.pageContent || "",
+            text: pageResult.text || pageResult.pageContent || ""
           };
         }
       }
-
+      
       let fullPrompt = query;
       if (pageContext) {
         fullPrompt = `Page: ${pageContext.url}\n\n${pageContext.text}\n\n---\n\n${query}`;
       }
-
-      // Default to Claude Sonnet 4.6 Thinking: most reliable for exact-format
-      // output across Pro thinking models (PONG test winner). User can override
-      // with --model <id>. See https://www.perplexity.ai/rest/models/config
-      // for the full list; the `reasoning_model` field is what you pass for
-      // Thinking mode. Max-tier models (e.g. gpt55_thinking, claude48opusthinking)
-      // require a Max subscription and are silently rejected by Perplexity for
-      // Pro users — prefer *_thinking ids marked as `tier: pro`.
-      const PERPLEXITY_DEFAULT_MODEL = "claude46sonnetthinking";
-
+      
       const result = await perplexityClient.query({
         prompt: fullPrompt,
-        mode: mode || "search",
-        model: model || PERPLEXITY_DEFAULT_MODEL,
-        focus,
-        spaceId,
-        timeout: timeout || 120000,
-        createTab: (url) =>
-          new Promise((resolve) => {
-            const tabCreateId = ++requestCounter;
-            pendingToolRequests.set(tabCreateId, {
-              socket: null,
-              originalId: null,
-              tool: "create_tab",
-              onComplete: (r) => resolve(r),
-            });
-            // URL is built by the client (deep-link #?q=...&model=...).
-            // When the client has no URL (e.g. no prompt), falls back to home.
-            writeMessage({ type: "PERPLEXITY_NEW_TAB", url, id: tabCreateId });
-          }),
-        closeTab: (tabIdToClose) =>
-          new Promise((resolve) => {
-            const tabCloseId = ++requestCounter;
-            pendingToolRequests.set(tabCloseId, {
-              socket: null,
-              originalId: null,
-              tool: "close_tab",
-              onComplete: (r) => resolve(r),
-            });
-            writeMessage({ type: "PERPLEXITY_CLOSE_TAB", tabId: tabIdToClose, id: tabCloseId });
-          }),
-        cdpEvaluate: (tabId, expression) =>
-          new Promise((resolve) => {
-            const evalId = ++requestCounter;
-            pendingToolRequests.set(evalId, {
-              socket: null,
-              originalId: null,
-              tool: "cdp_evaluate",
-              onComplete: (r) => resolve(r),
-            });
-            writeMessage({ type: "PERPLEXITY_EVALUATE", tabId, expression, id: evalId });
-          }),
-        cdpCommand: (tabId, method, params) =>
-          new Promise((resolve) => {
-            const cmdId = ++requestCounter;
-            pendingToolRequests.set(cmdId, {
-              socket: null,
-              originalId: null,
-              tool: "cdp_command",
-              onComplete: (r) => resolve(r),
-            });
-            writeMessage({ type: "PERPLEXITY_CDP_COMMAND", tabId, method, params, id: cmdId });
-          }),
-        log: (msg) => log(`[perplexity] ${msg}`),
-      });
-
-      return result;
-    })
-      .then((result) => {
-        sendToolResponse(
-          socket,
-          originalId,
-          {
-            response: result.response,
-            url: result.url,
-            mode: result.mode,
-            model: result.model,
-            focus: result.focus,
-            spaceId: result.spaceId,
-            partial: result.partial,
-            tookMs: result.tookMs,
-          },
-          null,
-        );
-      })
-      .catch((err) => {
-        sendToolResponse(socket, originalId, null, err.message);
-      });
-
-    return;
-  }
-
-  if (extensionMsg.type === "CLAUDE_QUERY") {
-    const { query, model, withPage, timeout } = extensionMsg;
-
-    queueAiRequest(async () => {
-      let pageContext = null;
-      if (withPage) {
-        const pageResult = await new Promise((resolve) => {
-          const pageId = ++requestCounter;
-          pendingToolRequests.set(pageId, {
-            socket: null,
-            originalId: null,
-            tool: "read_page",
-            onComplete: resolve,
-          });
-          writeMessage({ type: "GET_PAGE_TEXT", tabId: extensionMsg.tabId, id: pageId });
-        });
-        if (pageResult && !pageResult.error) {
-          pageContext = {
-            url: pageResult.url,
-            text: pageResult.text || pageResult.pageContent || "",
-          };
-        }
-      }
-
-      let fullPrompt = query;
-      if (pageContext) {
-        fullPrompt = `Page: ${pageContext.url}\n\n${pageContext.text}\n\n---\n\n${query}`;
-      }
-
-      const result = await claudeClient.query({
-        prompt: fullPrompt,
+        mode: mode || 'search',
         model,
-        timeout: timeout || 300000,
-        getCookies: () =>
-          new Promise((resolve) => {
-            const cookieId = ++requestCounter;
-            pendingToolRequests.set(cookieId, {
-              socket: null,
-              originalId: null,
-              tool: "get_cookies",
-              onComplete: (r) => resolve(r),
-            });
-            writeMessage({ type: "GET_CLAUDE_COOKIES", id: cookieId });
-          }),
-        createTab: () =>
-          new Promise((resolve) => {
-            const tabCreateId = ++requestCounter;
-            pendingToolRequests.set(tabCreateId, {
-              socket: null,
-              originalId: null,
-              tool: "create_tab",
-              onComplete: (r) => resolve(r),
-            });
-            writeMessage({ type: "CLAUDE_NEW_TAB", id: tabCreateId });
-          }),
-        closeTab: (tabIdToClose) =>
-          new Promise((resolve) => {
-            const tabCloseId = ++requestCounter;
-            pendingToolRequests.set(tabCloseId, {
-              socket: null,
-              originalId: null,
-              tool: "close_tab",
-              onComplete: (r) => resolve(r),
-            });
-            writeMessage({ type: "CLAUDE_CLOSE_TAB", tabId: tabIdToClose, id: tabCloseId });
-          }),
-        cdpEvaluate: (tabId, expression) =>
-          new Promise((resolve) => {
-            const evalId = ++requestCounter;
-            pendingToolRequests.set(evalId, {
-              socket: null,
-              originalId: null,
-              tool: "cdp_evaluate",
-              onComplete: (r) => resolve(r),
-            });
-            writeMessage({ type: "CLAUDE_EVALUATE", tabId, expression, id: evalId });
-          }),
-        cdpCommand: (tabId, method, params) =>
-          new Promise((resolve) => {
-            const cmdId = ++requestCounter;
-            pendingToolRequests.set(cmdId, {
-              socket: null,
-              originalId: null,
-              tool: "cdp_command",
-              onComplete: (r) => resolve(r),
-            });
-            writeMessage({ type: "CLAUDE_CDP_COMMAND", tabId, method, params, id: cmdId });
-          }),
-        log: (msg) => log(`[claude] ${msg}`),
-      });
-
-      return result;
-    })
-      .then((result) => {
-        sendToolResponse(
-          socket,
-          originalId,
-          {
-            response: result.response,
-            model: result.model,
-            tookMs: result.tookMs,
-          },
-          null,
-        );
-      })
-      .catch((err) => {
-        sendToolResponse(socket, originalId, null, err.message);
-      });
-
-    return;
-  }
-
-  if (extensionMsg.type === "AIMODE_QUERY") {
-    const { query, withPage, auto, timeout } = extensionMsg;
-
-    queueAiRequest(async () => {
-      let pageContext = null;
-      if (withPage) {
-        const pageResult = await new Promise((resolve) => {
-          const pageId = ++requestCounter;
-          pendingToolRequests.set(pageId, {
+        timeout: timeout || 120000,
+        createTab: () => new Promise((resolve) => {
+          const tabCreateId = ++requestCounter;
+          pendingToolRequests.set(tabCreateId, {
             socket: null,
             originalId: null,
-            tool: "read_page",
-            onComplete: resolve,
+            tool: "create_tab",
+            onComplete: (r) => resolve(r)
           });
-          writeMessage({ type: "GET_PAGE_TEXT", tabId: extensionMsg.tabId, id: pageId });
-        });
-        if (pageResult && !pageResult.error) {
-          pageContext = {
-            url: pageResult.url,
-            text: pageResult.text || pageResult.pageContent || "",
-          };
-        }
-      }
-
-      let fullPrompt = query;
-      if (pageContext) {
-        fullPrompt = `Page: ${pageContext.url}\n\n${pageContext.text}\n\n---\n\n${query}`;
-      }
-
-      const result = await aimodeClient.query({
-        prompt: fullPrompt,
-        pro: !auto,
-        timeout: timeout || 120000,
-        getCookies: () =>
-          new Promise((resolve) => {
-            const cookieId = ++requestCounter;
-            pendingToolRequests.set(cookieId, {
-              socket: null,
-              originalId: null,
-              tool: "get_cookies",
-              onComplete: (r) => resolve(r),
-            });
-            writeMessage({ type: "GET_GOOGLE_COOKIES", id: cookieId });
-          }),
-        createTab: (url) =>
-          new Promise((resolve) => {
-            const tabCreateId = ++requestCounter;
-            pendingToolRequests.set(tabCreateId, {
-              socket: null,
-              originalId: null,
-              tool: "create_tab",
-              onComplete: (r) => resolve(r),
-            });
-            writeMessage({ type: "AIMODE_NEW_TAB", url: url, id: tabCreateId });
-          }),
-        closeTab: (tabIdToClose) =>
-          new Promise((resolve) => {
-            const tabCloseId = ++requestCounter;
-            pendingToolRequests.set(tabCloseId, {
-              socket: null,
-              originalId: null,
-              tool: "close_tab",
-              onComplete: (r) => resolve(r),
-            });
-            writeMessage({ type: "AIMODE_CLOSE_TAB", tabId: tabIdToClose, id: tabCloseId });
-          }),
-        cdpEvaluate: (tabId, expression) =>
-          new Promise((resolve) => {
-            const evalId = ++requestCounter;
-            pendingToolRequests.set(evalId, {
-              socket: null,
-              originalId: null,
-              tool: "cdp_evaluate",
-              onComplete: (r) => resolve(r),
-            });
-            writeMessage({ type: "AIMODE_EVALUATE", tabId, expression, id: evalId });
-          }),
-        cdpCommand: (tabId, method, params) =>
-          new Promise((resolve) => {
-            const cmdId = ++requestCounter;
-            pendingToolRequests.set(cmdId, {
-              socket: null,
-              originalId: null,
-              tool: "cdp_command",
-              onComplete: (r) => resolve(r),
-            });
-            writeMessage({ type: "AIMODE_CDP_COMMAND", tabId, method, params, id: cmdId });
-          }),
-        log: (msg) => log(`[aimode] ${msg}`),
+          writeMessage({ type: "PERPLEXITY_NEW_TAB", id: tabCreateId });
+        }),
+        closeTab: (tabIdToClose) => new Promise((resolve) => {
+          const tabCloseId = ++requestCounter;
+          pendingToolRequests.set(tabCloseId, {
+            socket: null,
+            originalId: null,
+            tool: "close_tab",
+            onComplete: (r) => resolve(r)
+          });
+          writeMessage({ type: "PERPLEXITY_CLOSE_TAB", tabId: tabIdToClose, id: tabCloseId });
+        }),
+        cdpEvaluate: (tabId, expression) => new Promise((resolve) => {
+          const evalId = ++requestCounter;
+          pendingToolRequests.set(evalId, {
+            socket: null,
+            originalId: null,
+            tool: "cdp_evaluate",
+            onComplete: (r) => resolve(r)
+          });
+          writeMessage({ type: "PERPLEXITY_EVALUATE", tabId, expression, id: evalId });
+        }),
+        cdpCommand: (tabId, method, params) => new Promise((resolve) => {
+          const cmdId = ++requestCounter;
+          pendingToolRequests.set(cmdId, {
+            socket: null,
+            originalId: null,
+            tool: "cdp_command",
+            onComplete: (r) => resolve(r)
+          });
+          writeMessage({ type: "PERPLEXITY_CDP_COMMAND", tabId, method, params, id: cmdId });
+        }),
+        log: (msg) => log(`[perplexity] ${msg}`)
       });
-
+      
       return result;
-    })
-      .then((result) => {
-        sendToolResponse(
-          socket,
-          originalId,
-          {
-            response: result.response,
-            url: result.url,
-            tookMs: result.tookMs,
-          },
-          null,
-        );
-      })
-      .catch((err) => {
-        sendToolResponse(socket, originalId, null, err.message);
-      });
-
+    }).then((result) => {
+      sendToolResponse(socket, originalId, {
+        response: result.response,
+        sources: result.sources,
+        url: result.url,
+        mode: result.mode,
+        model: result.model,
+        tookMs: result.tookMs
+      }, null);
+    }).catch((err) => {
+      sendToolResponse(socket, originalId, null, err.message);
+    });
+    
     return;
   }
-
+  
   if (extensionMsg.type === "GEMINI_QUERY") {
-    const {
-      query,
-      model,
-      withPage,
-      file,
-      generateImage,
-      editImage,
-      output,
-      youtube,
-      aspectRatio,
-      timeout,
-    } = extensionMsg;
-
+    const { query, model, withPage, file, generateImage, editImage, output, youtube, aspectRatio, timeout } = extensionMsg;
+    
     queueAiRequest(async () => {
       // 1. Get page context if requested
       let pageContext = null;
@@ -1024,24 +667,24 @@ function handleToolRequest(msg, socket) {
             socket: null,
             originalId: null,
             tool: "get_page_text",
-            onComplete: resolve,
+            onComplete: resolve
           });
           writeMessage({ type: "GET_PAGE_TEXT", tabId: extensionMsg.tabId, id: pageId });
         });
         if (pageResult && !pageResult.error) {
           pageContext = {
             url: pageResult.url,
-            text: pageResult.text || pageResult.pageContent || "",
+            text: pageResult.text || pageResult.pageContent || ""
           };
         }
       }
-
+      
       // 2. Build full prompt
       let fullPrompt = query || "";
       if (pageContext) {
         fullPrompt = `Page: ${pageContext.url}\n\n${pageContext.text}\n\n---\n\n${fullPrompt}`;
       }
-
+      
       // 3. Call Gemini client
       const result = await geminiClient.query({
         prompt: fullPrompt,
@@ -1053,106 +696,91 @@ function handleToolRequest(msg, socket) {
         youtube,
         aspectRatio,
         timeout: timeout || 300000,
-        getCookies: () =>
-          new Promise((resolve) => {
-            const cookieId = ++requestCounter;
-            pendingToolRequests.set(cookieId, {
-              socket: null,
-              originalId: null,
-              tool: "get_cookies",
-              onComplete: (r) => resolve(r),
-            });
-            writeMessage({ type: "GET_GOOGLE_COOKIES", id: cookieId });
-          }),
-        createTab: () =>
-          new Promise((resolve) => {
-            const tabCreateId = ++requestCounter;
-            pendingToolRequests.set(tabCreateId, {
-              socket: null,
-              originalId: null,
-              tool: "create_tab",
-              onComplete: (r) => resolve(r),
-            });
-            writeMessage({ type: "GEMINI_NEW_TAB", id: tabCreateId });
-          }),
-        closeTab: (tabIdToClose) =>
-          new Promise((resolve) => {
-            const tabCloseId = ++requestCounter;
-            pendingToolRequests.set(tabCloseId, {
-              socket: null,
-              originalId: null,
-              tool: "close_tab",
-              onComplete: (r) => resolve(r),
-            });
-            writeMessage({ type: "GEMINI_CLOSE_TAB", tabId: tabIdToClose, id: tabCloseId });
-          }),
-        jsEval: (tabId, code) =>
-          new Promise((resolve) => {
-            const jsId = ++requestCounter;
-            pendingToolRequests.set(jsId, {
-              socket: null,
-              originalId: null,
-              tool: "js_eval",
-              onComplete: (r) => resolve(r),
-            });
-            log(
-              `[gemini] Sending EXECUTE_JAVASCRIPT id=${jsId} tabId=${tabId} code=${code.length} chars`,
-            );
-            writeMessage({ type: "EXECUTE_JAVASCRIPT", tabId, code, id: jsId });
-          }),
-        uploadFile: (tabId, filePaths) =>
-          new Promise((resolve) => {
-            const uploadId = ++requestCounter;
-            pendingToolRequests.set(uploadId, {
-              socket: null,
-              originalId: null,
-              tool: "upload_file",
-              onComplete: (r) => resolve(r),
-            });
-            writeMessage({ type: "UPLOAD_FILE_TO_TAB", tabId, filePaths, id: uploadId });
-          }),
-        fetchUrl: (url) =>
-          new Promise((resolve) => {
-            const fetchId = ++requestCounter;
-            pendingToolRequests.set(fetchId, {
-              socket: null,
-              originalId: null,
-              tool: "fetch_url",
-              onComplete: (r) => resolve(r),
-            });
-            writeMessage({ type: "GEMINI_FETCH_URL", url, id: fetchId });
-          }),
-        log: (msg) => log(`[gemini] ${msg}`),
+        getCookies: () => new Promise((resolve) => {
+          const cookieId = ++requestCounter;
+          pendingToolRequests.set(cookieId, {
+            socket: null,
+            originalId: null,
+            tool: "get_cookies",
+            onComplete: (r) => resolve(r)
+          });
+          writeMessage({ type: "GET_GOOGLE_COOKIES", id: cookieId });
+        }),
+        createTab: () => new Promise((resolve) => {
+          const tabCreateId = ++requestCounter;
+          pendingToolRequests.set(tabCreateId, {
+            socket: null,
+            originalId: null,
+            tool: "create_tab",
+            onComplete: (r) => resolve(r)
+          });
+          writeMessage({ type: "GEMINI_NEW_TAB", id: tabCreateId });
+        }),
+        closeTab: (tabIdToClose) => new Promise((resolve) => {
+          const tabCloseId = ++requestCounter;
+          pendingToolRequests.set(tabCloseId, {
+            socket: null,
+            originalId: null,
+            tool: "close_tab",
+            onComplete: (r) => resolve(r)
+          });
+          writeMessage({ type: "GEMINI_CLOSE_TAB", tabId: tabIdToClose, id: tabCloseId });
+        }),
+        jsEval: (tabId, code) => new Promise((resolve) => {
+          const jsId = ++requestCounter;
+          pendingToolRequests.set(jsId, {
+            socket: null,
+            originalId: null,
+            tool: "js_eval",
+            onComplete: (r) => resolve(r)
+          });
+          log(`[gemini] Sending EXECUTE_JAVASCRIPT id=${jsId} tabId=${tabId} code=${code.length} chars`);
+          writeMessage({ type: "EXECUTE_JAVASCRIPT", tabId, code, id: jsId });
+        }),
+        uploadFile: (tabId, filePaths) => new Promise((resolve) => {
+          const uploadId = ++requestCounter;
+          pendingToolRequests.set(uploadId, {
+            socket: null,
+            originalId: null,
+            tool: "upload_file",
+            onComplete: (r) => resolve(r)
+          });
+          writeMessage(buildProviderUploadMessage("gemini", tabId, filePaths, uploadId));
+        }),
+        fetchUrl: (url) => new Promise((resolve) => {
+          const fetchId = ++requestCounter;
+          pendingToolRequests.set(fetchId, {
+            socket: null,
+            originalId: null,
+            tool: "fetch_url",
+            onComplete: (r) => resolve(r)
+          });
+          writeMessage({ type: "GEMINI_FETCH_URL", url, id: fetchId });
+        }),
+        log: (msg) => log(`[gemini] ${msg}`)
       });
-
+      
       return result;
-    })
-      .then((result) => {
-        // gemini-client returns { text, thoughts, metadata, images, ... }
-        // but CLI expects `response` field. Normalize.
-        const response = {
-          response: result.response ?? result.text ?? result.output ?? "",
-          model: result.model ?? result.effectiveModel,
-          tookMs: result.tookMs,
-        };
-        if (result.imagePath) {
-          response.imagePath = result.imagePath;
-        }
-        if (result.images?.length) {
-          response.imagePath = result.images[0].url || result.images[0].path;
-        }
-        sendToolResponse(socket, originalId, response, null);
-      })
-      .catch((err) => {
-        sendToolResponse(socket, originalId, null, err.message);
-      });
-
+    }).then((result) => {
+      const response = { 
+        response: result.response, 
+        model: result.model, 
+        tookMs: result.tookMs 
+      };
+      if (result.imagePath) {
+        response.imagePath = result.imagePath;
+      }
+      sendToolResponse(socket, originalId, response, null);
+    }).catch((err) => {
+      sendToolResponse(socket, originalId, null, err.message);
+    });
+    
     return;
   }
-
+  
   if (extensionMsg.type === "GROK_QUERY") {
     const { query, model, deepSearch, withPage, timeout } = extensionMsg;
-
+    
     queueAiRequest(async () => {
       // 1. Get page context if requested
       let pageContext = null;
@@ -1163,242 +791,226 @@ function handleToolRequest(msg, socket) {
             socket: null,
             originalId: null,
             tool: "get_page_text",
-            onComplete: resolve,
+            onComplete: resolve
           });
           writeMessage({ type: "GET_PAGE_TEXT", tabId: extensionMsg.tabId, id: pageId });
         });
         if (pageResult && !pageResult.error) {
           pageContext = {
             url: pageResult.url,
-            text: pageResult.text || pageResult.pageContent || "",
+            text: pageResult.text || pageResult.pageContent || ""
           };
         }
       }
-
+      
       // 2. Build full prompt
       let fullPrompt = query || "";
       if (pageContext) {
         fullPrompt = `Page: ${pageContext.url}\n\n${pageContext.text}\n\n---\n\n${fullPrompt}`;
       }
-
+      
       // 3. Call Grok client
       const result = await grokClient.query({
         prompt: fullPrompt,
         model: model,
         deepSearch: deepSearch || false,
         timeout: timeout || 300000,
-        getCookies: () =>
-          new Promise((resolve) => {
-            const cookieId = ++requestCounter;
-            pendingToolRequests.set(cookieId, {
-              socket: null,
-              originalId: null,
-              tool: "get_cookies",
-              onComplete: (r) => resolve(r),
-            });
-            writeMessage({ type: "GET_TWITTER_COOKIES", id: cookieId });
-          }),
-        createTab: () =>
-          new Promise((resolve) => {
-            const tabCreateId = ++requestCounter;
-            pendingToolRequests.set(tabCreateId, {
-              socket: null,
-              originalId: null,
-              tool: "create_tab",
-              onComplete: (r) => resolve(r),
-            });
-            writeMessage({ type: "GROK_NEW_TAB", id: tabCreateId });
-          }),
-        closeTab: (tabIdToClose) =>
-          new Promise((resolve) => {
-            const tabCloseId = ++requestCounter;
-            pendingToolRequests.set(tabCloseId, {
-              socket: null,
-              originalId: null,
-              tool: "close_tab",
-              onComplete: (r) => resolve(r),
-            });
-            writeMessage({ type: "GROK_CLOSE_TAB", tabId: tabIdToClose, id: tabCloseId });
-          }),
-        cdpEvaluate: (tabId, expression) =>
-          new Promise((resolve) => {
-            const evalId = ++requestCounter;
-            pendingToolRequests.set(evalId, {
-              socket: null,
-              originalId: null,
-              tool: "cdp_evaluate",
-              onComplete: (r) => resolve(r),
-            });
-            writeMessage({ type: "GROK_EVALUATE", tabId, expression, id: evalId });
-          }),
-        cdpCommand: (tabId, method, params) =>
-          new Promise((resolve) => {
-            const cmdId = ++requestCounter;
-            pendingToolRequests.set(cmdId, {
-              socket: null,
-              originalId: null,
-              tool: "cdp_command",
-              onComplete: (r) => resolve(r),
-            });
-            writeMessage({ type: "GROK_CDP_COMMAND", tabId, method, params, id: cmdId });
-          }),
-        log: (msg) => log(`[grok] ${msg}`),
+        getCookies: () => new Promise((resolve) => {
+          const cookieId = ++requestCounter;
+          pendingToolRequests.set(cookieId, {
+            socket: null,
+            originalId: null,
+            tool: "get_cookies",
+            onComplete: (r) => resolve(r)
+          });
+          writeMessage({ type: "GET_TWITTER_COOKIES", id: cookieId });
+        }),
+        createTab: () => new Promise((resolve) => {
+          const tabCreateId = ++requestCounter;
+          pendingToolRequests.set(tabCreateId, {
+            socket: null,
+            originalId: null,
+            tool: "create_tab",
+            onComplete: (r) => resolve(r)
+          });
+          writeMessage({ type: "GROK_NEW_TAB", id: tabCreateId });
+        }),
+        closeTab: (tabIdToClose) => new Promise((resolve) => {
+          const tabCloseId = ++requestCounter;
+          pendingToolRequests.set(tabCloseId, {
+            socket: null,
+            originalId: null,
+            tool: "close_tab",
+            onComplete: (r) => resolve(r)
+          });
+          writeMessage({ type: "GROK_CLOSE_TAB", tabId: tabIdToClose, id: tabCloseId });
+        }),
+        cdpEvaluate: (tabId, expression) => new Promise((resolve) => {
+          const evalId = ++requestCounter;
+          pendingToolRequests.set(evalId, {
+            socket: null,
+            originalId: null,
+            tool: "cdp_evaluate",
+            onComplete: (r) => resolve(r)
+          });
+          writeMessage({ type: "GROK_EVALUATE", tabId, expression, id: evalId });
+        }),
+        cdpCommand: (tabId, method, params) => new Promise((resolve) => {
+          const cmdId = ++requestCounter;
+          pendingToolRequests.set(cmdId, {
+            socket: null,
+            originalId: null,
+            tool: "cdp_command",
+            onComplete: (r) => resolve(r)
+          });
+          writeMessage({ type: "GROK_CDP_COMMAND", tabId, method, params, id: cmdId });
+        }),
+        log: (msg) => log(`[grok] ${msg}`)
       });
-
+      
       return result;
-    })
-      .then((result) => {
-        const response = {
-          response: result.response,
-          model: result.model,
-          tookMs: result.tookMs,
-        };
-        if (result.thinkingTime) {
-          response.thinkingTime = result.thinkingTime;
-        }
-        if (result.deepSearch) {
-          response.deepSearch = result.deepSearch;
-        }
-        if (result.partial) {
-          response.partial = true;
-        }
-        if (result.warnings && result.warnings.length > 0) {
-          response.warnings = result.warnings;
-        }
-        if (result.modelSelectionFailed) {
-          response.modelSelectionFailed = true;
-        }
-        sendToolResponse(socket, originalId, response, null);
-      })
-      .catch((err) => {
-        sendToolResponse(socket, originalId, null, err.message);
-      });
-
+    }).then((result) => {
+      const response = { 
+        response: result.response, 
+        model: result.model, 
+        tookMs: result.tookMs 
+      };
+      if (result.thinkingTime) {
+        response.thinkingTime = result.thinkingTime;
+      }
+      if (result.deepSearch) {
+        response.deepSearch = result.deepSearch;
+      }
+      if (result.partial) {
+        response.partial = true;
+      }
+      if (result.warnings && result.warnings.length > 0) {
+        response.warnings = result.warnings;
+      }
+      if (result.modelSelectionFailed) {
+        response.modelSelectionFailed = true;
+      }
+      sendToolResponse(socket, originalId, response, null);
+    }).catch((err) => {
+      sendToolResponse(socket, originalId, null, err.message);
+    });
+    
     return;
   }
-
+  
   if (extensionMsg.type === "GROK_VALIDATE") {
     const { saveModels } = extensionMsg;
-
+    
     queueAiRequest(async () => {
       const result = await grokClient.validate({
-        getCookies: () =>
-          new Promise((resolve) => {
-            const cookieId = ++requestCounter;
-            pendingToolRequests.set(cookieId, {
-              socket: null,
-              originalId: null,
-              tool: "get_cookies",
-              onComplete: (r) => resolve(r),
-            });
-            writeMessage({ type: "GET_TWITTER_COOKIES", id: cookieId });
-          }),
-        createTab: () =>
-          new Promise((resolve) => {
-            const tabCreateId = ++requestCounter;
-            pendingToolRequests.set(tabCreateId, {
-              socket: null,
-              originalId: null,
-              tool: "create_tab",
-              onComplete: (r) => resolve(r),
-            });
-            writeMessage({ type: "GROK_NEW_TAB", id: tabCreateId });
-          }),
-        closeTab: (tabIdToClose) =>
-          new Promise((resolve) => {
-            const tabCloseId = ++requestCounter;
-            pendingToolRequests.set(tabCloseId, {
-              socket: null,
-              originalId: null,
-              tool: "close_tab",
-              onComplete: (r) => resolve(r),
-            });
-            writeMessage({ type: "GROK_CLOSE_TAB", tabId: tabIdToClose, id: tabCloseId });
-          }),
-        cdpEvaluate: (tabId, expression) =>
-          new Promise((resolve) => {
-            const evalId = ++requestCounter;
-            pendingToolRequests.set(evalId, {
-              socket: null,
-              originalId: null,
-              tool: "cdp_evaluate",
-              onComplete: (r) => resolve(r),
-            });
-            writeMessage({ type: "GROK_EVALUATE", tabId, expression, id: evalId });
-          }),
-        log: (msg) => log(`[grok:validate] ${msg}`),
-      });
-
-      return result;
-    })
-      .then((result) => {
-        // If --save-models flag was passed and we found models, save them
-        if (saveModels && result.models && result.models.length > 0) {
-          // Convert scraped model names to our format
-          const modelMap = {};
-          result.models.forEach((name) => {
-            const nameLower = name.toLowerCase();
-            // Match known model keywords to generate consistent short IDs
-            let shortId;
-            if (nameLower.includes("thinking")) {
-              shortId = "thinking";
-            } else if (nameLower.includes("expert")) {
-              shortId = "expert";
-            } else if (nameLower.includes("fast")) {
-              shortId = "fast";
-            } else if (nameLower.includes("auto")) {
-              shortId = "auto";
-            } else {
-              shortId = nameLower.replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
-            }
-
-            modelMap[shortId] = { id: shortId, name: name, desc: "" };
+        getCookies: () => new Promise((resolve) => {
+          const cookieId = ++requestCounter;
+          pendingToolRequests.set(cookieId, {
+            socket: null,
+            originalId: null,
+            tool: "get_cookies",
+            onComplete: (r) => resolve(r)
           });
-          const saveResult = grokClient.saveModels(modelMap);
-          result.savedModels = saveResult;
-        }
-        sendToolResponse(socket, originalId, result, null);
-      })
-      .catch((err) => {
-        sendToolResponse(socket, originalId, null, err.message);
+          writeMessage({ type: "GET_TWITTER_COOKIES", id: cookieId });
+        }),
+        createTab: () => new Promise((resolve) => {
+          const tabCreateId = ++requestCounter;
+          pendingToolRequests.set(tabCreateId, {
+            socket: null,
+            originalId: null,
+            tool: "create_tab",
+            onComplete: (r) => resolve(r)
+          });
+          writeMessage({ type: "GROK_NEW_TAB", id: tabCreateId });
+        }),
+        closeTab: (tabIdToClose) => new Promise((resolve) => {
+          const tabCloseId = ++requestCounter;
+          pendingToolRequests.set(tabCloseId, {
+            socket: null,
+            originalId: null,
+            tool: "close_tab",
+            onComplete: (r) => resolve(r)
+          });
+          writeMessage({ type: "GROK_CLOSE_TAB", tabId: tabIdToClose, id: tabCloseId });
+        }),
+        cdpEvaluate: (tabId, expression) => new Promise((resolve) => {
+          const evalId = ++requestCounter;
+          pendingToolRequests.set(evalId, {
+            socket: null,
+            originalId: null,
+            tool: "cdp_evaluate",
+            onComplete: (r) => resolve(r)
+          });
+          writeMessage({ type: "GROK_EVALUATE", tabId, expression, id: evalId });
+        }),
+        log: (msg) => log(`[grok:validate] ${msg}`)
       });
-
+      
+      return result;
+    }).then((result) => {
+      // If --save-models flag was passed and we found models, save them
+      if (saveModels && result.models && result.models.length > 0) {
+        // Convert scraped model names to selectable IDs.
+        const modelMap = {};
+        const defaultModels = Object.values(grokClient.DEFAULT_GROK_MODELS || {});
+        result.models.forEach(name => {
+          const nameLower = name.toLowerCase();
+          const normalizedName = grokClient.normalizeGrokModelLabel(name);
+          const knownModel = defaultModels.find(model => {
+            const normalizedDefaultName = grokClient.normalizeGrokModelLabel(model.name);
+            return normalizedName.includes(normalizedDefaultName) || normalizedDefaultName.includes(normalizedName);
+          });
+          // Match known model keywords to generate consistent short IDs
+          let shortId;
+          if (knownModel) shortId = knownModel.id;
+          else if (nameLower.includes('expert')) shortId = 'expert';
+          else if (nameLower.includes('fast')) shortId = 'fast';
+          else if (nameLower.includes('auto')) shortId = 'auto';
+          else shortId = nameLower.replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+          
+          modelMap[shortId] = { id: shortId, name: name, desc: knownModel?.desc || "" };
+        });
+        const saveResult = grokClient.saveModels(modelMap);
+        result.savedModels = saveResult;
+      }
+      sendToolResponse(socket, originalId, result, null);
+    }).catch((err) => {
+      sendToolResponse(socket, originalId, null, err.message);
+    });
+    
     return;
   }
 
   if (extensionMsg.type === "AISTUDIO_QUERY") {
     const { query, model, withPage, timeout } = extensionMsg;
-
+    
     queueAiRequest(async () => {
       const EXT_CALL_TIMEOUT_MS = 30000;
 
-      const callExtension = (toolName, msg, timeoutMs = EXT_CALL_TIMEOUT_MS) =>
-        new Promise((resolve, reject) => {
-          const id = ++requestCounter;
+      const callExtension = (toolName, msg, timeoutMs = EXT_CALL_TIMEOUT_MS) => new Promise((resolve, reject) => {
+        const id = ++requestCounter;
 
-          if (msg && msg.type === "AISTUDIO_NEW_TAB") {
-            log(
-              `[aistudio] Opening tab: ${msg.url || "https://aistudio.google.com/prompts/new_chat"}`,
-            );
+        if (msg && msg.type === "AISTUDIO_NEW_TAB") {
+          log(`[aistudio] Opening tab: ${(msg.url || "https://aistudio.google.com/prompts/new_chat")}`);
+        }
+
+        const timeoutId = setTimeout(() => {
+          pendingToolRequests.delete(id);
+          reject(new Error(`Timeout waiting for extension: ${toolName}`));
+        }, timeoutMs);
+
+        pendingToolRequests.set(id, {
+          socket: null,
+          originalId: null,
+          tool: toolName,
+          onComplete: (r) => {
+            clearTimeout(timeoutId);
+            resolve(r);
           }
-
-          const timeoutId = setTimeout(() => {
-            pendingToolRequests.delete(id);
-            reject(new Error(`Timeout waiting for extension: ${toolName}`));
-          }, timeoutMs);
-
-          pendingToolRequests.set(id, {
-            socket: null,
-            originalId: null,
-            tool: toolName,
-            onComplete: (r) => {
-              clearTimeout(timeoutId);
-              resolve(r);
-            },
-          });
-
-          writeMessage({ ...msg, id });
         });
+
+        writeMessage({ ...msg, id });
+      });
 
       // 1. Get page context if requested
       let pageContext = null;
@@ -1406,13 +1018,13 @@ function handleToolRequest(msg, socket) {
         const pageResult = await callExtension(
           "get_page_text",
           { type: "GET_PAGE_TEXT", tabId: extensionMsg.tabId },
-          45000,
+          45000
         );
 
         if (pageResult && !pageResult.error) {
           pageContext = {
             url: pageResult.url,
-            text: pageResult.text || pageResult.pageContent || "",
+            text: pageResult.text || pageResult.pageContent || ""
           };
         }
       }
@@ -1422,10 +1034,9 @@ function handleToolRequest(msg, socket) {
       if (pageContext) {
         const MAX_PAGE_CONTEXT_CHARS = 20000;
         const pageText = String(pageContext.text || "");
-        const truncated =
-          pageText.length > MAX_PAGE_CONTEXT_CHARS
-            ? `${pageText.slice(0, MAX_PAGE_CONTEXT_CHARS)}\n\n[...truncated...]`
-            : pageText;
+        const truncated = pageText.length > MAX_PAGE_CONTEXT_CHARS
+          ? pageText.slice(0, MAX_PAGE_CONTEXT_CHARS) + "\n\n[...truncated...]"
+          : pageText;
 
         fullPrompt = `Page: ${pageContext.url}\n\n${truncated}\n\n---\n\n${fullPrompt}`;
       }
@@ -1436,44 +1047,52 @@ function handleToolRequest(msg, socket) {
         model: model || undefined,
         timeout: timeout || 300000,
         getCookies: () => callExtension("get_cookies", { type: "GET_GOOGLE_COOKIES" }, 45000),
-        createTab: (url) => callExtension("create_tab", { type: "AISTUDIO_NEW_TAB", url }, 45000),
-        closeTab: (tabIdToClose) =>
-          callExtension("close_tab", { type: "AISTUDIO_CLOSE_TAB", tabId: tabIdToClose }, 45000),
-        cdpEvaluate: (tabId, expression) =>
-          callExtension("cdp_evaluate", { type: "AISTUDIO_EVALUATE", tabId, expression }),
-        cdpCommand: (tabId, method, params) =>
-          callExtension("cdp_command", { type: "AISTUDIO_CDP_COMMAND", tabId, method, params }),
-        readNetworkEntries: (tabIdToRead) =>
-          callExtension(
-            "read_network_entries",
-            {
-              type: "READ_NETWORK_REQUESTS",
-              tabId: tabIdToRead,
-              full: true,
-              limit: 100,
-              urlPattern: "MakerSuiteService/GenerateContent",
-            },
-            45000,
-          ),
-        log: (msg) => log(`[aistudio] ${msg}`),
+        createTab: (url) => callExtension(
+          "create_tab",
+          { type: "AISTUDIO_NEW_TAB", url },
+          45000
+        ),
+        closeTab: (tabIdToClose) => callExtension(
+          "close_tab",
+          { type: "AISTUDIO_CLOSE_TAB", tabId: tabIdToClose },
+          45000
+        ),
+        cdpEvaluate: (tabId, expression) => callExtension(
+          "cdp_evaluate",
+          { type: "AISTUDIO_EVALUATE", tabId, expression }
+        ),
+        cdpCommand: (tabId, method, params) => callExtension(
+          "cdp_command",
+          { type: "AISTUDIO_CDP_COMMAND", tabId, method, params }
+        ),
+        readNetworkEntries: (tabIdToRead) => callExtension(
+          "read_network_entries",
+          {
+            type: "READ_NETWORK_REQUESTS",
+            tabId: tabIdToRead,
+            full: true,
+            limit: 100,
+            urlPattern: "MakerSuiteService/GenerateContent"
+          },
+          45000
+        ),
+        log: (msg) => log(`[aistudio] ${msg}`)
       });
 
       return result;
-    })
-      .then((result) => {
-        const payload = {
-          response: result.response,
-          model: result.model,
-          thinkingTime: result.thinkingTime,
-          tookMs: result.tookMs,
-        };
+    }).then((result) => {
+      const payload = {
+        response: result.response,
+        model: result.model,
+        thinkingTime: result.thinkingTime,
+        tookMs: result.tookMs
+      };
 
-        sendToolResponse(socket, originalId, { output: JSON.stringify(payload) }, null);
-      })
-      .catch((err) => {
-        sendToolResponse(socket, originalId, null, err.message);
-      });
-
+      sendToolResponse(socket, originalId, { output: JSON.stringify(payload) }, null);
+    }).catch((err) => {
+      sendToolResponse(socket, originalId, null, err.message);
+    });
+    
     return;
   }
 
@@ -1483,31 +1102,30 @@ function handleToolRequest(msg, socket) {
     queueAiRequest(async () => {
       const EXT_CALL_TIMEOUT_MS = 30000;
 
-      const callExtension = (toolName, msg, timeoutMs = EXT_CALL_TIMEOUT_MS) =>
-        new Promise((resolve, reject) => {
-          const id = ++requestCounter;
+      const callExtension = (toolName, msg, timeoutMs = EXT_CALL_TIMEOUT_MS) => new Promise((resolve, reject) => {
+        const id = ++requestCounter;
 
-          if (msg && msg.type === "AISTUDIO_NEW_TAB") {
-            log(`[aistudio] Opening tab: ${msg.url || "https://aistudio.google.com/apps"}`);
+        if (msg && msg.type === "AISTUDIO_NEW_TAB") {
+          log(`[aistudio] Opening tab: ${(msg.url || "https://aistudio.google.com/apps")}`);
+        }
+
+        const timeoutId = setTimeout(() => {
+          pendingToolRequests.delete(id);
+          reject(new Error(`Timeout waiting for extension: ${toolName}`));
+        }, timeoutMs);
+
+        pendingToolRequests.set(id, {
+          socket: null,
+          originalId: null,
+          tool: toolName,
+          onComplete: (r) => {
+            clearTimeout(timeoutId);
+            resolve(r);
           }
-
-          const timeoutId = setTimeout(() => {
-            pendingToolRequests.delete(id);
-            reject(new Error(`Timeout waiting for extension: ${toolName}`));
-          }, timeoutMs);
-
-          pendingToolRequests.set(id, {
-            socket: null,
-            originalId: null,
-            tool: toolName,
-            onComplete: (r) => {
-              clearTimeout(timeoutId);
-              resolve(r);
-            },
-          });
-
-          writeMessage({ ...msg, id });
         });
+
+        writeMessage({ ...msg, id });
+      });
 
       const result = await aistudioBuild.build({
         prompt: query,
@@ -1516,41 +1134,50 @@ function handleToolRequest(msg, socket) {
         keepOpen,
         timeout: timeout || 600000,
         getCookies: () => callExtension("get_cookies", { type: "GET_GOOGLE_COOKIES" }, 45000),
-        createTab: (url) => callExtension("create_tab", { type: "AISTUDIO_NEW_TAB", url }, 45000),
-        closeTab: (tabIdToClose) =>
-          callExtension("close_tab", { type: "AISTUDIO_CLOSE_TAB", tabId: tabIdToClose }, 45000),
-        cdpEvaluate: (tabId, expression) =>
-          callExtension("cdp_evaluate", { type: "AISTUDIO_EVALUATE", tabId, expression }),
-        cdpCommand: (tabId, method, params) =>
-          callExtension("cdp_command", { type: "AISTUDIO_CDP_COMMAND", tabId, method, params }),
+        createTab: (url) => callExtension(
+          "create_tab",
+          { type: "AISTUDIO_NEW_TAB", url },
+          45000
+        ),
+        closeTab: (tabIdToClose) => callExtension(
+          "close_tab",
+          { type: "AISTUDIO_CLOSE_TAB", tabId: tabIdToClose },
+          45000
+        ),
+        cdpEvaluate: (tabId, expression) => callExtension(
+          "cdp_evaluate",
+          { type: "AISTUDIO_EVALUATE", tabId, expression }
+        ),
+        cdpCommand: (tabId, method, params) => callExtension(
+          "cdp_command",
+          { type: "AISTUDIO_CDP_COMMAND", tabId, method, params }
+        ),
         searchDownloads: async (params) => {
           const result = await callExtension(
             "downloads_search",
             { type: "DOWNLOADS_SEARCH", searchParams: params },
-            10000,
+            10000
           );
           return result?.downloads || [];
         },
-        log: (msg) => log(`[aistudio:build] ${msg}`),
+        log: (msg) => log(`[aistudio:build] ${msg}`)
       });
 
       return result;
-    })
-      .then((result) => {
-        sendToolResponse(socket, originalId, { output: JSON.stringify(result) }, null);
-      })
-      .catch((err) => {
-        sendToolResponse(socket, originalId, null, err.message);
-      });
+    }).then((result) => {
+      sendToolResponse(socket, originalId, { output: JSON.stringify(result) }, null);
+    }).catch((err) => {
+      sendToolResponse(socket, originalId, null, err.message);
+    });
 
     return;
   }
-
+  
   if (extensionMsg.type === "EXECUTE_KEY_REPEAT") {
     const { key, repeat, tabId: tid } = extensionMsg;
     let completed = 0;
     let lastError = null;
-
+    
     const sendNextKey = () => {
       if (completed >= repeat) {
         if (lastError) {
@@ -1561,24 +1188,22 @@ function handleToolRequest(msg, socket) {
         return;
       }
       const id = ++requestCounter;
-      pendingToolRequests.set(id, {
+      pendingToolRequests.set(id, { 
         socket: null,
         originalId: null,
         tool,
         onComplete: (result) => {
-          if (result.error) {
-            lastError = result.error;
-          }
+          if (result.error) lastError = result.error;
           completed++;
           setTimeout(sendNextKey, 50);
-        },
+        }
       });
       writeMessage({ type: "EXECUTE_KEY", key, tabId: tid, id });
     };
     sendNextKey();
     return;
   }
-
+  
   if (extensionMsg.type === "NAMED_TAB_SWITCH" || extensionMsg.type === "NAMED_TAB_CLOSE") {
     const { name, type: opType } = extensionMsg;
     const lookupId = ++requestCounter;
@@ -1588,42 +1213,35 @@ function handleToolRequest(msg, socket) {
       tool: "tabs_get_by_name",
       onComplete: (result) => {
         if (result.error || !result.tabId) {
-          sendToolResponse(
-            socket,
-            originalId,
-            null,
-            result.error || `No tab found with name "${name}"`,
-          );
+          sendToolResponse(socket, originalId, null, result.error || `No tab found with name "${name}"`);
           return;
         }
         const actionId = ++requestCounter;
         const actionType = opType === "NAMED_TAB_SWITCH" ? "SWITCH_TAB" : "CLOSE_TAB";
         pendingToolRequests.set(actionId, { socket, originalId, tool, tabId: result.tabId });
         writeMessage({ type: actionType, tabId: result.tabId, id: actionId });
-      },
+      }
     });
     writeMessage({ type: "TABS_GET_BY_NAME", name, id: lookupId });
     return;
   }
-
+  
   const id = ++requestCounter;
-  const pendingData = {
-    socket,
-    originalId,
-    tool,
+  const pendingData = { 
+    socket, 
+    originalId, 
+    tool, 
     savePath: extensionMsg.savePath || args?.savePath,
     autoScreenshot: args?.autoScreenshot,
     fullRes: extensionMsg.fullRes || args?.fullRes,
     maxSize: extensionMsg.maxSize || args?.maxSize,
-    tabId: extensionMsg.tabId || tabId,
+    tabId: extensionMsg.tabId || tabId
   };
   pendingToolRequests.set(id, pendingData);
-
+  
   // Include windowId for tab resolution scoping
   const finalMsg = { ...extensionMsg, id };
-  if (windowId) {
-    finalMsg.windowId = windowId;
-  }
+  if (windowId) finalMsg.windowId = windowId;
   writeMessage(finalMsg);
 }
 
@@ -1631,57 +1249,42 @@ function executeBatch(actions, tabId, socket, originalId) {
   const results = [];
   const DELAY_MS = 100;
   let currentIndex = 0;
-
+  
   function executeNextAction() {
     if (currentIndex >= actions.length) {
-      sendToolResponse(
-        socket,
-        originalId,
-        {
-          success: true,
-          completedActions: actions.length,
-          totalActions: actions.length,
-          results,
-        },
-        null,
-      );
+      sendToolResponse(socket, originalId, {
+        success: true,
+        completedActions: actions.length,
+        totalActions: actions.length,
+        results,
+      }, null);
       return;
     }
-
+    
     const action = actions[currentIndex];
     const toolName = mapBatchActionToTool(action);
     const toolArgs = mapBatchActionToArgs(action);
-
+    
     const extensionMsg = mapToolToMessage(toolName, toolArgs, tabId);
     if (!extensionMsg || extensionMsg.type === "UNSUPPORTED_ACTION") {
-      results.push({
-        index: currentIndex,
-        type: action.type,
+      results.push({ index: currentIndex, type: action.type, success: false, error: "Unsupported action" });
+      sendToolResponse(socket, originalId, {
         success: false,
-        error: "Unsupported action",
-      });
-      sendToolResponse(
-        socket,
-        originalId,
-        {
-          success: false,
-          completedActions: currentIndex,
-          totalActions: actions.length,
-          results,
-          error: `Action ${currentIndex} failed: Unsupported action type "${action.type}"`,
-        },
-        null,
-      );
+        completedActions: currentIndex,
+        totalActions: actions.length,
+        results,
+        error: `Action ${currentIndex} failed: Unsupported action type "${action.type}"`,
+      }, null);
       return;
     }
-
+    
     if (extensionMsg.type === "LOCAL_WAIT") {
       results.push({ index: currentIndex, type: action.type, success: true });
       currentIndex++;
       setTimeout(executeNextAction, extensionMsg.seconds * 1000);
       return;
     }
-
+    
     const id = ++requestCounter;
     pendingToolRequests.set(id, {
       socket: null,
@@ -1689,37 +1292,27 @@ function executeBatch(actions, tabId, socket, originalId) {
       tool: toolName,
       onComplete: (result) => {
         if (result.error) {
-          results.push({
-            index: currentIndex,
-            type: action.type,
+          results.push({ index: currentIndex, type: action.type, success: false, error: result.error });
+          sendToolResponse(socket, originalId, {
             success: false,
-            error: result.error,
-          });
-          sendToolResponse(
-            socket,
-            originalId,
-            {
-              success: false,
-              completedActions: currentIndex,
-              totalActions: actions.length,
-              results,
-              error: `Action ${currentIndex} failed: ${result.error}`,
-            },
-            null,
-          );
+            completedActions: currentIndex,
+            totalActions: actions.length,
+            results,
+            error: `Action ${currentIndex} failed: ${result.error}`,
+          }, null);
           return;
         }
-
+        
         results.push({ index: currentIndex, type: action.type, success: true });
         currentIndex++;
-
+        
         setTimeout(executeNextAction, DELAY_MS);
-      },
+      }
     });
-
+    
     writeMessage({ ...extensionMsg, id });
   }
-
+  
   executeNextAction();
 }
 
@@ -1771,17 +1364,15 @@ let inputBuffer = Buffer.alloc(0);
 function processInput() {
   while (inputBuffer.length >= 4) {
     const msgLen = inputBuffer.readUInt32LE(0);
-    if (inputBuffer.length < 4 + msgLen) {
-      break;
-    }
-
+    if (inputBuffer.length < 4 + msgLen) break;
+    
     const jsonStr = inputBuffer.slice(4, 4 + msgLen).toString("utf8");
     inputBuffer = inputBuffer.slice(4 + msgLen);
-
+    
     try {
       const msg = JSON.parse(jsonStr);
       log(`Received from extension: ${JSON.stringify(msg)}`);
-
+      
       if (msg.type === "GET_AUTH") {
         log("Handling GET_AUTH from extension");
         try {
@@ -1789,33 +1380,33 @@ function processInput() {
             const authData = JSON.parse(fs.readFileSync(AUTH_FILE, "utf8"));
             writeMessage({ id: msg.id, auth: authData, hint: null });
           } else {
-            writeMessage({
-              id: msg.id,
-              auth: null,
-              hint: "No OAuth credentials found. Run 'pi --login anthropic' in terminal to authenticate with Claude Max.",
+            writeMessage({ 
+              id: msg.id, 
+              auth: null, 
+              hint: "No OAuth credentials found. Run 'pi --login anthropic' in terminal to authenticate with Claude Max."
             });
           }
         } catch (e) {
           log(`Error reading auth file: ${e.message}`);
-          writeMessage({
-            id: msg.id,
-            auth: null,
-            hint: "Failed to read auth credentials. Run 'pi --login anthropic' in terminal to authenticate.",
+          writeMessage({ 
+            id: msg.id, 
+            auth: null, 
+            hint: "Failed to read auth credentials. Run 'pi --login anthropic' in terminal to authenticate."
           });
         }
         return;
       }
-
+      
       if (msg.type === "API_REQUEST") {
         handleApiRequest(msg, writeMessage);
         return;
       }
-
+      
       if (msg.type === "STREAM_EVENT") {
         const stream = activeStreams.get(msg.streamId);
         if (stream) {
           try {
-            stream.socket.write(`${JSON.stringify(msg.event)}\n`);
+            stream.socket.write(JSON.stringify(msg.event) + "\n");
           } catch (e) {
             log(`Error forwarding stream event: ${e.message}`);
             activeStreams.delete(msg.streamId);
@@ -1824,40 +1415,39 @@ function processInput() {
         }
         return;
       }
-
+      
       if (msg.type === "STREAM_ERROR") {
         const stream = activeStreams.get(msg.streamId);
         if (stream) {
           try {
-            stream.socket.write(`${JSON.stringify({ error: msg.error })}\n`);
-          } catch (_e) {}
+            stream.socket.write(JSON.stringify({ error: msg.error }) + "\n");
+          } catch (e) {}
           activeStreams.delete(msg.streamId);
         }
         return;
       }
-
+      
+      
       if (msg.id && pendingToolRequests.has(msg.id)) {
         const pending = pendingToolRequests.get(msg.id);
         pendingToolRequests.delete(msg.id);
-
+        
         if (pending.onComplete) {
           pending.onComplete(msg);
         } else {
           const { socket, originalId, savePath, autoScreenshot, tabId: storedTabId } = pending;
           const tabId = storedTabId || msg._resolvedTabId;
-
+          
           if (savePath && msg.base64) {
             try {
               const dir = path.dirname(savePath);
-              if (!fs.existsSync(dir)) {
-                fs.mkdirSync(dir, { recursive: true });
-              }
+              if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
               fs.writeFileSync(savePath, Buffer.from(msg.base64, "base64"));
               const origWidth = msg.width || 0;
               const origHeight = msg.height || 0;
               const maxSize = pending.maxSize || 1200;
               const skipResize = pending.fullRes;
-
+              
               let finalDims = origWidth && origHeight ? `${origWidth}x${origHeight}` : "";
               if (!skipResize && (origWidth > maxSize || origHeight > maxSize)) {
                 const result = resizeImage(savePath, maxSize);
@@ -1865,36 +1455,26 @@ function processInput() {
                   finalDims = `${result.width}x${result.height}, from ${origWidth}x${origHeight}`;
                 }
               }
-              sendToolResponse(
-                socket,
-                originalId,
-                {
-                  message: `Saved to ${savePath} (${finalDims})`,
-                  path: savePath,
-                  screenshotId: msg.screenshotId, // Preserve for upload_image workflow
-                },
-                null,
-              );
+              sendToolResponse(socket, originalId, { 
+                message: `Saved to ${savePath} (${finalDims})`,
+                path: savePath,
+                screenshotId: msg.screenshotId,  // Preserve for upload_image workflow
+              }, null);
             } catch (e) {
               sendToolResponse(socket, originalId, null, `Failed to save: ${e.message}`);
             }
           } else if (autoScreenshot && tabId && !msg.error && !msg.base64) {
+            
             const screenshotId = ++requestCounter;
             const screenshotPath = path.join(SURF_TMP, `pi-auto-${Date.now()}.png`);
-
-            const autoFiles = fs
-              .readdirSync(SURF_TMP)
-              .filter((f) => f.startsWith("pi-auto-") && f.endsWith(".png"))
-              .map((f) => ({
-                name: f,
-                time: parseInt(f.match(/pi-auto-(\d+)\.png/)?.[1] || "0", 10),
-              }))
+            
+            const autoFiles = fs.readdirSync(SURF_TMP)
+              .filter(f => f.startsWith("pi-auto-") && f.endsWith(".png"))
+              .map(f => ({ name: f, time: parseInt(f.match(/pi-auto-(\d+)\.png/)?.[1] || "0", 10) }))
               .sort((a, b) => b.time - a.time);
             if (autoFiles.length >= 10) {
-              autoFiles.slice(9).forEach((f) => {
-                try {
-                  fs.unlinkSync(path.join(SURF_TMP, f.name));
-                } catch (_e) {}
+              autoFiles.slice(9).forEach(f => {
+                try { fs.unlinkSync(path.join(SURF_TMP, f.name)); } catch (e) {}
               });
             }
             pendingToolRequests.set(screenshotId, {
@@ -1907,8 +1487,7 @@ function processInput() {
                     fs.writeFileSync(screenshotPath, Buffer.from(screenshotMsg.base64, "base64"));
                     const origW = screenshotMsg.width || 0;
                     const origH = screenshotMsg.height || 0;
-                    let finalW = origW,
-                      finalH = origH;
+                    let finalW = origW, finalH = origH;
                     const maxSize = 1200;
                     if (origW > maxSize || origH > maxSize) {
                       const result = resizeImage(screenshotPath, maxSize);
@@ -1917,83 +1496,45 @@ function processInput() {
                         finalH = result.height;
                       }
                     }
-                    sendToolResponse(
-                      socket,
-                      originalId,
-                      {
-                        ...msg,
-                        autoScreenshot: {
-                          path: screenshotPath,
-                          width: finalW,
-                          height: finalH,
-                          originalWidth: origW,
-                          originalHeight: origH,
-                        },
-                      },
-                      null,
-                    );
+                    sendToolResponse(socket, originalId, {
+                      ...msg,
+                      autoScreenshot: { path: screenshotPath, width: finalW, height: finalH, originalWidth: origW, originalHeight: origH }
+                    }, null);
                   } catch (e) {
-                    sendToolResponse(
-                      socket,
-                      originalId,
-                      { ...msg, autoScreenshotError: e.message },
-                      null,
-                    );
+                    sendToolResponse(socket, originalId, { ...msg, autoScreenshotError: e.message }, null);
                   }
                 } else {
                   const errMsg = screenshotMsg.error || "Failed to capture";
-                  sendToolResponse(
-                    socket,
-                    originalId,
-                    { ...msg, autoScreenshotError: errMsg },
-                    null,
-                  );
+                  sendToolResponse(socket, originalId, { ...msg, autoScreenshotError: errMsg }, null);
                 }
-              },
+              }
             });
-            setTimeout(
-              () => writeMessage({ type: "EXECUTE_SCREENSHOT", tabId, id: screenshotId }),
-              500,
-            );
+            setTimeout(() => writeMessage({ type: "EXECUTE_SCREENSHOT", tabId, id: screenshotId }), 500);
             return;
           } else if (msg.results && msg.savePath) {
             try {
               const dir = msg.savePath;
-              if (!fs.existsSync(dir)) {
-                fs.mkdirSync(dir, { recursive: true });
-              }
-
+              if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+              
               for (const result of msg.results) {
                 if (result.screenshotBase64 && result.hostname) {
                   const ssPath = path.join(dir, `${result.hostname}.png`);
                   fs.writeFileSync(ssPath, Buffer.from(result.screenshotBase64, "base64"));
                   result.screenshot = ssPath;
-                  result.screenshotBase64 = undefined;
-                  result.hostname = undefined;
+                  delete result.screenshotBase64;
+                  delete result.hostname;
                 }
               }
-              msg.savePath = undefined;
+              delete msg.savePath;
               sendToolResponse(socket, originalId, msg, null);
             } catch (e) {
-              sendToolResponse(
-                socket,
-                originalId,
-                null,
-                `Failed to save screenshots: ${e.message}`,
-              );
+              sendToolResponse(socket, originalId, null, `Failed to save screenshots: ${e.message}`);
             }
           } else {
-            const isPureError =
-              msg.error &&
-              !msg.success &&
-              !msg.base64 &&
-              !msg.pageContent &&
-              !msg.tabs &&
-              !msg.text &&
-              !msg.output &&
-              !msg.messages &&
-              !msg.requests;
-
+            const isPureError = msg.error && !msg.success && !msg.base64 && 
+                                !msg.pageContent && !msg.tabs && !msg.text &&
+                                !msg.output && !msg.messages && !msg.requests;
+            
             if (isPureError) {
               sendToolResponse(socket, originalId, null, msg.error);
             } else {
@@ -2004,7 +1545,7 @@ function processInput() {
       } else if (msg.id && pendingRequests.has(msg.id)) {
         const { socket } = pendingRequests.get(msg.id);
         try {
-          socket.write(`${JSON.stringify(msg)}\n`);
+          socket.write(JSON.stringify(msg) + "\n");
         } catch (e) {
           log(`Error writing to CLI socket: ${e.message}`);
         }
@@ -2031,15 +1572,12 @@ process.stdin.on("end", () => {
   log("stdin ended (extension disconnected), notifying clients");
   for (const socket of Array.from(connectedSockets)) {
     try {
-      socket.write(
-        `${JSON.stringify({
-          type: "extension_disconnected",
-          code: SURF_ERRORS.SURF_NOT_RUNNING.code,
-          message: `${SURF_ERRORS.SURF_NOT_RUNNING.message} ${SURF_ERRORS.SURF_NOT_RUNNING.hint}`,
-        })}\n`,
-      );
+      socket.write(JSON.stringify({ 
+        type: "extension_disconnected",
+        message: "Surf extension was reloaded. Restart your command."
+      }) + "\n");
       socket.end();
-    } catch (_e) {
+    } catch (e) {
       // Socket may already be closed
     }
   }
@@ -2058,7 +1596,7 @@ const server = net.createServer((socket) => {
   log("CLI client connected");
   connectedSockets.add(socket);
   socket.on("close", () => connectedSockets.delete(socket));
-
+  
   let dataBuffer = "";
 
   socket.on("data", (data) => {
@@ -2067,62 +1605,54 @@ const server = net.createServer((socket) => {
     dataBuffer = lines.pop() || "";
 
     for (const line of lines) {
-      if (!line.trim()) {
-        continue;
-      }
+      if (!line.trim()) continue;
       try {
         const msg = JSON.parse(line);
-
+        
         if (msg.type === "GET_AUTH") {
           log("Handling GET_AUTH locally");
           try {
             if (fs.existsSync(AUTH_FILE)) {
               const authData = JSON.parse(fs.readFileSync(AUTH_FILE, "utf8"));
-              socket.write(
-                `${JSON.stringify({
-                  id: msg.id || 0,
-                  auth: authData,
-                  hint: null,
-                })}\n`,
-              );
+              socket.write(JSON.stringify({ 
+                id: msg.id || 0,
+                auth: authData,
+                hint: null
+              }) + "\n");
             } else {
-              socket.write(
-                `${JSON.stringify({
-                  id: msg.id || 0,
-                  auth: null,
-                  hint: "No OAuth credentials found. Run 'pi --login anthropic' in terminal to authenticate with Claude Max.",
-                })}\n`,
-              );
+              socket.write(JSON.stringify({ 
+                id: msg.id || 0,
+                auth: null,
+                hint: "No OAuth credentials found. Run 'pi --login anthropic' in terminal to authenticate with Claude Max."
+              }) + "\n");
             }
           } catch (e) {
             log(`Error reading auth file: ${e.message}`);
-            socket.write(
-              `${JSON.stringify({
-                id: msg.id || 0,
-                auth: null,
-                hint: "Failed to read auth credentials. Run 'pi --login anthropic' in terminal to authenticate.",
-              })}\n`,
-            );
+            socket.write(JSON.stringify({ 
+              id: msg.id || 0,
+              auth: null,
+              hint: "Failed to read auth credentials. Run 'pi --login anthropic' in terminal to authenticate."
+            }) + "\n");
           }
           continue;
         }
-
+        
         if (msg.type === "tool_request") {
-          log(`Handling tool_request: ${msg.method} ${msg.params?.tool || ""}`);
+          log("Handling tool_request: " + msg.method + " " + (msg.params?.tool || ""));
           try {
             handleToolRequest(msg, socket);
           } catch (e) {
-            socket.write(`${JSON.stringify({ error: e.message || "Request failed" })}\n`);
+            socket.write(JSON.stringify({ error: e.message || "Request failed" }) + "\n");
           }
           continue;
         }
-
+        
         if (msg.type === "stream_request") {
-          log(`Handling stream_request: ${msg.streamType}`);
+          log("Handling stream_request: " + msg.streamType);
           handleStreamRequest(msg, socket);
           continue;
         }
-
+        
         if (msg.type === "stream_stop") {
           log("Handling stream_stop");
           for (const [streamId, stream] of activeStreams.entries()) {
@@ -2133,14 +1663,14 @@ const server = net.createServer((socket) => {
           }
           continue;
         }
-
+        
         const id = ++requestCounter;
         log(`Forwarding to extension: id=${id} type=${msg.type}`);
         pendingRequests.set(id, { socket });
         writeMessage({ ...msg, id });
       } catch (e) {
         log(`Error parsing CLI request: ${e.message}`);
-        socket.write(`${JSON.stringify({ error: "Invalid request" })}\n`);
+        socket.write(JSON.stringify({ error: "Invalid request" }) + "\n");
       }
     }
   });
@@ -2148,7 +1678,7 @@ const server = net.createServer((socket) => {
   socket.on("error", (err) => {
     log(`CLI socket error: ${err.message}`);
   });
-
+  
   socket.on("close", () => {
     log("CLI client disconnected");
     for (const [id, pending] of pendingRequests.entries()) {
@@ -2171,43 +1701,27 @@ const server = net.createServer((socket) => {
 });
 
 server.listen(SOCKET_PATH, () => {
-  log(`Socket server listening on ${SOCKET_PATH}`);
-  if (!IS_WIN) {
-    try {
-      fs.chmodSync(SOCKET_PATH, 0o600);
-    } catch {}
-  }
+  log("Socket server listening on " + SOCKET_PATH);
+  if (!IS_WIN) { try { fs.chmodSync(SOCKET_PATH, 0o600); } catch {} }
   writeMessage({ type: "HOST_READY" });
   log("Sent HOST_READY to extension");
 });
 
 server.on("error", (err) => {
   log(`Server error: ${err.message}`);
-  if (err.code === "EADDRINUSE") {
-  } else if (err.code === "EACCES") {
-  } else {
-  }
 });
 
 process.on("SIGTERM", () => {
   log("SIGTERM received");
   server.close();
-  if (!IS_WIN) {
-    try {
-      fs.unlinkSync(SOCKET_PATH);
-    } catch {}
-  }
+  if (!IS_WIN) { try { fs.unlinkSync(SOCKET_PATH); } catch {} }
   process.exit(0);
 });
 
 process.on("SIGINT", () => {
   log("SIGINT received");
   server.close();
-  if (!IS_WIN) {
-    try {
-      fs.unlinkSync(SOCKET_PATH);
-    } catch {}
-  }
+  if (!IS_WIN) { try { fs.unlinkSync(SOCKET_PATH); } catch {} }
   process.exit(0);
 });
 

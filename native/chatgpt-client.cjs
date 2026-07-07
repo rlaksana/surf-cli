@@ -1,25 +1,17 @@
+const path = require("path");
+
 const CHATGPT_URL = "https://chatgpt.com/";
 
 const SELECTORS = {
-  promptTextarea:
-    '#prompt-textarea, [data-testid="composer-textarea"], textarea[name="prompt-textarea"], .ProseMirror, [contenteditable="true"][data-virtualkeyboard="true"]',
-  sendButton:
-    'button[data-testid="send-button"], button[data-testid*="composer-send"], form button[type="submit"]',
+  promptTextarea: '#prompt-textarea, [data-testid="composer-textarea"], textarea[name="prompt-textarea"], .ProseMirror, [contenteditable="true"][data-virtualkeyboard="true"]',
+  sendButton: 'button[data-testid="send-button"], button[data-testid*="composer-send"], form button[type="submit"]',
   modelButton: '[data-testid="model-switcher-dropdown-button"]',
-  menuContainer: '[role="menu"], [data-radix-collection-root]',
-  menuItem: 'button, [role="menuitem"], [role="menuitemradio"], [data-testid*="model-switcher-"]',
-  assistantMessage: '[data-message-author-role="assistant"], [data-turn="assistant"]',
-  stopButton: '[data-testid="stop-button"]',
-  finishedActions:
-    'button[data-testid="copy-turn-action-button"], button[data-testid="good-response-turn-action-button"]',
-  conversationTurn:
-    'article[data-testid^="conversation-turn"], div[data-testid^="conversation-turn"]',
-  fileInput: 'input[type="file"]',
+  assistantMessage: '[data-message-author-role="assistant"], [data-turn="assistant"], [data-testid*="assistant-message"], [data-testid*="assistant-turn"], [data-testid*="assistant-response"]',
+  assistantContent: '.markdown, [data-message-content], .prose, [class*="markdown"], [dir="auto"]',
+  stopButton: '[data-testid="stop-button"], [data-testid*="stop"], button[aria-label*="Stop"], button[aria-label*="stop"]',
+  finishedActions: 'button[data-testid="copy-turn-action-button"], button[data-testid="good-response-turn-action-button"], button[data-testid*="turn-action"], button[aria-label*="Copy"], button[aria-label*="copy"], button[aria-label*="Read aloud"], button[aria-label*="read aloud"]',
+  conversationTurn: '[data-testid^="conversation-turn"], [data-testid*="conversation-turn"]',
   cloudflareScript: 'script[src*="/challenge-platform/"]',
-  // Detects thinking model indicator (e.g., "Thought for 1m 29s")
-  thinkingIndicator: '[data-message-model-slug*="thinking"]',
-  // Voice mode button appears when stop button transforms after completion
-  voiceButton: '[aria-label="Voice mode"], [data-testid="voice-mode-button"]',
 };
 
 function delay(ms) {
@@ -45,43 +37,164 @@ function buildClickDispatcher() {
 }
 
 function hasRequiredCookies(cookies) {
-  if (!cookies || !Array.isArray(cookies)) {
-    return false;
-  }
-  // Valid: __Secure-next-auth.session-token with non-empty value
-  // Valid: __Secure-next-auth.session-token.<digits> with non-empty value (chunked sessions)
-  // Invalid: session-token-extra, session-token., session-token.foo, etc.
-  const sessionCookie = cookies.find((c) => {
-    const name = c.name;
-    if (!c.value) {
-      return false;
-    }
-    if (name === "__Secure-next-auth.session-token") {
-      return true;
-    }
-    if (name.startsWith("__Secure-next-auth.session-token.")) {
-      const suffix = name.slice("__Secure-next-auth.session-token.".length);
-      if (/^\d+$/.test(suffix)) {
-        return true; // Only numeric suffixes (.0, .1, etc.)
-      }
-    }
-    return false;
-  });
-  return Boolean(sessionCookie);
+  if (!cookies || !Array.isArray(cookies)) return false;
+  return cookies.some(
+    (c) =>
+      typeof c?.name === "string" &&
+      Boolean(c.value) &&
+      (c.name === "__Secure-next-auth.session-token" ||
+        /^__Secure-next-auth\.session-token\.\d+$/.test(c.name))
+  );
 }
 
-async function evaluate(cdp, expression, timeoutMs = 10000) {
-  const result = await Promise.race([
-    cdp(expression),
-    new Promise((_, reject) =>
-      setTimeout(() => reject(new Error("CDP evaluate timeout")), timeoutMs)
-    ),
+function cleanChatGPTResponseText(rawText) {
+  if (!rawText) return "";
+
+  const chromeLines = new Set([
+    "copy",
+    "good response",
+    "bad response",
+    "read aloud",
+    "edit",
+    "retry",
+    "continue generating",
+    "share",
   ]);
+
+  const lines = [];
+  let inCodeFence = false;
+
+  for (const line of String(rawText).replace(/\r\n?/g, "\n").split("\n")) {
+    const trimmed = line.trim();
+    const isFenceLine = trimmed.startsWith("```");
+    const normalizedLine = inCodeFence || isFenceLine ? line.replace(/[\t ]+$/g, "") : line;
+
+    lines.push({
+      text: normalizedLine,
+      trimmed,
+      isChrome: trimmed.length > 0 && chromeLines.has(trimmed.toLowerCase()),
+      inCodeFence,
+      isFenceLine,
+    });
+
+    if (isFenceLine) {
+      inCodeFence = !inCodeFence;
+    }
+  }
+
+  while (lines.length > 0 && lines[0].trimmed.length === 0) {
+    lines.shift();
+  }
+  while (lines.length > 0 && lines[lines.length - 1].trimmed.length === 0) {
+    lines.pop();
+  }
+
+  let trailingChromeStart = lines.length;
+  while (trailingChromeStart > 0) {
+    const line = lines[trailingChromeStart - 1];
+    if (line.inCodeFence || line.isFenceLine || !line.isChrome) break;
+    trailingChromeStart--;
+  }
+
+  const trailingChromeCount = lines.length - trailingChromeStart;
+  if (trailingChromeCount >= 2) {
+    lines.splice(trailingChromeStart);
+  }
+
+  while (lines.length > 0 && lines[0].trimmed.length === 0) {
+    lines.shift();
+  }
+  while (lines.length > 0 && lines[lines.length - 1].trimmed.length === 0) {
+    lines.pop();
+  }
+
+  return lines.map((line) => line.text).join("\n");
+}
+
+function extractLatestAssistantSnapshot(candidates) {
+  if (!Array.isArray(candidates)) return null;
+
+  let latestEmptyAssistant = null;
+
+  for (let i = candidates.length - 1; i >= 0; i--) {
+    const candidate = candidates[i];
+    if (!candidate?.isAssistant) continue;
+
+    const snapshot = {
+      ...candidate,
+      text: cleanChatGPTResponseText(candidate?.text || ""),
+      turnIndex: i,
+    };
+
+    if (snapshot.text) {
+      return snapshot;
+    }
+
+    if (!latestEmptyAssistant) {
+      latestEmptyAssistant = snapshot;
+    }
+  }
+
+  return latestEmptyAssistant;
+}
+
+function normalizeResponseSnapshot(rawSnapshot) {
+  const candidates = rawSnapshot?.candidates;
+  return {
+    latestAssistant: extractLatestAssistantSnapshot(candidates),
+    assistantCount: Array.isArray(candidates)
+      ? candidates.filter((candidate) => candidate?.isAssistant).length
+      : 0,
+    stopVisible: Boolean(rawSnapshot?.stopVisible),
+  };
+}
+
+function isNewAssistantContent(
+  latestAssistant,
+  baselineAssistant,
+  assistantCount = 0,
+  baselineAssistantCount = 0
+) {
+  if (!latestAssistant) return false;
+  if (!baselineAssistant) return true;
+  if (latestAssistant.messageId && baselineAssistant.messageId) {
+    if (latestAssistant.messageId !== baselineAssistant.messageId) {
+      return true;
+    }
+  }
+
+  const currentText = latestAssistant.text || "";
+  const baselineText = baselineAssistant.text || "";
+
+  if (assistantCount > baselineAssistantCount) {
+    if (latestAssistant.turnIndex !== baselineAssistant.turnIndex) {
+      return true;
+    }
+    if (currentText !== baselineText) {
+      return true;
+    }
+    return false;
+  }
+
+  if (currentText !== baselineText) {
+    return true;
+  }
+  return false;
+}
+
+function isChatGPTResponseComplete(snapshot, stableCycles, stableMs) {
+  if (!snapshot?.text) return false;
+  if (snapshot.stopVisible) return false;
+  if (snapshot.hasFinishedActions) return true;
+  return stableCycles >= 6 && stableMs >= 1200;
+}
+
+async function evaluate(cdp, expression) {
+  const result = await cdp(expression);
   if (result.exceptionDetails) {
-    const desc =
-      result.exceptionDetails.exception?.description ||
-      result.exceptionDetails.text ||
-      "Evaluation failed";
+    const desc = result.exceptionDetails.exception?.description || 
+                 result.exceptionDetails.text || 
+                 "Evaluation failed";
     throw new Error(desc);
   }
   if (result.error) {
@@ -104,12 +217,10 @@ async function waitForPageLoad(cdp, timeoutMs = 45000) {
 
 async function isCloudflareBlocked(cdp) {
   const title = await evaluate(cdp, "document.title.toLowerCase()");
-  if (title?.includes("just a moment")) {
-    return true;
-  }
+  if (title && title.includes("just a moment")) return true;
   const hasScript = await evaluate(
     cdp,
-    `Boolean(document.querySelector('${SELECTORS.cloudflareScript}'))`,
+    `Boolean(document.querySelector('${SELECTORS.cloudflareScript}'))`
   );
   return hasScript;
 }
@@ -136,7 +247,7 @@ async function checkLoginStatus(cdp) {
       } catch (e) {
         return { status: 0, error: e.message, url: location.href };
       }
-    })()`,
+    })()`
   );
   return result || { status: 0 };
 }
@@ -156,14 +267,39 @@ async function waitForPromptReady(cdp, timeoutMs = 30000) {
           }
         }
         return false;
-      })()`,
+      })()`
     );
-    if (found) {
-      return true;
-    }
+    if (found) return true;
     await delay(200);
   }
   return false;
+}
+
+function normalizeChatGPTModelChoice(desiredModel) {
+  const normalized = String(desiredModel || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, "");
+
+  if (["instant", "gpt53"].includes(normalized)) return "instant";
+  if (["thinking", "gpt54thinking"].includes(normalized)) return "thinking";
+  if (["pro", "gpt54pro"].includes(normalized)) return "pro";
+
+  return normalized;
+}
+
+function resolveChatGPTModelMenuOption(items, desiredModel) {
+  if (!Array.isArray(items)) return null;
+
+  const targetModel = normalizeChatGPTModelChoice(desiredModel);
+
+  return items.find((item) => {
+    if (item?.role !== "menuitemradio") return false;
+    if (typeof item?.testId !== "string" || !item.testId.startsWith("model-switcher-")) return false;
+
+    const label = normalizeChatGPTModelChoice(item.label || "");
+    const testId = normalizeChatGPTModelChoice(item.testId.replace(/^model-switcher-/, ""));
+    return label === targetModel || testId === targetModel;
+  }) || null;
 }
 
 async function selectModel(cdp, desiredModel, timeoutMs = 8000) {
@@ -172,7 +308,7 @@ async function selectModel(cdp, desiredModel, timeoutMs = 8000) {
     `(() => {
       const btn = document.querySelector('${SELECTORS.modelButton}');
       return btn ? true : false;
-    })()`,
+    })()`
   );
   if (!modelButton) {
     throw new Error("Model selector button not found");
@@ -183,55 +319,64 @@ async function selectModel(cdp, desiredModel, timeoutMs = 8000) {
       ${buildClickDispatcher()}
       const btn = document.querySelector('${SELECTORS.modelButton}');
       if (btn) dispatchClickSequence(btn);
-    })()`,
+    })()`
   );
   await delay(300);
-  // Select from menu - loop in Node.js to avoid CDP timeout issues
-  const normalizedModel = desiredModel.toLowerCase().replace(/[^a-z0-9]/g, "");
+
+  const normalizedModel = normalizeChatGPTModelChoice(desiredModel);
   const deadline = Date.now() + timeoutMs;
 
   while (Date.now() < deadline) {
     const result = await evaluate(
       cdp,
       `(() => {
-        ${buildClickDispatcher()}
-        const targetModel = ${JSON.stringify(normalizedModel)};
-        const menuSelector = '${SELECTORS.menuContainer}';
-        const itemSelector = '${SELECTORS.menuItem}';
-        const normalize = (text) => (text || '').toLowerCase().replace(/[^a-z0-9]/g, '');
-        
-        const menu = document.querySelector(menuSelector);
+        const menu = document.querySelector('[role="menu"][data-radix-menu-content]');
         if (!menu) {
           return { found: false, waiting: true };
         }
-        const items = Array.from(menu.querySelectorAll(itemSelector));
-        let bestMatch = null;
-        let bestScore = 0;
-        for (const item of items) {
-          const text = normalize(item.textContent || '');
-          const testId = normalize(item.getAttribute('data-testid') || '');
-          let score = 0;
-          if (text.includes(targetModel) || testId.includes(targetModel)) score = 100;
-          else if (targetModel.includes(text) || targetModel.includes(testId)) score = 50;
-          if (score > bestScore) {
-            bestScore = score;
-            bestMatch = item;
-          }
-        }
-        if (bestMatch) {
-          dispatchClickSequence(bestMatch);
-          return { found: true, success: true, label: bestMatch.textContent?.trim() };
-        }
-        return { found: true, success: false, error: 'No matching model in menu' };
-      })()`,
+
+        return {
+          found: true,
+          items: Array.from(menu.children).map((item) => {
+            const primary = item.querySelector?.('.min-w-0 > span');
+            return {
+              role: item.getAttribute?.('role') || null,
+              label: (primary?.textContent || item.getAttribute?.('aria-label') || item.textContent || '').trim(),
+              testId: item.getAttribute?.('data-testid') || null,
+            };
+          }),
+        };
+      })()`
     );
 
-    if (result?.found) {
-      if (result.success) {
+    if (result && result.found) {
+      const match = resolveChatGPTModelMenuOption(result.items, normalizedModel);
+      if (match) {
+        await evaluate(
+          cdp,
+          `(() => {
+            ${buildClickDispatcher()}
+            const menu = document.querySelector('[role="menu"][data-radix-menu-content]');
+            const item = menu?.querySelector('[data-testid="${match.testId}"]');
+            if (item) dispatchClickSequence(item);
+          })()`
+        );
         await delay(200);
-        return result.label;
+        return match.label;
       }
-      throw new Error(`Model not found: ${desiredModel}`);
+
+      const available = Array.isArray(result.items)
+        ? result.items
+            .filter((item) => item?.role === "menuitemradio" && typeof item?.testId === "string" && item.testId.startsWith("model-switcher-"))
+            .map((item) => item.label)
+            .filter(Boolean)
+            .join(", ")
+        : "";
+      throw new Error(
+        available
+          ? `Model not found: ${desiredModel}. Available: ${available}`
+          : `Model not found: ${desiredModel}`
+      );
     }
 
     await delay(100);
@@ -265,7 +410,7 @@ async function typePrompt(cdp, inputCdp, prompt) {
         return true;
       }
       return false;
-    })()`,
+    })()`
   );
   if (!focused) {
     throw new Error("Failed to focus prompt textarea");
@@ -283,7 +428,7 @@ async function typePrompt(cdp, inputCdp, prompt) {
         if (text.trim().length > 0) return true;
       }
       return false;
-    })()`,
+    })()`
   );
   if (!verified) {
     await evaluate(
@@ -299,7 +444,7 @@ async function typePrompt(cdp, inputCdp, prompt) {
           editor.textContent = ${encodedPrompt};
           editor.dispatchEvent(new InputEvent('input', { bubbles: true, data: ${encodedPrompt}, inputType: 'insertFromPaste' }));
         }
-      })()`,
+      })()`
     );
   }
 }
@@ -326,14 +471,10 @@ async function clickSend(cdp, inputCdp) {
         if (disabled) return 'disabled';
         dispatchClickSequence(button);
         return 'clicked';
-      })()`,
+      })()`
     );
-    if (result === "clicked") {
-      return true;
-    }
-    if (result === "missing") {
-      break;
-    }
+    if (result === "clicked") return true;
+    if (result === "missing") break;
     await delay(100);
   }
   await inputCdp("Input.dispatchKeyEvent", {
@@ -354,131 +495,150 @@ async function clickSend(cdp, inputCdp) {
   return true;
 }
 
-async function waitForResponse(cdp, timeoutMs = 2700000) {
-  const deadline = Date.now() + timeoutMs;
-  let previousLength = 0;
-  let stableCycles = 0;
-  const requiredStableCycles = 6;
-  const minStableMs = 1200;
-  let lastChangeAt = Date.now();
-  // Safety: if the text has been stable for a very long time but selectors
-  // are broken (e.g. stop button still "visible"), force completion so the
-  // CLI doesn't hang forever.
-  const FORCE_COMPLETE_MS = 30000;
-  while (Date.now() < deadline) {
-    const snapshot = await evaluate(
-      cdp,
-      `(() => {
-        const CONVERSATION_SELECTOR = '${SELECTORS.conversationTurn}';
-        const ASSISTANT_SELECTOR = '${SELECTORS.assistantMessage}';
-        const STOP_SELECTOR = '${SELECTORS.stopButton}';
-        const FINISHED_SELECTOR = '${SELECTORS.finishedActions}';
-        const VOICE_SELECTOR = '${SELECTORS.voiceButton}';
-        const isAssistantTurn = (node) => {
-          if (!(node instanceof HTMLElement)) return false;
-          const role = (node.getAttribute('data-message-author-role') || '').toLowerCase();
-          if (role === 'assistant') return true;
-          const turn = (node.getAttribute('data-turn') || '').toLowerCase();
-          if (turn === 'assistant') return true;
-          return Boolean(node.querySelector(ASSISTANT_SELECTOR));
-        };
-        const turns = Array.from(document.querySelectorAll(CONVERSATION_SELECTOR));
-        let lastAssistantTurn = null;
-        for (let i = turns.length - 1; i >= 0; i--) {
-          if (isAssistantTurn(turns[i])) {
-            lastAssistantTurn = turns[i];
+async function readChatGPTResponseSnapshot(cdp) {
+  return evaluate(
+    cdp,
+    `(() => {
+      const scope = document.querySelector('main') || document;
+      const CONVERSATION_SELECTOR = ${JSON.stringify(SELECTORS.conversationTurn)};
+      const ASSISTANT_SELECTOR = ${JSON.stringify(SELECTORS.assistantMessage)};
+      const CONTENT_SELECTORS = ${JSON.stringify(SELECTORS.assistantContent.split(", "))};
+      const STOP_SELECTOR = ${JSON.stringify(SELECTORS.stopButton)};
+      const FINISHED_SELECTOR = ${JSON.stringify(SELECTORS.finishedActions)};
+
+      const toCandidate = (turnNode, messageRoot = null) => {
+        const resolvedMessageRoot = messageRoot || (turnNode.matches?.(ASSISTANT_SELECTOR)
+          ? turnNode
+          : turnNode.querySelector(ASSISTANT_SELECTOR));
+        const searchRoot = resolvedMessageRoot || turnNode;
+        let contentRoot = null;
+
+        for (const selector of CONTENT_SELECTORS) {
+          const match = selector === '[dir="auto"]'
+            ? (searchRoot.matches?.(selector) ? searchRoot : null)
+            : (searchRoot.matches?.(selector) ? searchRoot : searchRoot.querySelector(selector));
+          if (match) {
+            contentRoot = match;
             break;
           }
         }
-        if (!lastAssistantTurn) {
-          return { text: '', stopVisible: Boolean(document.querySelector(STOP_SELECTOR)), finished: false };
-        }
-        const messageRoot = lastAssistantTurn.querySelector(ASSISTANT_SELECTOR) || lastAssistantTurn;
-        // For thinking models, the response may live inside the thinking block
-        // (collapsed) or after it. Try the .markdown / .prose selectors first
-        // (the final answer area), then fall back to the thinking block content,
-        // then the entire assistant turn as a last resort. This prevents the
-        // "stuck on empty text" failure when the model is still thinking.
-        const thinkingBlock = lastAssistantTurn.querySelector('[data-message-model-slug*="thinking"]');
-        const contentRoot = messageRoot.querySelector('.markdown') ||
-                           messageRoot.querySelector('[data-message-content]') ||
-                           messageRoot.querySelector('.prose') ||
-                           (thinkingBlock && thinkingBlock.querySelector('.markdown')) ||
-                           thinkingBlock ||
-                           messageRoot;
-        const text = (contentRoot?.innerText || contentRoot?.textContent || '').trim();
-        const stopVisible = Boolean(document.querySelector(STOP_SELECTOR));
-        const finished = Boolean(lastAssistantTurn.querySelector(FINISHED_SELECTOR));
-        const voiceVisible = Boolean(document.querySelector(VOICE_SELECTOR));
-        const messageId = messageRoot.getAttribute('data-message-id') || null;
-        // Detect if this is a thinking model response (has thinking indicator but no finished actions yet)
-        const hasThinkingIndicator = Boolean(lastAssistantTurn.querySelector('[data-message-model-slug*="thinking"]'));
-        return { text, stopVisible, finished, voiceVisible, messageId, turnIndex: turns.length - 1, hasThinkingIndicator };
-      })()`,
-    );
+
+        const role =
+          resolvedMessageRoot?.getAttribute('data-message-author-role') ||
+          turnNode.getAttribute('data-message-author-role') ||
+          null;
+        const turn =
+          resolvedMessageRoot?.getAttribute('data-turn') ||
+          turnNode.getAttribute('data-turn') ||
+          null;
+        const isAssistant =
+          role === 'assistant' ||
+          turn === 'assistant' ||
+          resolvedMessageRoot !== null;
+        const text = (contentRoot || turnNode).innerText || (contentRoot || turnNode).textContent || '';
+        const messageId =
+          resolvedMessageRoot?.getAttribute('data-message-id') ||
+          turnNode.getAttribute('data-message-id') ||
+          null;
+        const hasFinishedActions = Boolean(turnNode.querySelector(FINISHED_SELECTOR));
+
+        return {
+          role,
+          turn,
+          isAssistant,
+          text,
+          messageId,
+          hasFinishedActions,
+        };
+      };
+
+      let candidates = Array.from(scope.querySelectorAll(CONVERSATION_SELECTOR)).map((turnNode) =>
+        toCandidate(turnNode)
+      );
+
+      if (candidates.length === 0) {
+        candidates = Array.from(scope.querySelectorAll(ASSISTANT_SELECTOR)).map((messageRoot) =>
+          toCandidate(messageRoot, messageRoot)
+        );
+      }
+
+      return {
+        candidates,
+        stopVisible: Boolean(scope.querySelector(STOP_SELECTOR)),
+      };
+    })()`
+  );
+}
+
+async function waitForResponse(
+  cdp,
+  timeoutMs = 2700000,
+  baselineAssistant,
+  baselineAssistantCount
+) {
+  const deadline = Date.now() + timeoutMs;
+  let previousText = "";
+  let stableCycles = 0;
+  let lastChangeAt = Date.now();
+
+  previousText = baselineAssistant?.text || "";
+  lastChangeAt = Date.now();
+
+  while (Date.now() < deadline) {
+    const snapshot = await readChatGPTResponseSnapshot(cdp);
+
     if (!snapshot) {
       await delay(400);
       continue;
     }
-    const currentLength = (snapshot.text || "").length;
-    if (currentLength > previousLength) {
-      previousLength = currentLength;
+
+    const { latestAssistant, assistantCount, stopVisible } = normalizeResponseSnapshot(snapshot);
+    const currentText = latestAssistant?.text || "";
+    const hasNewAssistantContent = isNewAssistantContent(
+      latestAssistant,
+      baselineAssistant,
+      assistantCount,
+      baselineAssistantCount
+    );
+
+    if (!hasNewAssistantContent) {
+      await delay(400);
+      continue;
+    }
+
+    if (currentText !== previousText) {
+      previousText = currentText;
       stableCycles = 0;
       lastChangeAt = Date.now();
-    } else {
+    } else if (currentText) {
       stableCycles++;
+    } else {
+      stableCycles = 0;
+      lastChangeAt = Date.now();
     }
+
     const stableMs = Date.now() - lastChangeAt;
-    // Safety: if text has been stable for 30s+ and has content, force return.
-    // This prevents the CLI from hanging forever when selectors are stale
-    // (e.g. stop button always "visible", thinking indicator never clears).
-    if (stableMs >= FORCE_COMPLETE_MS && currentLength > 0) {
+    const completionSnapshot = latestAssistant
+      ? { ...latestAssistant, stopVisible }
+      : { text: "", stopVisible, hasFinishedActions: false };
+
+    if (isChatGPTResponseComplete(completionSnapshot, stableCycles, stableMs)) {
       return {
-        text: snapshot.text,
-        messageId: snapshot.messageId,
-        turnIndex: snapshot.turnIndex,
+        text: latestAssistant.text,
+        messageId: latestAssistant.messageId,
+        turnIndex: latestAssistant.turnIndex,
       };
     }
-    if (!snapshot.stopVisible) {
-      const stableEnough = stableCycles >= requiredStableCycles && stableMs >= minStableMs;
-      const finishedVisible = snapshot.finished;
-      const voiceVisible = snapshot.voiceVisible;
-      // Voice button appears when stop button transforms after completion
-      // If voice is visible, response is done regardless of thinking indicator
-      if (voiceVisible && currentLength > 0) {
-        return {
-          text: snapshot.text,
-          messageId: snapshot.messageId,
-          turnIndex: snapshot.turnIndex,
-        };
-      }
-      // For thinking models: if we detect a thinking indicator, keep waiting even if stable
-      // The thinking block has no stop button but is not the final response
-      if ((finishedVisible || stableEnough) && currentLength > 0) {
-        // Check if this is a thinking block (has thinking indicator but no finished actions)
-        const isThinkingBlock = snapshot.hasThinkingIndicator && !snapshot.finished;
-        if (isThinkingBlock) {
-          // Reset stability and keep waiting for actual response
-          stableCycles = 0;
-          lastChangeAt = Date.now();
-          await delay(400);
-          continue;
-        }
-        return {
-          text: snapshot.text,
-          messageId: snapshot.messageId,
-          turnIndex: snapshot.turnIndex,
-        };
-      }
-    }
+
     await delay(400);
   }
+
   throw new Error("Response timeout");
 }
 
 async function query(options) {
   const {
-    prompt: originalPrompt,
+    prompt,
     model,
     file,
     timeout = 2700000,
@@ -490,16 +650,11 @@ async function query(options) {
     uploadFile,
     log = () => {},
   } = options;
-
-  let prompt = originalPrompt;
   const startTime = Date.now();
   log("Starting ChatGPT query");
   const { cookies } = await getCookies();
-  const cookieNames = cookies?.map((c) => c.name) || [];
   if (!hasRequiredCookies(cookies)) {
-    throw new Error(
-      `ChatGPT login required. Found ${cookies?.length || 0} cookies: ${cookieNames.join(", ")}`,
-    );
+    throw new Error("ChatGPT login required");
   }
   log(`Got ${cookies.length} cookies`);
   const tabInfo = await createTab();
@@ -508,10 +663,10 @@ async function query(options) {
     throw new Error("Failed to create ChatGPT tab");
   }
   log(`Created tab ${tabId}`);
-
+  
   const cdp = (expr) => cdpEvaluate(tabId, expr);
   const inputCdp = (method, params) => cdpCommand(tabId, method, params);
-
+  
   try {
     await waitForPageLoad(cdp);
     log("Page loaded");
@@ -519,12 +674,15 @@ async function query(options) {
       throw new Error("Cloudflare challenge detected - complete in browser");
     }
     const loginStatus = await checkLoginStatus(cdp);
-    log(`DEBUG loginStatus: ${JSON.stringify(loginStatus)}`);
-    if (loginStatus.error) {
-      throw new Error(`ChatGPT login check failed: ${loginStatus.error}`);
+    if (loginStatus.status === 0) {
+      throw new Error(
+        loginStatus.error
+          ? `ChatGPT login check failed: ${loginStatus.error}`
+          : "ChatGPT login check failed"
+      );
     }
     if (loginStatus.status !== 200 || loginStatus.hasLoginCta) {
-      throw new Error(`ChatGPT login required. loginStatus: ${JSON.stringify(loginStatus)}`);
+      throw new Error("ChatGPT login required");
     }
     log("Login verified");
     const promptReady = await waitForPromptReady(cdp);
@@ -537,72 +695,33 @@ async function query(options) {
       log(`Selected model: ${selectedLabel}`);
     }
     if (file) {
-      const fs = require("node:fs");
-      const path = require("node:path");
-
-      const absolutePath = path.resolve(process.cwd(), file);
-      if (!fs.existsSync(absolutePath)) {
-        throw new Error(`File not found: ${file}`);
+      if (!uploadFile) {
+        throw new Error("ChatGPT file upload unavailable: native host did not provide upload callback");
       }
-
-      const fileName = path.basename(absolutePath);
-      const fileExt = path.extname(absolutePath).toLowerCase();
-
-      // Text-based extensions only
-      const textExtensions = [
-        ".js",
-        ".ts",
-        ".tsx",
-        ".jsx",
-        ".py",
-        ".java",
-        ".c",
-        ".cpp",
-        ".h",
-        ".hpp",
-        ".go",
-        ".rs",
-        ".rb",
-        ".php",
-        ".html",
-        ".htm",
-        ".css",
-        ".scss",
-        ".less",
-        ".json",
-        ".md",
-        ".txt",
-        ".sh",
-        ".bash",
-        ".zsh",
-        ".yaml",
-        ".yml",
-        ".xml",
-        ".sql",
-        ".gitignore",
-        ".env",
-        ".toml",
-        ".ini",
-        ".cfg",
-        ".conf",
-        ".log",
-        ".csv",
-        ".tsv",
-      ];
-
-      if (!textExtensions.includes(fileExt)) {
-        throw new Error(`Unsupported file type: ${fileExt}. Only text files are supported.`);
+      const files = Array.isArray(file) ? file : [file];
+      const absFiles = files.map((filePath) => path.resolve(process.cwd(), filePath));
+      log(`Uploading ${absFiles.length} file(s) to ChatGPT...`);
+      const uploadResult = await uploadFile(tabId, absFiles);
+      if (uploadResult?.error) {
+        throw new Error(`ChatGPT file upload failed: ${uploadResult.error}`);
       }
-
-      const fileContent = fs.readFileSync(absolutePath, "utf-8");
-      prompt = `File: ${fileName}\n\n\`\`\`\n${fileContent}\n\`\`\`\n\n---\n\n${prompt}`;
-      log(`Attached file: ${fileName} (${fileContent.length} chars)`);
+      if (!uploadResult?.success) {
+        throw new Error("ChatGPT file upload failed: upload did not report success");
+      }
+      log("File uploaded, waiting for ChatGPT attachment processing...");
+      await delay(1500);
     }
     await typePrompt(cdp, inputCdp, prompt);
     log("Prompt typed");
+    const baseline = normalizeResponseSnapshot(await readChatGPTResponseSnapshot(cdp));
     await clickSend(cdp, inputCdp);
     log("Prompt sent, waiting for response...");
-    const response = await waitForResponse(cdp, timeout);
+    const response = await waitForResponse(
+      cdp,
+      timeout,
+      baseline.latestAssistant,
+      baseline.assistantCount
+    );
     log(`Response received (${response.text.length} chars)`);
     return {
       response: response.text,
@@ -611,251 +730,22 @@ async function query(options) {
       tookMs: Date.now() - startTime,
     };
   } finally {
-    if (tabId) {
-      console.error("[ChatGPT] Closing tab:", tabId);
-      try {
-        await Promise.race([
-          closeTab(tabId),
-          new Promise((_, reject) =>
-            setTimeout(() =>
-              reject(new Error("closeTab timeout")), 5000)
-          ),
-        ]);
-        console.error("[ChatGPT] Tab closed successfully:", tabId);
-      } catch (e) {
-        console.error("[ChatGPT] Tab close failed:", e);
-      }
+    try {
+      await closeTab(tabId);
+    } catch (error) {
+      log(`Failed to close ChatGPT tab ${tabId}: ${error?.message || error}`);
     }
   }
-}
-
-/**
- * Strips trailing chrome clusters from ChatGPT response text.
- * Chrome button labels (Copy, Read aloud, Share, Retry) appear as
- * standalone lines after the actual content. Edit is NOT chrome — it is
- * a legitimate content action that should be preserved.
- *
- * Algorithm:
- * 1. Strip trailing \r\n to avoid creating empty elements on split
- * 2. Split on \r\n (any combination)
- * 3. Strip trailing chrome cluster (2+ consecutive chrome at end)
- * 4. Strip outer blank lines
- * @param {string} text
- * @returns {string}
- */
-function cleanChatGPTResponseText(text) {
-  if (!text) {
-    return "";
-  }
-  // Strip trailing \r\n to avoid creating an empty element on split
-  const stripped = text.replace(/\r\n$/, "").replace(/\n$/, "");
-  const lines = stripped.split(/\r?\n/);
-  // Chrome button labels — Edit is NOT chrome (preserved as content)
-  const chromeSet = new Set(["Copy", "Read aloud", "Share", "Retry"]);
-
-  // Count consecutive chrome at the end
-  let trailingChrome = 0;
-  for (let i = lines.length - 1; i >= 0; i--) {
-    if (chromeSet.has(lines[i].trim())) {
-      trailingChrome++;
-    } else {
-      break;
-    }
-  }
-
-  // Only strip trailing chrome if 2+ consecutive (a "cluster")
-  let end = lines.length;
-  if (trailingChrome >= 2) {
-    end = lines.length - trailingChrome;
-  }
-
-  // Strip outer blank lines
-  let start = 0;
-  while (start < end && lines[start].trim() === "") {
-    start++;
-  }
-  while (end > start && lines[end - 1].trim() === "") {
-    end--;
-  }
-
-  return lines.slice(start, end).join("\n");
-}
-
-/**
- * Extracts the latest assistant message from a candidates array.
- * Prefers the last assistant with non-empty cleaned text.
- * When all have empty text, returns the last assistant by index.
- * @param {Array<object>} candidates
- * @returns {object|null}
- */
-function extractLatestAssistantSnapshot(candidates) {
-  if (!Array.isArray(candidates)) {
-    return null;
-  }
-  let lastNonEmpty = null;
-  let lastNonEmptyIdx = -1;
-  let lastAssistant = null;
-  let lastAssistantIdx = -1;
-  for (let i = 0; i < candidates.length; i++) {
-    const c = candidates[i];
-    if (c.isAssistant || c.role === "assistant" || c.turn === "assistant") {
-      const cleanedText = cleanChatGPTResponseText(c.text || "");
-      lastAssistant = { ...c, _cleanedText: cleanedText };
-      lastAssistantIdx = i;
-      if (cleanedText.trim().length > 0) {
-        lastNonEmpty = lastAssistant;
-        lastNonEmptyIdx = i;
-      }
-    }
-  }
-  const best = lastNonEmpty !== null ? lastNonEmpty : lastAssistant;
-  const bestIdx = lastNonEmpty !== null ? lastNonEmptyIdx : lastAssistantIdx;
-  if (!best) {
-    return null;
-  }
-  const result = {
-    role: "assistant",
-    turn: best.turn || "assistant",
-    isAssistant: true,
-    text: best._cleanedText,
-    messageId: best.messageId || null,
-    turnIndex: bestIdx,
-  };
-  if (best.hasFinishedActions) {
-    result.hasFinishedActions = true;
-  }
-  return result;
-}
-
-/**
- * Normalizes a ChatGPT model choice string to canonical form.
- * @param {string} model
- * @returns {string}
- */
-function normalizeChatGPTModelChoice(model) {
-  if (!model) {
-    return "";
-  }
-  const s = model.toLowerCase().replace(/\s+/g, "").replace(/-/g, "");
-  if (s === "instant" || s === "gpt53" || s === "gpt-5-3") {
-    return "instant";
-  }
-  if (s === "thinking" || s === "gpt54thinking" || s === "gpt-5-4-thinking") {
-    return "thinking";
-  }
-  if (s === "pro" || s === "gpt54pro" || s === "gpt-5-4-pro") {
-    return "pro";
-  }
-  // Fallback: strip non-alphanumeric
-  return model.toLowerCase().replace(/[^a-z0-9]/g, "");
-}
-
-/**
- * Determines whether the latest assistant content is new vs baseline.
- * Checks messageId, text, and turnIndex — a different turnIndex always means new content.
- * @param {object} latestAssistant
- * @param {object} baselineAssistant
- * @param {number} assistantCount
- * @param {number} baselineAssistantCount
- * @returns {boolean}
- */
-function isNewAssistantContent(
-  latestAssistant,
-  baselineAssistant,
-  _assistantCount,
-  _baselineAssistantCount,
-) {
-  if (!latestAssistant) {
-    return false;
-  }
-  if (!baselineAssistant) {
-    return true;
-  }
-  if (latestAssistant.messageId !== baselineAssistant.messageId) {
-    return true;
-  }
-  if (latestAssistant.turnIndex !== baselineAssistant.turnIndex) {
-    return true;
-  }
-  const text1 = (latestAssistant.text || "").trim();
-  const text2 = (baselineAssistant.text || "").trim();
-  return text1 !== text2;
-}
-
-/**
- * Determines whether a ChatGPT response is complete.
- * @param {object} snapshot - { text, stopVisible, hasFinishedActions }
- * @param {number} minStableCycles
- * @param {number} minStableMs
- * @returns {boolean}
- */
-function isChatGPTResponseComplete(snapshot, minStableCycles, minStableMs) {
-  if (!snapshot) {
-    return false;
-  }
-  if (snapshot.stopVisible) {
-    return false;
-  }
-  // Empty text is never complete, even if finished actions are visible
-  const text = (snapshot.text || "").trim();
-  if (!text) {
-    return false;
-  }
-  if (snapshot.hasFinishedActions) {
-    return true;
-  }
-  // Thinking model: if the response is a thinking block only (no finished
-  // actions yet), the model is still mid-think — do not treat as complete.
-  if (snapshot.hasThinkingIndicator && !snapshot.hasFinishedActions) {
-    return false;
-  }
-  // Not finished: check stability thresholds
-  if (typeof minStableCycles === "number" && minStableCycles < 6) {
-    return false;
-  }
-  if (typeof minStableMs === "number" && minStableMs < 1200) {
-    return false;
-  }
-  return true;
-}
-
-/**
- * Resolves a model choice string to a ChatGPT model menu option object.
- * @param {Array<{role?: string, label?: string, testId?: string}>} options
- * @param {string} modelChoice
- * @returns {object|null}
- */
-function resolveChatGPTModelMenuOption(options, modelChoice) {
-  if (!Array.isArray(options) || !modelChoice) {
-    return null;
-  }
-  const normalizedChoice = normalizeChatGPTModelChoice(modelChoice);
-  for (const opt of options) {
-    if (opt.role === null || opt.role === "menuitem") {
-      continue; // skip section labels
-    }
-    const normalizedLabel = normalizeChatGPTModelChoice(opt.label || "");
-    const normalizedTestId = opt.testId
-      ? opt.testId
-          .replace(/^model-switcher-/g, "")
-          .toLowerCase()
-          .replace(/-/g, "")
-      : "";
-    if (normalizedLabel === normalizedChoice || normalizedTestId === normalizedChoice) {
-      return { role: opt.role, label: opt.label, testId: opt.testId };
-    }
-  }
-  return null;
 }
 
 module.exports = {
   query,
   hasRequiredCookies,
-  CHATGPT_URL,
   cleanChatGPTResponseText,
   extractLatestAssistantSnapshot,
   normalizeChatGPTModelChoice,
   resolveChatGPTModelMenuOption,
   isNewAssistantContent,
   isChatGPTResponseComplete,
+  CHATGPT_URL,
 };

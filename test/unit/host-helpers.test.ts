@@ -1,6 +1,34 @@
 // @ts-expect-error - CommonJS module without type definitions
 import * as helpers from "../../native/host-helpers.cjs";
 
+describe("buildProviderUploadMessage", () => {
+  it("builds provider-aware ChatGPT upload messages", () => {
+    expect(helpers.buildProviderUploadMessage("chatgpt", 123, ["/tmp/file.txt"], 7)).toEqual({
+      type: "AI_UPLOAD_FILE_TO_TAB",
+      provider: "chatgpt",
+      tabId: 123,
+      filePaths: ["/tmp/file.txt"],
+      id: 7,
+    });
+  });
+
+  it("builds provider-aware Gemini upload messages", () => {
+    expect(helpers.buildProviderUploadMessage("gemini", 456, ["/tmp/image.png"], 8)).toEqual({
+      type: "AI_UPLOAD_FILE_TO_TAB",
+      provider: "gemini",
+      tabId: 456,
+      filePaths: ["/tmp/image.png"],
+      id: 8,
+    });
+  });
+
+  it("rejects unsupported upload providers", () => {
+    expect(() => helpers.buildProviderUploadMessage("perplexity", 1, ["/tmp/file.txt"], 2)).toThrow(
+      "Unsupported upload provider: perplexity",
+    );
+  });
+});
+
 describe("mapToolToMessage", () => {
   describe("window commands", () => {
     it("maps window.new to WINDOW_NEW with url", () => {
@@ -88,6 +116,136 @@ describe("mapToolToMessage", () => {
     });
   });
 
+  describe("screenshot commands", () => {
+    it("maps full-page to fullpage", () => {
+      const msg = helpers.mapToolToMessage("screenshot", { "full-page": true });
+      expect(msg.type).toBe("EXECUTE_SCREENSHOT");
+      expect(msg.fullpage).toBe(true);
+    });
+
+    it("preserves fullpage mapping", () => {
+      const msg = helpers.mapToolToMessage("screenshot", { fullpage: true });
+      expect(msg.fullpage).toBe(true);
+    });
+  });
+
+  describe("animate-audit command", () => {
+    it("maps animate-audit with bounded defaults", () => {
+      const msg = helpers.mapToolToMessage("animate-audit", { selector: ".thing" }, 123);
+      expect(msg).toMatchObject({
+        type: "ANIMATE_AUDIT",
+        selector: ".thing",
+        durationMs: 2000,
+        fps: 10,
+        tabId: 123,
+      });
+    });
+
+    it("parses animate-audit duration and fps", () => {
+      const msg = helpers.mapToolToMessage(
+        "animate-audit",
+        { selector: ".thing", duration: "1500", fps: "12" },
+        123,
+      );
+      expect(msg.durationMs).toBe(1500);
+      expect(msg.fps).toBe(12);
+    });
+
+    it("requires animate-audit selector", () => {
+      expect(() => helpers.mapToolToMessage("animate-audit", {})).toThrow("selector required");
+    });
+
+    it("rejects malformed animate-audit duration and fps", () => {
+      expect(() =>
+        helpers.mapToolToMessage("animate-audit", { selector: ".thing", duration: true }),
+      ).toThrow("duration must be a number");
+      expect(() =>
+        helpers.mapToolToMessage("animate-audit", { selector: ".thing", fps: true }),
+      ).toThrow("fps must be a number");
+      expect(() =>
+        helpers.mapToolToMessage("animate-audit", { selector: ".thing", duration: "10001" }),
+      ).toThrow("duration must be between 100 and 10000 ms");
+      expect(() =>
+        helpers.mapToolToMessage("animate-audit", { selector: ".thing", fps: "31" }),
+      ).toThrow("fps must be between 1 and 30");
+    });
+  });
+
+  describe("perf-audit command", () => {
+    it("maps perf-audit with bounded defaults", () => {
+      const msg = helpers.mapToolToMessage("perf-audit", {}, 123);
+      expect(msg).toMatchObject({
+        type: "PERF_AUDIT",
+        durationMs: 3000,
+        tabId: 123,
+      });
+    });
+
+    it("parses perf-audit duration and trigger", () => {
+      const msg = helpers.mapToolToMessage(
+        "perf-audit",
+        { duration: "1500", trigger: "click:.cta" },
+        123,
+      );
+      expect(msg).toMatchObject({
+        type: "PERF_AUDIT",
+        durationMs: 1500,
+        trigger: "click:.cta",
+        tabId: 123,
+      });
+    });
+
+    it("rejects malformed perf-audit options", () => {
+      expect(() => helpers.mapToolToMessage("perf-audit", { duration: true })).toThrow(
+        "duration must be a number",
+      );
+      expect(() => helpers.mapToolToMessage("perf-audit", { duration: "10001" })).toThrow(
+        "duration must be between 100 and 10000 ms",
+      );
+      expect(() => helpers.mapToolToMessage("perf-audit", { trigger: true })).toThrow(
+        "trigger must be action:target",
+      );
+    });
+  });
+
+  describe("scroll commands", () => {
+    it("maps direction and amount flags to scroll deltas", () => {
+      const msg = helpers.mapToolToMessage("scroll", { direction: "down", amount: 4 }, 123);
+      expect(msg).toMatchObject({ type: "EXECUTE_SCROLL", deltaX: 0, deltaY: 400, tabId: 123 });
+    });
+
+    it("preserves legacy scroll_direction and scroll_amount mapping", () => {
+      const msg = helpers.mapToolToMessage(
+        "scroll",
+        { scroll_direction: "up", scroll_amount: 2 },
+        123,
+      );
+      expect(msg).toMatchObject({ type: "EXECUTE_SCROLL", deltaX: 0, deltaY: -200, tabId: 123 });
+    });
+
+    it("uses shorthand pixel amounts without multiplying by 100", () => {
+      const msg = helpers.mapToolToMessage(
+        "scroll",
+        { direction: "down", scroll_pixels: 800 },
+        123,
+      );
+      expect(msg).toMatchObject({ type: "EXECUTE_SCROLL", deltaX: 0, deltaY: 800, tabId: 123 });
+    });
+
+    it("maps scroll.top and scroll.bottom dot commands", () => {
+      expect(helpers.mapToolToMessage("scroll.top", {}, 123)).toMatchObject({
+        type: "SCROLL_TO_POSITION",
+        position: "top",
+        tabId: 123,
+      });
+      expect(helpers.mapToolToMessage("scroll.bottom", {}, 123)).toMatchObject({
+        type: "SCROLL_TO_POSITION",
+        position: "bottom",
+        tabId: 123,
+      });
+    });
+  });
+
   describe("error cases", () => {
     it("returns null for unknown tool", () => {
       expect(helpers.mapToolToMessage("unknown.command", {})).toBeNull();
@@ -135,6 +293,38 @@ describe("formatToolContent", () => {
         _hint: "hint",
       });
       expect(result[0].text).not.toContain("_resolvedTabId");
+    });
+  });
+
+  describe("scroll responses", () => {
+    it("formats scrollBy position output", () => {
+      const result = helpers.formatToolContent({ scrollY: 800, pageHeight: 3200, scrolled: true });
+      expect(result[0].text).toBe("Scrolled to Y:800 (page height: 3200)");
+    });
+
+    it("formats scroll position output", () => {
+      const result = helpers.formatToolContent({ scrollTop: 0, scrollHeight: 3200, atTop: true });
+      expect(result[0].text).toBe("Scrolled to Y:0 (page height: 3200)");
+    });
+
+    it("preserves detailed scroll info output", () => {
+      const result = helpers.formatToolContent({
+        scrollTop: 800,
+        scrollHeight: 3200,
+        clientHeight: 900,
+        atTop: false,
+        atBottom: false,
+        scrollPercentage: 35,
+      });
+
+      expect(JSON.parse(result[0].text)).toEqual({
+        scrollTop: 800,
+        scrollHeight: 3200,
+        clientHeight: 900,
+        atTop: false,
+        atBottom: false,
+        scrollPercentage: 35,
+      });
     });
   });
 

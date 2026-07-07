@@ -8,28 +8,24 @@
 const { loadConfig, getConfigPath, clearCache } = require("./config.cjs");
 
 const GROK_URL = "https://x.com/i/grok";
-const DEFAULT_MODEL = "thinking";
+const DEFAULT_MODEL = "fast";
 
-// Default models (as of Jan 2026)
+// Default models (as of Jun 2026)
 const DEFAULT_GROK_MODELS = {
-  auto: { id: "auto", name: "Auto", desc: "Chooses Fast or Expert" },
-  fast: { id: "fast", name: "Fast", desc: "Quick responses" },
-  expert: { id: "expert", name: "Expert", desc: "Thinks hard" },
-  thinking: { id: "thinking", name: "Grok 4.1 Thinking", desc: "Thinks fast" },
+  "auto": { id: "auto", name: "Auto", desc: "Chooses Fast or Expert" },
+  "fast": { id: "fast", name: "Fast", desc: "Quick responses" },
+  "expert": { id: "expert", name: "Expert", desc: "Thinks hard" },
+  "grok-4.20-beta": { id: "grok-4.20-beta", name: "Grok 4.20 Beta", desc: "4 Agents" },
 };
 
 // Load models from surf.json config or use defaults
 function getGrokModels() {
   try {
     const config = loadConfig();
-    if (
-      config.grok?.models &&
-      typeof config.grok.models === "object" &&
-      Object.keys(config.grok.models).length > 0
-    ) {
+    if (config.grok?.models && typeof config.grok.models === "object" && Object.keys(config.grok.models).length > 0) {
       return config.grok.models;
     }
-  } catch (_e) {
+  } catch (e) {
     // Ignore errors, use defaults
   }
   return DEFAULT_GROK_MODELS;
@@ -43,7 +39,7 @@ const GROK_MODELS = DEFAULT_GROK_MODELS;
 // ============================================================================
 
 function delay(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 function buildClickDispatcher() {
@@ -64,39 +60,84 @@ function buildClickDispatcher() {
   }`;
 }
 
-function hasRequiredCookies(cookies) {
-  if (!cookies || !Array.isArray(cookies)) {
-    return false;
+function normalizeGrokModelLabel(text) {
+  return String(text || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+function getGrokModelMatchLabels(desiredModel) {
+  const labels = new Set([desiredModel]);
+  const models = getGrokModels();
+  const configured = models[desiredModel];
+  if (configured) {
+    labels.add(configured.id);
+    labels.add(configured.name);
+  } else {
+    for (const model of Object.values(models)) {
+      if (model?.id === desiredModel) {
+        labels.add(model.id);
+        labels.add(model.name);
+      }
+    }
   }
-  // Auth surfaces (in priority order):
-  //   1. x.com legacy:   auth_token cookie scoped to x.com
-  //   2. grok.com new:   x-userid cookie (set by grok.com after login)
-  //                     — verified live: grok.com does not use auth_token,
-  //                       grok_session, or session_id. x-userid is the
-  //                       primary session marker.
-  // Either is sufficient — Grok moved from x.com to grok.com.
-  const hasXCom = cookies.some(
-    (c) =>
-      c.name === "auth_token" &&
-      c.value &&
-      (!c.domain || c.domain.includes("x.com") || c.domain.includes("twitter.com"))
-  );
-  const hasGrokCom = cookies.some(
-    (c) =>
-      c.name === "x-userid" &&
-      c.value &&
-      (!c.domain || c.domain.includes("grok.com") || c.domain.includes("x.ai"))
-  );
-  return hasXCom || hasGrokCom;
+  return Array.from(labels).filter(Boolean).map(normalizeGrokModelLabel);
+}
+
+function grokModelLabelsMatch(foundLabel, requestedLabels) {
+  const found = normalizeGrokModelLabel(foundLabel);
+  return requestedLabels.some(label => label && (found.includes(label) || label.includes(found)));
+}
+
+function grokSendButtonFinderScript() {
+  return `
+    const isVisible = (el) => {
+      const style = window.getComputedStyle?.(el);
+      const rect = el.getBoundingClientRect?.();
+      return el.offsetParent !== null &&
+             (!style || (style.visibility !== 'hidden' && style.display !== 'none')) &&
+             (!rect || (rect.width > 0 && rect.height > 0));
+    };
+    const isEnabled = (el) => !el.disabled && el.getAttribute('aria-disabled') !== 'true';
+    const matchesSendButton = (button) => {
+      const label = (button.getAttribute('aria-label') || '').trim().toLowerCase();
+      const testId = (button.getAttribute('data-testid') || '').trim().toLowerCase();
+      return label === 'send' || label === 'submit' ||
+             label.startsWith('send ') || label.startsWith('submit ') ||
+             testId === 'groksend' || testId === 'send-button' ||
+             testId.includes('composer-send') || testId.includes('grok-send');
+    };
+    const input = document.querySelector('textarea, [contenteditable="true"][role="textbox"], [data-testid="grokComposerInput"]');
+    const scopes = [];
+    if (input) {
+      const form = input.closest('form');
+      const composer = input.closest('[data-testid*="composer" i], [aria-label*="composer" i], [role="form"]');
+      if (form) scopes.push(form);
+      if (composer && composer !== form) scopes.push(composer);
+    }
+    scopes.push(document);
+    let sendBtn = null;
+    for (const scope of scopes) {
+      sendBtn = Array.from(scope.querySelectorAll('button')).find(b =>
+        matchesSendButton(b) && isVisible(b) && isEnabled(b)
+      );
+      if (sendBtn) break;
+    }
+  `;
+}
+
+function hasRequiredCookies(cookies) {
+  if (!cookies || !Array.isArray(cookies)) return false;
+  // auth_token is the primary session cookie for X.com
+  // ct0 is a CSRF token that's set dynamically, not strictly required for page load
+  const authToken = cookies.find(c => c.name === "auth_token" && c.value);
+  return Boolean(authToken);
 }
 
 async function evaluate(cdp, expression) {
   const result = await cdp(expression);
   if (result.exceptionDetails) {
-    const desc =
-      result.exceptionDetails.exception?.description ||
-      result.exceptionDetails.text ||
-      "Evaluation failed";
+    const desc = result.exceptionDetails.exception?.description ||
+                 result.exceptionDetails.text ||
+                 "Evaluation failed";
     throw new Error(desc);
   }
   if (result.error) {
@@ -124,14 +165,10 @@ async function waitForPageLoad(cdp, timeoutMs = 30000) {
 }
 
 async function checkLoginStatus(cdp) {
-  const result = await evaluate(
-    cdp,
-    `(() => {
+  const result = await evaluate(cdp, `(() => {
     const body = document.body.innerText.toLowerCase();
     const hasLoginButton = !!document.querySelector('a[href*="/login"], [data-testid="loginButton"]');
-    // Grok UI changed: original (x.com) had "ask anything" placeholder;
-    // new grok.com has "what do you want to know?" placeholder.
-    const hasGrokUI = body.includes('ask anything') || body.includes('what do you want to know') || body.includes('grok');
+    const hasGrokUI = body.includes('ask anything') || body.includes('grok');
     const hasPremiumPrompt = body.includes('subscribe') || body.includes('premium required');
 
     return {
@@ -139,8 +176,7 @@ async function checkLoginStatus(cdp) {
       hasPremium: hasGrokUI && !hasPremiumPrompt,
       url: location.href
     };
-  })()`,
-  );
+  })()`);
 
   return result || { loggedIn: false, hasPremium: false };
 }
@@ -150,18 +186,14 @@ async function waitForGrokReady(cdp, timeoutMs = 20000) {
   let lastState = null;
 
   while (Date.now() < deadline) {
-    const state = await evaluate(
-      cdp,
-      `(() => {
+    const state = await evaluate(cdp, `(() => {
       // Check for Grok-specific elements
       const hasInput = !!document.querySelector('textarea, [contenteditable="true"][role="textbox"], [data-testid="grokComposerInput"]');
       const hasGrokBranding = document.body.innerText.includes('Grok') ||
                                !!document.querySelector('[data-testid*="grok"]');
-      // Grok moved from x.com/i/grok to grok.com. Accept either path.
-      const isGrokPage = location.pathname.includes('/grok') ||
-                          location.hostname.endsWith('grok.com');
+      const isGrokPage = location.pathname.includes('/grok');
       const isLoginPage = location.pathname.includes('/login') || location.pathname.includes('/i/flow');
-      
+
       return {
         ready: isGrokPage && (hasInput || hasGrokBranding),
         hasInput,
@@ -169,17 +201,16 @@ async function waitForGrokReady(cdp, timeoutMs = 20000) {
         isLoginPage,
         url: location.href
       };
-    })()`,
-    );
+    })()`);
 
     lastState = state;
 
-    if (state?.ready) {
+    if (state && state.ready) {
       return state;
     }
 
     // If redirected to login, fail fast
-    if (state?.isLoginPage) {
+    if (state && state.isLoginPage) {
       throw new Error("Redirected to login page - X.com login required");
     }
 
@@ -200,15 +231,13 @@ async function waitForGrokReady(cdp, timeoutMs = 20000) {
 // ============================================================================
 
 async function selectModel(cdp, desiredModel, timeoutMs = 8000) {
-  const normalizedModel = desiredModel.toLowerCase().replace(/[^a-z0-9.-]/g, "");
+  const requestedLabels = getGrokModelMatchLabels(desiredModel);
 
   // First, find and click the model selector button
-  const buttonClicked = await evaluate(
-    cdp,
-    `(() => {
+  const buttonClicked = await evaluate(cdp, `(() => {
     ${buildClickDispatcher()}
-    
-    // Look for model selector button (shows current model: Auto, Fast, Expert, or Grok 4.1 Thinking)
+
+    // Look for model selector button (shows current model: Auto, Fast, Expert, or Grok 4.x)
     const buttons = Array.from(document.querySelectorAll('button'));
     const modelBtn = buttons.find(b => {
       const text = (b.textContent || '').toLowerCase();
@@ -219,13 +248,12 @@ async function selectModel(cdp, desiredModel, timeoutMs = 8000) {
       const hasModelLabel = label.includes('model') || testId.includes('model');
       return hasModelName || hasModelLabel;
     });
-    
+
     if (!modelBtn) return { success: false, error: 'Model selector not found' };
-    
+
     dispatchClickSequence(modelBtn);
     return { success: true };
-  })()`,
-  );
+  })()`);
 
   if (!buttonClicked || !buttonClicked.success) {
     // Model selector might not exist (single model), continue anyway
@@ -238,55 +266,55 @@ async function selectModel(cdp, desiredModel, timeoutMs = 8000) {
   const deadline = Date.now() + timeoutMs;
 
   while (Date.now() < deadline) {
-    const result = await evaluate(
-      cdp,
-      `(() => {
+    const result = await evaluate(cdp, `(() => {
       ${buildClickDispatcher()}
-      
-      const targetModel = ${JSON.stringify(normalizedModel)};
-      const normalize = (text) => (text || '').toLowerCase().replace(/[^a-z0-9.-]/g, '');
-      
+
+      const requestedLabels = ${JSON.stringify(requestedLabels)};
+      const normalize = (text) => (text || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+
       // Look for menu items
       const items = document.querySelectorAll('[role="menuitem"], [role="menuitemradio"], [role="option"]');
-      
+
       if (items.length === 0) {
         return { found: false, waiting: true };
       }
-      
+
       let bestMatch = null;
       let bestScore = 0;
-      
+
       for (const item of items) {
         const text = normalize(item.textContent || '');
         let score = 0;
-        
-        if (text.includes(targetModel)) score = 100;
-        else if (targetModel.includes(text) && text.length > 3) score = 50;
-        else if (text.includes('thinking') && targetModel.includes('thinking')) score = 75;
-        
+
+        for (const label of requestedLabels) {
+          if (!label) continue;
+          if (text === label) score = Math.max(score, 100);
+          else if (text.includes(label)) score = Math.max(score, 90);
+          else if (label.includes(text) && text.length > 3) score = Math.max(score, 50);
+        }
+
         if (score > bestScore) {
           bestScore = score;
           bestMatch = item;
         }
       }
-      
+
       if (bestMatch) {
         dispatchClickSequence(bestMatch);
         return { found: true, success: true, model: bestMatch.textContent?.trim() };
       }
-      
-      return { found: true, success: false, error: 'No matching model in menu' };
-    })()`,
-    );
 
-    if (result?.found) {
+      return { found: true, success: false, error: 'No matching model in menu' };
+    })()`);
+
+    if (result && result.found) {
       if (result.success) {
         await delay(200);
         return result.model;
       }
-      // Items found but no match - close menu and return default
+      // Items found but no match - close menu and surface the failure to callers.
       await evaluate(cdp, `document.body.click()`);
-      return desiredModel;
+      throw new Error(result.error ? `${result.error} for "${desiredModel}"` : `No matching model in menu for "${desiredModel}"`);
     }
 
     await delay(100);
@@ -294,7 +322,7 @@ async function selectModel(cdp, desiredModel, timeoutMs = 8000) {
 
   // Timeout - close menu
   await evaluate(cdp, `document.body.click()`);
-  return desiredModel;
+  throw new Error(`Timed out waiting for model menu to show "${desiredModel}"`);
 }
 
 // ============================================================================
@@ -302,11 +330,9 @@ async function selectModel(cdp, desiredModel, timeoutMs = 8000) {
 // ============================================================================
 
 async function enableDeepSearch(cdp) {
-  const result = await evaluate(
-    cdp,
-    `(() => {
+  const result = await evaluate(cdp, `(() => {
     ${buildClickDispatcher()}
-    
+
     // Look for DeepSearch toggle or button
     const buttons = Array.from(document.querySelectorAll('button, [role="switch"]'));
     const deepSearchBtn = buttons.find(b => {
@@ -316,25 +342,24 @@ async function enableDeepSearch(cdp) {
       return text.includes('deepsearch') || text.includes('deep search') ||
              label.includes('deepsearch') || label.includes('deep search');
     });
-    
+
     if (!deepSearchBtn) {
       return { success: false, error: 'DeepSearch toggle not found' };
     }
-    
+
     // Check if already enabled
     const isEnabled = deepSearchBtn.getAttribute('aria-checked') === 'true' ||
                       deepSearchBtn.classList.contains('active');
-    
+
     if (isEnabled) {
       return { success: true, alreadyEnabled: true };
     }
-    
+
     dispatchClickSequence(deepSearchBtn);
     return { success: true };
-  })()`,
-  );
+  })()`);
 
-  if (result?.success) {
+  if (result && result.success) {
     await delay(300);
   }
 
@@ -347,11 +372,9 @@ async function enableDeepSearch(cdp) {
 
 async function typePrompt(cdp, inputCdp, prompt) {
   // Focus the input area
-  const focused = await evaluate(
-    cdp,
-    `(() => {
+  const focused = await evaluate(cdp, `(() => {
     ${buildClickDispatcher()}
-    
+
     // Strategy 1: Find textarea or contenteditable
     const inputs = document.querySelectorAll('textarea, [contenteditable="true"][role="textbox"], [data-testid="grokComposerInput"]');
     for (const el of inputs) {
@@ -361,7 +384,7 @@ async function typePrompt(cdp, inputCdp, prompt) {
         return { success: true, method: 'input' };
       }
     }
-    
+
     // Strategy 2: Look for elements with "Ask" placeholder (more targeted selector)
     const placeholderEls = document.querySelectorAll('[placeholder*="Ask"], [placeholder*="ask"], [aria-placeholder*="Ask"]');
     for (const el of placeholderEls) {
@@ -371,13 +394,12 @@ async function typePrompt(cdp, inputCdp, prompt) {
         return { success: true, method: 'placeholder' };
       }
     }
-    
+
     return { success: false, error: 'Input not found' };
-  })()`,
-  );
+  })()`);
 
   if (!focused || !focused.success) {
-    throw new Error(`Could not focus input: ${focused?.error || "unknown"}`);
+    throw new Error(`Could not focus input: ${focused?.error || 'unknown'}`);
   }
 
   await delay(300);
@@ -389,28 +411,18 @@ async function typePrompt(cdp, inputCdp, prompt) {
 
 async function submitPrompt(cdp, inputCdp) {
   // Try to click send button
-  const clicked = await evaluate(
-    cdp,
-    `(() => {
+  const clicked = await evaluate(cdp, `(() => {
     ${buildClickDispatcher()}
-    
-    // Look for send button
-    const buttons = Array.from(document.querySelectorAll('button'));
-    const sendBtn = buttons.find(b => {
-      const label = (b.getAttribute('aria-label') || '').toLowerCase();
-      const testId = b.getAttribute('data-testid') || '';
-      return label.includes('send') || testId.includes('send') || 
-             testId.includes('submit') || testId.includes('grokSend');
-    });
-    
-    if (sendBtn && !sendBtn.disabled) {
+
+    ${grokSendButtonFinderScript()}
+
+    if (sendBtn) {
       dispatchClickSequence(sendBtn);
       return { success: true, method: 'button' };
     }
-    
+
     return { success: false };
-  })()`,
-  );
+  })()`);
 
   if (!clicked || !clicked.success) {
     // Fallback: press Enter
@@ -438,17 +450,55 @@ async function submitPrompt(cdp, inputCdp) {
 // Response Handling
 // ============================================================================
 
-// Extract Grok's response from the full page body text
-function extractGrokResponse(bodyText, userPrompt = "") {
-  if (!bodyText) {
-    return null;
+function looksLikeTrailingSuggestion(line) {
+  if (!line || line.length < 4 || line.length > 90) return false;
+  if (/[.!:;)]$/.test(line)) return false;
+  const words = line.split(/\s+/).filter(Boolean);
+  if (words.length < 2 || words.length > 9) return false;
+  if (/^[-*•\d]/.test(line)) return false;
+  if (/\b(https?:\/\/|www\.)\b/i.test(line)) return false;
+  return true;
+}
+
+function trimTrailingSuggestionLines(lines) {
+  let end = lines.length;
+  while (end > 0 && looksLikeTrailingSuggestion(lines[end - 1])) {
+    end--;
   }
 
+  const trimmedCount = lines.length - end;
+  if (trimmedCount >= 2 && end > 0) {
+    return lines.slice(0, end);
+  }
+
+  const last = lines[lines.length - 1];
+  if (
+    trimmedCount === 1 &&
+    lines.length > 1 &&
+    /^(explain|tell|share|compare|derive|make|show|summari[sz]e|expand|rewrite)\b/i.test(last)
+  ) {
+    return lines.slice(0, -1);
+  }
+
+  const previous = lines[lines.length - 2];
+  if (
+    last &&
+    previous &&
+    /^[A-Z][a-z]{3,}$/.test(last) &&
+    /(?:[.!?)]|^\d+(?:\.\d+)?$)/.test(previous)
+  ) {
+    return lines.slice(0, -1);
+  }
+
+  return lines;
+}
+
+// Extract Grok's response from the full page body text
+function extractGrokResponse(bodyText, userPrompt = '') {
+  if (!bodyText) return null;
+
   // Split into lines and filter out navigation/UI elements
-  const lines = bodyText
-    .split("\n")
-    .map((l) => l.trim())
-    .filter((l) => l);
+  const lines = bodyText.split('\n').map(l => l.trim()).filter(l => l);
 
   // Known UI elements to skip
   const uiPatterns = [
@@ -458,22 +508,19 @@ function extractGrokResponse(bodyText, userPrompt = "") {
     /^(Create recurring tasks|Get access to|Explore)$/i,
     /^(Think Harder)$/i,
     /^(Auto|Fast|Expert)$/i, // Model names
-    /^Grok\s*\d/i, // "Grok 4.1 Thinking" etc
+    /^Grok\s*\d/i, // Grok 4.x model names
     /^@\w+$/, // Username mentions alone
     /^[A-Z][a-z]+ \d+$/, // Dates like "Jan 20"
     /^(See new posts|Talk to Grok|Get access to)/, // Sidebar promos
   ];
 
   // Normalize prompt for comparison (first 30 chars to handle truncation)
-  const promptNorm = userPrompt
-    .toLowerCase()
-    .replace(/[^a-z0-9]/g, "")
-    .substring(0, 30);
+  const promptNorm = userPrompt.toLowerCase().replace(/[^a-z0-9]/g, '').substring(0, 30);
 
   // Find the LAST occurrence of the user's question to get the most recent conversation
   let lastQuestionIndex = -1;
   for (let i = lines.length - 1; i >= 0; i--) {
-    const lineNorm = lines[i].toLowerCase().replace(/[^a-z0-9]/g, "");
+    const lineNorm = lines[i].toLowerCase().replace(/[^a-z0-9]/g, '');
     if (promptNorm && lineNorm.includes(promptNorm)) {
       lastQuestionIndex = i;
       break;
@@ -488,26 +535,19 @@ function extractGrokResponse(bodyText, userPrompt = "") {
     const line = lines[i];
 
     // Skip empty and UI lines
-    if (!line || uiPatterns.some((p) => p.test(line))) {
-      continue;
-    }
+    if (!line || uiPatterns.some(p => p.test(line))) continue;
 
     // Skip very short lines that are likely icons/buttons (but keep numbers)
-    if (line.length <= 2 && !/^\d+$/.test(line)) {
-      continue;
-    }
-
-    // Stop at follow-up suggestions (they mark the end of the response)
-    if (/^(Explain|Tell me|Learn more|Show me|Multiplication)/i.test(line)) {
-      break;
-    }
+    if (line.length <= 2 && !/^\d+$/.test(line)) continue;
 
     contentLines.push(line);
   }
 
+  const responseLines = trimTrailingSuggestionLines(contentLines);
+
   // If we found content after the question, return the response
-  if (contentLines.length > 0) {
-    return contentLines.join("\n").trim();
+  if (responseLines.length > 0) {
+    return responseLines.join('\n').trim();
   }
 
   // Fallback: look for the LAST standalone numeric answer
@@ -521,45 +561,43 @@ function extractGrokResponse(bodyText, userPrompt = "") {
   return null;
 }
 
-async function waitForResponse(cdp, timeoutMs = 300000, userPrompt = "") {
+async function waitForResponse(cdp, timeoutMs = 300000, userPrompt = '') {
   // Grok can take a long time:
-  // - Thinking models (Grok 4.1 Thinking): 40-60+ seconds to think, then streams
+  // - Thinking models: 40-60+ seconds to think, then streams
   // - Fast/Auto models: No thinking phase, just streams directly
 
   const deadline = Date.now() + timeoutMs;
-  let previousText = "";
+  let previousText = '';
   let previousLength = 0;
   let lastChangeAt = Date.now();
   let thinkingTime = null;
   let thinkingComplete = false;
-  let lastResponseText = "";
+  let lastResponseText = '';
   let responseStableCycles = 0;
 
   while (Date.now() < deadline) {
     // Get page state with multiple completion indicators
-    const snapshot = await evaluate(
-      cdp,
-      `(function() {
+    const snapshot = await evaluate(cdp, `(function() {
       const bodyText = document.body.innerText || '';
-      
+
       // Check for stop/cancel button (indicates still generating)
       const hasStopBtn = !!document.querySelector('button[aria-label*="Stop"], button[aria-label*="stop"], button[aria-label*="Cancel"]');
-      
+
       // Check for "Thought for Xs" which indicates thinking model completed thinking
       const thinkMatch = bodyText.match(/Thought for (\\d+)s/i);
       const thinkingDone = !!thinkMatch;
       const thinkingSecs = thinkMatch ? parseInt(thinkMatch[1], 10) : null;
-      
+
       // Check if actively showing "thinking..." or similar loading state
-      const isThinking = /\\bthinking\\.\\.\\./i.test(bodyText) || 
+      const isThinking = /\\bthinking\\.\\.\\./i.test(bodyText) ||
                          /\\bSearching\\.\\.\\./i.test(bodyText) ||
                          bodyText.includes('Grok is thinking') ||
                          bodyText.includes('is thinking...');
-      
+
       // Try to find the actual Grok response in the DOM
       // Look for the main content area - Grok responses appear in the conversation area
       let responseText = '';
-      
+
       // Strategy 1: Look for article elements or main content containers
       const articles = document.querySelectorAll('article');
       if (articles.length > 0) {
@@ -567,7 +605,7 @@ async function waitForResponse(cdp, timeoutMs = 300000, userPrompt = "") {
         const lastArticle = articles[articles.length - 1];
         responseText = lastArticle.innerText || '';
       }
-      
+
       // Strategy 2: If no articles, look for the conversation container
       if (!responseText) {
         const convArea = document.querySelector('[data-testid="conversation"], [role="main"] > div > div');
@@ -575,14 +613,14 @@ async function waitForResponse(cdp, timeoutMs = 300000, userPrompt = "") {
           responseText = convArea.innerText || '';
         }
       }
-      
+
       // Strategy 3: Fallback to looking for text after common Grok UI patterns
       if (!responseText || responseText.length < 10) {
         // Find content between user question and follow-up suggestions
         const mainArea = document.querySelector('main') || document.body;
         responseText = mainArea.innerText || bodyText;
       }
-      
+
       return {
         bodyText: bodyText,
         responseText: responseText,
@@ -593,8 +631,7 @@ async function waitForResponse(cdp, timeoutMs = 300000, userPrompt = "") {
         isThinking: isThinking,
         url: location.href
       };
-    })()`,
-    );
+    })()`);
 
     if (!snapshot || !snapshot.bodyText) {
       await delay(300);
@@ -620,12 +657,12 @@ async function waitForResponse(cdp, timeoutMs = 300000, userPrompt = "") {
     }
 
     // Extract the actual response text - try DOM-extracted first, fall back to body parsing
-    let currentResponseText = "";
+    let currentResponseText = '';
     if (snapshot.responseText && snapshot.responseText.length > 10) {
-      currentResponseText = extractGrokResponse(snapshot.responseText, userPrompt) || "";
+      currentResponseText = extractGrokResponse(snapshot.responseText, userPrompt) || '';
     }
     if (!currentResponseText || currentResponseText.length < 5) {
-      currentResponseText = extractGrokResponse(bodyText, userPrompt) || "";
+      currentResponseText = extractGrokResponse(bodyText, userPrompt) || '';
     }
 
     // Track RESPONSE text stability (more reliable than body text)
@@ -649,24 +686,20 @@ async function waitForResponse(cdp, timeoutMs = 300000, userPrompt = "") {
     // Response is stable if the extracted response text hasn't changed
     // Use shorter thresholds since we're checking actual content, not noisy body text
     // 4 cycles (1.2s) + 1.5s minimum is enough for response stability
-    const responseIsStable =
-      responseStableCycles >= 4 && stableMs >= 1500 && currentResponseText.length > 10;
+    const responseIsStable = responseStableCycles >= 4 && stableMs >= 1500 && currentResponseText.length > 10;
 
     // "Thought for Xs" is the strongest completion signal - response is definitely done
     const thinkingModelDone = snapshot.thinkingDone && noStopButton;
 
     // SIMPLE CHECK: If we have response content, no stop button, and stable for 3+ cycles
-    const hasResponseNoStop =
-      currentResponseText.length > 5 && noStopButton && responseStableCycles >= 3;
+    const hasResponseNoStop = currentResponseText.length > 5 && noStopButton && responseStableCycles >= 3;
 
     // Response is complete when:
     // 1. Has meaningful response content (> 5 chars)
     // 2. No stop button
     // 3. Either: thinking done, response stable for 3+ cycles, OR stable for 4+ cycles with 1.5s
-    const isDone =
-      currentResponseText.length > 5 &&
-      noStopButton &&
-      (thinkingModelDone || hasResponseNoStop || responseIsStable);
+    const isDone = currentResponseText.length > 5 && noStopButton &&
+                   (thinkingModelDone || hasResponseNoStop || responseIsStable);
 
     if (isDone) {
       return {
@@ -713,18 +746,12 @@ async function query(options) {
   const startTime = Date.now();
   log("Starting Grok query");
 
-  // Cookie pre-check is OPTIONAL — the page-load login detection below is
-  // authoritative. Cookies for x.com/grok.com may not be available if the
-  // surf CLI was launched from a different browser context, so we log the
-  // count but don't fail the query on cookie absence.
-  let cookies = [];
-  try {
-    const cookieResult = await getCookies();
-    cookies = cookieResult?.cookies || cookieResult || [];
-    log(`Got ${cookies.length} cookies (pre-check)`);
-  } catch (cookieErr) {
-    log(`Cookie pre-check failed (non-fatal): ${cookieErr.message}`);
+  // Check cookies for X.com authentication
+  const { cookies } = await getCookies();
+  if (!hasRequiredCookies(cookies)) {
+    throw new Error("X.com login required - log in to x.com in Chrome first");
   }
+  log(`Got ${cookies.length} cookies`);
 
   // Create tab
   const tabInfo = await createTab();
@@ -751,7 +778,7 @@ async function query(options) {
     if (!loginStatus.hasPremium) {
       log("Warning: X Premium may be required for some Grok features");
     }
-    log(`Login: yes${loginStatus.hasPremium ? " (Premium)" : ""}`);
+    log(`Login: yes${loginStatus.hasPremium ? ' (Premium)' : ''}`);
 
     // Track warnings for agent feedback
     const warnings = [];
@@ -768,18 +795,14 @@ async function query(options) {
       selectedModel = await selectModel(cdp, targetModel);
       log(`Model: ${selectedModel}`);
       // Check if we got a different model than requested
-      const requestedNorm = targetModel.toLowerCase().replace(/[^a-z0-9]/g, "");
-      const selectedNorm = selectedModel.toLowerCase().replace(/[^a-z0-9]/g, "");
+      const requestedNorm = targetModel.toLowerCase().replace(/[^a-z0-9]/g, '');
+      const selectedNorm = selectedModel.toLowerCase().replace(/[^a-z0-9]/g, '');
       if (!selectedNorm.includes(requestedNorm) && !requestedNorm.includes(selectedNorm)) {
-        warnings.push(
-          `Requested model "${targetModel}" but got "${selectedModel}" - model may not be available`,
-        );
+        warnings.push(`Requested model "${targetModel}" but got "${selectedModel}" - model may not be available`);
       }
     } catch (e) {
       modelSelectionFailed = true;
-      warnings.push(
-        `Model selection failed: ${e.message}. Run 'surf grok --validate' to check available models.`,
-      );
+      warnings.push(`Model selection failed: ${e.message}. Run 'surf grok --validate' to check available models.`);
       log(`Model selection failed: ${e.message}`);
     }
 
@@ -792,9 +815,7 @@ async function query(options) {
           deepSearchEnabled = true;
           log("DeepSearch enabled");
         } else {
-          warnings.push(
-            `DeepSearch toggle not found - feature may require X Premium or UI changed`,
-          );
+          warnings.push(`DeepSearch toggle not found - feature may require X Premium or UI changed`);
         }
       } catch (e) {
         warnings.push(`DeepSearch toggle failed: ${e.message}`);
@@ -812,10 +833,8 @@ async function query(options) {
 
     // Wait for response
     const response = await waitForResponse(cdp, timeout, prompt);
-    const thinkingInfo = response.thinkingTime ? ` (thought for ${response.thinkingTime}s)` : "";
-    log(
-      `Response: ${response.text.length} chars${thinkingInfo}${response.partial ? " (partial)" : ""}`,
-    );
+    const thinkingInfo = response.thinkingTime ? ` (thought for ${response.thinkingTime}s)` : '';
+    log(`Response: ${response.text.length} chars${thinkingInfo}${response.partial ? ' (partial)' : ''}`);
 
     return {
       response: response.text,
@@ -831,10 +850,7 @@ async function query(options) {
       tookMs: Date.now() - startTime,
     };
   } finally {
-    await Promise.race([
-      closeTab(tabId),
-      new Promise(resolve => setTimeout(resolve, 5000)),
-    ]).catch(() => {});
+    await closeTab(tabId).catch(() => {});
   }
 }
 
@@ -843,7 +859,13 @@ async function query(options) {
 // ============================================================================
 
 async function validate(options) {
-  const { getCookies, createTab, closeTab, cdpEvaluate, log = () => {} } = options;
+  const {
+    getCookies,
+    createTab,
+    closeTab,
+    cdpEvaluate,
+    log = () => {},
+  } = options;
 
   const startTime = Date.now();
   log("Starting Grok validation");
@@ -905,43 +927,30 @@ async function validate(options) {
       result.errors.push("Page shows logged out state");
       return { ...result, tookMs: Date.now() - startTime };
     }
-    log(`Login: yes${result.premium ? " (Premium)" : ""}`);
+    log(`Login: yes${result.premium ? ' (Premium)' : ''}`);
 
     // Wait for Grok UI
     await waitForGrokReady(cdp);
     log("Grok ready");
 
     // Check for input field
-    const inputCheck = await evaluate(
-      cdp,
-      `(() => {
+    const inputCheck = await evaluate(cdp, `(() => {
       const input = document.querySelector('textarea, [contenteditable="true"][role="textbox"], [data-testid="grokComposerInput"]');
       return { found: !!input && input.offsetParent !== null };
-    })()`,
-    );
+    })()`);
     result.inputFound = inputCheck?.found || false;
-    log(`Input field: ${result.inputFound ? "found" : "NOT FOUND"}`);
+    log(`Input field: ${result.inputFound ? 'found' : 'NOT FOUND'}`);
 
     // Check for send button
-    const sendCheck = await evaluate(
-      cdp,
-      `(() => {
-      const buttons = Array.from(document.querySelectorAll('button'));
-      const sendBtn = buttons.find(b => {
-        const label = (b.getAttribute('aria-label') || '').toLowerCase();
-        const testId = b.getAttribute('data-testid') || '';
-        return label.includes('send') || testId.includes('send') || testId.includes('submit');
-      });
+    const sendCheck = await evaluate(cdp, `(() => {
+      ${grokSendButtonFinderScript()}
       return { found: !!sendBtn };
-    })()`,
-    );
+    })()`);
     result.sendButtonFound = sendCheck?.found || false;
-    log(`Send button: ${result.sendButtonFound ? "found" : "NOT FOUND"}`);
+    log(`Send button: ${result.sendButtonFound ? 'found' : 'NOT FOUND'}`);
 
     // Click model selector and scrape models
-    const modelButtonClicked = await evaluate(
-      cdp,
-      `(() => {
+    const modelButtonClicked = await evaluate(cdp, `(() => {
       ${buildClickDispatcher()}
       const buttons = Array.from(document.querySelectorAll('button'));
       const modelBtn = buttons.find(b => {
@@ -955,16 +964,13 @@ async function validate(options) {
       if (!modelBtn) return { success: false };
       dispatchClickSequence(modelBtn);
       return { success: true };
-    })()`,
-    );
+    })()`);
 
     if (modelButtonClicked?.success) {
       await delay(500);
 
       // Scrape model options
-      const modelScrape = await evaluate(
-        cdp,
-        `(() => {
+      const modelScrape = await evaluate(cdp, `(() => {
         const items = document.querySelectorAll('[role="menuitem"], [role="menuitemradio"], [role="option"]');
         const models = [];
         for (const item of items) {
@@ -977,11 +983,10 @@ async function validate(options) {
           }
         }
         return { models };
-      })()`,
-      );
+      })()`);
 
       result.models = modelScrape?.models || [];
-      log(`Found models: ${result.models.join(", ")}`);
+      log(`Found models: ${result.models.join(', ')}`);
 
       // Close the menu
       await evaluate(cdp, `document.body.click()`);
@@ -991,32 +996,26 @@ async function validate(options) {
     }
 
     // Check for model mismatch
-    const expectedNames = Object.values(getGrokModels()).map((m) => m.name.toLowerCase());
-    const foundNames = result.models.map((m) => m.toLowerCase());
+    const expectedNames = Object.values(getGrokModels()).map(m => normalizeGrokModelLabel(m.name));
+    const foundNames = result.models.map(m => normalizeGrokModelLabel(m));
 
-    const missing = expectedNames.filter(
-      (e) => !foundNames.some((f) => f.includes(e) || e.includes(f)),
-    );
-    const extra = foundNames.filter(
-      (f) => !expectedNames.some((e) => f.includes(e) || e.includes(f)),
-    );
+    const missing = expectedNames.filter(e => !foundNames.some(f => f.includes(e) || e.includes(f)));
+    const extra = foundNames.filter(f => !expectedNames.some(e => f.includes(e) || e.includes(f)));
 
     if (missing.length > 0 || extra.length > 0) {
       result.modelMismatch = true;
       if (missing.length > 0) {
-        result.errors.push(`Expected models not found: ${missing.join(", ")}`);
+        result.errors.push(`Expected models not found: ${missing.join(', ')}`);
       }
       if (extra.length > 0) {
-        result.errors.push(`Unexpected models found: ${extra.join(", ")}`);
+        result.errors.push(`Unexpected models found: ${extra.join(', ')}`);
       }
     }
+
   } catch (e) {
     result.errors.push(`Validation error: ${e.message}`);
   } finally {
-    await Promise.race([
-      closeTab(tabId),
-      new Promise(resolve => setTimeout(resolve, 5000)),
-    ]).catch(() => {});
+    await closeTab(tabId).catch(() => {});
   }
 
   result.tookMs = Date.now() - startTime;
@@ -1025,9 +1024,9 @@ async function validate(options) {
 
 // Save discovered models to surf.json config
 function saveModels(models) {
-  const fs = require("node:fs");
-  const path = require("node:path");
-  const os = require("node:os");
+  const fs = require("fs");
+  const path = require("path");
+  const os = require("os");
 
   try {
     // Use existing config path or default to ~/surf.json
@@ -1041,7 +1040,7 @@ function saveModels(models) {
     if (fs.existsSync(configPath)) {
       try {
         config = JSON.parse(fs.readFileSync(configPath, "utf-8"));
-      } catch (_e) {
+      } catch (e) {
         // Start fresh if parse fails
       }
     }
@@ -1050,7 +1049,7 @@ function saveModels(models) {
     config.grok = config.grok || {};
     config.grok.models = models;
 
-    fs.writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`);
+    fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n");
     clearCache(); // Clear config cache so subsequent reads see new values
     return { success: true, path: configPath };
   } catch (e) {
@@ -1065,6 +1064,9 @@ module.exports = {
   getGrokModels,
   saveModels,
   extractGrokResponse,
+  normalizeGrokModelLabel,
+  getGrokModelMatchLabels,
+  grokModelLabelsMatch,
   GROK_URL,
   GROK_MODELS,
   DEFAULT_GROK_MODELS,

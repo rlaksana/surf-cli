@@ -1,10 +1,49 @@
 # Changelog
 
+## [Unreleased]
+
+## [2.8.0] - 2026-07-03
+
+### Added
+- **Native host diagnostics** - Added `surf doctor` to diagnose socket connectivity, native messaging manifests, allowed origins, and wrapper paths without requiring a working browser connection.
+- **Performance audit** - Added `surf perf-audit --duration ... --trigger ... --output ...` for bounded PerformanceObserver snapshots of layout shifts, events, long tasks, paints, and long animation frames. (@SeMmyT)
+- **Animation recording** - Added `surf record --duration ... --fps ... --output ...` to capture screenshot bursts and assemble animated GIFs with ImageMagick. (@SeMmyT)
+- **Browser request lock** - Added per-socket CLI request serialization for multi-agent workflows, with `--no-lock` for intentional bypasses. (@SeMmyT)
+- **Animation audit** - Added `surf animate-audit --selector ... --duration ... --fps ...` for bounded JSON timelines of element rect/style samples. (@SeMmyT)
+- **Concurrency docs** - Documented the current multi-agent isolation contract: window/tab targeting, named tabs, `SURF_SOCKET` for separate browser/profile instances, and the absence of built-in session IDs or independent per-agent CDP sessions.
+- **LLM context flag** - Added `surf --llm-context` as a compact, deterministic quick reference for AI agents. (@SeMmyT)
+- **CLI/native socket integration coverage** - Added CI-safe integration tests for Surf CLI request framing, fake native-host responses, host errors, and missing-socket diagnostics.
+- **Native host protocol integration coverage** - Added CI-safe tests for `native/host.cjs` native-messaging framing, CLI request forwarding, extension responses, and extension error propagation without real Chrome.
+- **E2E-contract coverage** - Added CI-safe real CLI plus real native-host tests with a fake native-messaging extension for browser-like navigation, page text, page read, and screenshot flows without Chrome.
+- **Scroll shorthand** - `surf scroll` now accepts positional forms like `scroll down 800`, `scroll up 400`, `scroll bottom`, and `scroll top` while keeping existing flag and dot-command forms. (@SeMmyT)
+- **Cookie subcommands** - Added space-separated cookie commands (`surf cookie list`, `get`, `set`, `clear --all`, and `delete`) while keeping existing `cookie.*` commands working. (@SeMmyT)
+
+### Fixed
+- **Socket failure guidance** - Socket connection errors now point users to `surf doctor --browser all` for detailed native-host diagnostics.
+- **ChatGPT file upload** - `surf chatgpt --file <path>` now uploads the file through the ChatGPT composer before sending the prompt, with provider-specific upload errors.
+- **Gemini upload menu selector** - Accept Gemini's current `Upload & tools` opener while preserving the legacy upload menu selector.
+- **Screenshot full-page alias** - Treat `surf screenshot --full-page` the same as `--fullpage`, including explicit output paths. (@SeMmyT)
+- **Resize shorthand parsing** - `surf resize 375 812` now maps positional width and height, while `surf resize 375` sets width only. (@SeMmyT)
+- **Grok UI drift** - Updated default model selection for the current Grok menu, broadened send-button validation, and trimmed trailing suggested follow-up chips from extracted responses.
+- **WSL2 native messaging host install** - Install/uninstall now target Windows browser manifests from WSL2 by default, preserve manifest origins, forward wrapper arguments, and include clearer socket diagnostics. (@SeMmyT)
+- **JavaScript expression evaluation** - `surf js` now returns single-expression values while preserving statement-script fallback behavior. (@SeMmyT)
+- **Baseline CI validation** - Restored lint, typecheck, tests, and critical audit checks on current dependencies.
+- **Native messaging host portability** - Generated Unix wrappers now use `#!/usr/bin/env bash` so Chrome can launch the host on NixOS, Guix, and other non-FHS Linux systems. (@ppetru)
+- **Gemini blob-backed generated images** - Detect and extract Gemini-generated `blob:` images from the page while preserving existing `gg-dl` URL downloads. (@goneflyin)
+- **Accessibility tree nested labels** - Include nested text content when naming interactive links, buttons, and summaries so child spans contribute accessible names. (@skyeryg)
+
+### Docs
+- **macOS native host troubleshooting** - Added a focused checklist for Chrome native messaging manifests, extension IDs, service-worker logs, and matching `SURF_SOCKET` values.
+
+### Dependencies
+- Bump Vitest package group from 4.0.18 to 4.1.9 to clear the critical audit advisory.
+- Bump TypeScript from 5.7.2 to 6.0.3.
+
 ## [2.7.2] - 2026-04-10
 
 ### Fixed
-- **ChatGPT login detection** - Accept chunked NextAuth session cookies such as `__Secure-next-auth.session-token.0` during login checks, matching ChatGPT's current cookie layout.
-- **ChatGPT response extraction** - Improved assistant turn detection and completion polling so responses are still captured when ChatGPT's DOM structure shifts or thinking output renders through newer turn containers.
+- **ChatGPT login detection** - Accept chunked NextAuth session cookies such as `__Secure-next-auth.session-token.0` during login checks, matching ChatGPT's current cookie layout. (@mplibunao)
+- **ChatGPT response extraction** - Improved assistant turn detection and completion polling so responses are still captured when ChatGPT's DOM structure shifts or thinking output renders through newer turn containers. (@mplibunao, @Julian194)
 - **ChatGPT model selection** - Updated `surf chatgpt --model` to match the current ChatGPT model menu and select `Instant`, `Thinking`, and `Pro` reliably.
 - **ChatGPT error reporting** - Preserve `/backend-api/me` login check failures instead of downgrading them to a generic `ChatGPT login required` error.
 
@@ -85,7 +124,7 @@
   - Using DOM-based response extraction (articles, conversation containers) instead of relying on body text parsing
   - Tracking response text stability rather than noisy full-page body text
   - Recognizing "Thought for Xs" as a definitive completion signal for thinking models
-  - Fixing false positive "isThinking" detection that matched "Grok 4.1 Thinking" model name
+  - Fixing false positive "isThinking" detection that matched Grok model names
 - **Grok thinking model support** - Long-running thinking queries (1+ minutes) now reliably return complete responses
 
 ## [2.4.1] - 2026-01-22
@@ -120,7 +159,7 @@
 ## [2.3.0] - 2026-01-20
 
 ### Added
-- **Grok AI integration** - Query X.com's Grok AI via `surf grok "query"`. Supports `--with-page` for context, `--deep-search` for DeepSearch mode, and `--model` for model selection (auto, fast, expert, thinking). Requires X.com login in Chrome.
+- **Grok AI integration** - Query X.com's Grok AI via `surf grok "query"`. Supports `--with-page` for context, `--deep-search` for DeepSearch mode, and `--model` for model selection. Requires X.com login in Chrome.
 - **Grok validation command** - `surf grok --validate` checks UI structure and lists available models. Use `--save-models` to persist discovered models to `surf.json` config for when X updates their UI.
 - **Grok response warnings** - Agents receive warnings when model selection fails or differs from requested, with actionable suggestions to run `--validate`.
 - **Grok unit tests** - 17 new tests covering response extraction, cookie validation, and model loading.

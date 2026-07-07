@@ -76,9 +76,20 @@ surf install <extension-id>                    # Chrome (default)
 surf install <extension-id> --browser brave    # Brave
 surf install <extension-id> --browser helium   # Helium
 surf install <extension-id> --browser all      # All supported browsers
+surf install <extension-id> --target linux     # WSLg/Linux browser from WSL2
 ```
 
 Supported: `chrome`, `chromium`, `brave`, `edge`, `arc`, `helium`
+
+**WSL2 with Windows Chrome**
+When you run `surf install <extension-id>` inside WSL2, Surf detects WSL2 and installs a Windows-side native messaging manifest for Windows Chrome/Brave/Edge by default. The generated Windows wrapper launches the WSL2 host with `wsl.exe`, so `surf` commands run inside WSL2 still connect to the WSL socket.
+
+If you use a Linux browser inside WSLg instead, install with:
+```bash
+surf install <extension-id> --target linux
+```
+
+Restart Windows Chrome after installing. If the extension reports `Access to the specified native messaging host is forbidden`, rerun `surf install <extension-id>` from the same WSL distro and confirm the extension ID was copied from `chrome://extensions`.
 
 **Package Manager Installs (Nix, Homebrew, etc.)**
 If surf is installed via a package manager that stores binaries in non-standard locations, set these environment variables before running `surf install`:
@@ -94,6 +105,7 @@ See [Environment Variables](#environment-variables) for details.
 ```bash
 surf uninstall                  # Chrome only
 surf uninstall --all            # All browsers + wrapper files
+surf uninstall --target linux   # Remove WSLg/Linux-browser config from WSL2
 ```
 
 ### Development Setup
@@ -111,6 +123,7 @@ npm run build
 ```bash
 surf <command> [args] [options]
 surf --help                    # Basic help
+surf --llm-context             # Compact reference for AI agents
 surf --help-full               # All 50+ commands
 surf <command> --help          # Command details
 surf --find <query>            # Search commands
@@ -185,7 +198,9 @@ surf click 100 200                  # Click by coordinates
 surf type "hello" --submit          # Type and press Enter
 surf type "email@example.com" --ref e12  # Type into specific element
 surf key Escape                     # Press key
-surf scroll.bottom                  # Scroll to bottom
+surf scroll down 800                # Scroll down 800px
+surf scroll bottom                  # Scroll to bottom
+surf scroll.bottom                  # Dot command form also works
 ```
 
 ### Forms
@@ -221,6 +236,7 @@ surf screenshot --output /tmp/shot.png      # Save to specific path
 surf screenshot --full --output /tmp/hd.png # Full resolution (skip resize)
 surf screenshot --annotate                  # With element labels
 surf screenshot --fullpage                  # Entire page
+surf screenshot --full-page /tmp/full.png   # Entire page, save to path
 surf screenshot --no-save                   # Return base64 + ID only (no file)
 surf snap                                   # Alias for screenshot
 ```
@@ -246,14 +262,18 @@ surf tab.group --name "Work" --color blue
 Keep using your browser while the agent works in a separate window:
 
 ```bash
-# Create isolated window for agent
+# Create a separate window for agent work
 surf window.new "https://example.com"
 # Returns: Window 123456 (tab 789)
 
-# All subsequent commands target that window
+# Target that window or its tab from later commands
 surf click e5 --window-id 123456
-surf read --window-id 123456
+surf read --tab-id 789
 surf tab.new "https://other.com" --window-id 123456
+
+# Name tabs when humans or agents need stable aliases
+surf tab.name dashboard --tab-id 789
+surf tab.switch dashboard
 
 # Or manage windows directly
 surf window.list                    # List all windows
@@ -261,6 +281,19 @@ surf window.list --tabs             # Include tab details
 surf window.focus 123456            # Bring window to front
 surf window.close 123456            # Close window
 ```
+
+`window.new`, `--window-id`, `--tab-id`, and named tabs are Surf's supported coordination tools for parallel workflows. They help agents avoid accidentally driving the same visible tab.
+
+Surf also serializes non-streaming browser CLI requests per socket with a file-based lock, so two agents sharing the same native host wait instead of interleaving browser commands. Use `--no-lock` only when you intentionally want to bypass the guard for a command.
+
+For hard isolation, run separate browser instances/profiles with separate Surf native hosts and socket paths, then point each shell at the matching socket. Each socket has its own independent lock:
+
+```bash
+SURF_SOCKET=/tmp/surf-agent-a.sock surf tab.list
+SURF_SOCKET=/tmp/surf-agent-b.sock surf tab.list
+```
+
+Surf does not yet provide `session.new`, session IDs, or independent per-agent CDP sessions.
 
 ### Device Emulation
 
@@ -282,6 +315,39 @@ surf emulate.touch --enabled false            # Disable touch
 ```
 
 Available devices: iPhone 12-14 (Pro/Max), iPhone SE, iPad (Pro/Mini), Pixel 5-7 (Pro), Galaxy S21-S23, Galaxy Tab S7, Nest Hub (Max).
+
+### Animation Recording
+
+Capture a screenshot burst and assemble it into an animated GIF with ImageMagick:
+
+```bash
+surf record --duration 2000 --fps 10 --output /tmp/anim.gif
+surf record --trigger "click:#btn" --output /tmp/click.gif
+surf record --rect 0,200,1440,800 --output /tmp/region.gif
+```
+
+`record` defaults to 2000ms at 10fps and writes to `/tmp/surf-record-*.gif` when no output is provided. `--duration` is capped at 10000ms and `--fps` is capped at 30. `--trigger` supports `click:<selector>`, `scroll:up|down|left|right|top|bottom`, and `scroll:<selector>` to scroll a container to the bottom before capture. `--rect` crops the GIF using `x,y,width,height`. ImageMagick must be available as `magick` or `convert`.
+
+### Animation Audit
+
+Sample matching elements over time and return a bounded JSON timeline for agent inspection:
+
+```bash
+surf animate-audit --selector ".thing" --duration 2000 --fps 10
+```
+
+The command captures rect, opacity, transform, visibility, display, and a short text snippet for up to 25 matching elements per sample. `--selector` is required. `--duration` defaults to 2000ms and is capped at 10000ms; `--fps` defaults to 10 and is capped at 30. This command returns JSON only and does not record GIF/video output.
+
+### Performance Audit
+
+Capture layout shift, long animation frame, event timing, long task, and paint entries during a short window:
+
+```bash
+surf perf-audit --duration 3000 --trigger "click:.cta" --output /tmp/perf.json
+surf perf-audit --duration 1000 --json
+```
+
+`perf-audit` defaults to 3000ms and is capped at 10000ms. `--trigger` supports the same `click:<selector>` and `scroll:<target>` forms as `record`. `--output` writes the JSON snapshot to disk.
 
 ### Performance Tracing
 
@@ -324,7 +390,7 @@ surf grok "what are the latest AI agent trends on X"          # Search X posts
 surf grok "analyze @username recent activity"                 # Profile analysis
 surf grok "summarize this page" --with-page                   # Include page context
 surf grok "find viral AI posts" --deep-search                 # DeepSearch mode
-surf grok "quick question" --model fast                       # Models: auto, fast, expert, thinking
+surf grok "quick question" --model fast                       # Models: auto, fast, expert, grok-4.20-beta
 surf grok --validate                                          # Check UI and available models
 surf grok --validate --save-models                            # Save discovered models to settings
 
@@ -342,7 +408,7 @@ surf aistudio.build "game" --keep-open --timeout 600          # Keep tab open, 1
 
 Each AI tool uses your existing browser login - no API keys needed. Just be logged into the respective service in Chrome (chatgpt.com, gemini.google.com, perplexity.ai, x.com, or aistudio.google.com).
 
-**Grok troubleshooting:** If queries fail, run `surf grok --validate` to check if the UI structure changed. Use `--save-models` to update the model cache in `surf.json`. Default model is "thinking" (Grok 4.1 Thinking).
+**Grok troubleshooting:** If queries fail, run `surf grok --validate` to check if the UI structure changed. Use `--save-models` to update the model cache in `surf.json`. Default model is `fast`.
 
 ### Waiting
 
@@ -357,8 +423,11 @@ surf wait.url "/dashboard"          # Wait for URL pattern
 
 ```bash
 surf js "return document.title"     # Execute JavaScript
+surf record --duration 2000 --fps 10 --output /tmp/anim.gif      # Animated GIF capture
+surf animate-audit --selector ".thing" --duration 2000 --fps 10  # JSON animation timeline
+surf perf-audit --duration 3000 --output /tmp/perf.json           # PerformanceObserver snapshot
 surf search "login"                 # Find text in page
-surf cookie.list                    # List cookies
+surf cookie list                    # List cookies
 surf zoom 1.5                       # Set zoom to 150%
 surf console                        # Read console messages
 surf network                        # Read network requests
@@ -529,6 +598,7 @@ surf workflow.validate ./my-workflow.json
 --window-id <id>   # Target specific window (isolate agent from your browsing)
 --json             # Output raw JSON
 --soft-fail        # Warn instead of error (exit 0) on restricted pages
+--no-lock          # Bypass the per-socket browser request lock
 --no-screenshot    # Skip auto-screenshot after actions
 --full             # Full resolution screenshots (skip resize)
 --network-path <path>  # Custom path for network logs (default: /tmp/surf, or SURF_NETWORK_PATH env)
@@ -538,12 +608,14 @@ surf workflow.validate ./my-workflow.json
 
 ```bash
 SURF_NETWORK_PATH         # Path for network capture logs (default: /tmp/surf)
+SURF_SOCKET               # Socket path or named pipe (default: /tmp/surf.sock, Windows: //./pipe/surf)
 SURF_NODE_PATH            # Path to node binary (for native host wrapper)
 SURF_HOST_PATH            # Path to native/host.cjs (for native host wrapper)
 SURF_EXTENSION_PATH       # Path to extension dist/ directory
 ```
 
 **Use cases:**
+- `SURF_SOCKET`: Advanced socket override. Set it for both the native host and CLI if you need a non-default socket, including separate sockets for separate browser/profile instances in hard-isolated multi-agent workflows. Each socket gets an independent request lock.
 - `SURF_NODE_PATH` / `SURF_HOST_PATH`: Package manager installs (e.g., Nix) that store binaries in non-standard locations
 - `SURF_EXTENSION_PATH`: Package managers that create stable symlinks instead of changing paths on reinstall
 
@@ -554,9 +626,38 @@ export SURF_HOST_PATH=~/.local/share/surf-cli/native/host.cjs
 export SURF_EXTENSION_PATH=~/.local/share/surf-cli/extension
 ```
 
+## Troubleshooting native host connections
+
+If a command fails with `Socket connect failed`, start with:
+
+```bash
+surf doctor
+surf doctor --browser all
+surf doctor --json
+```
+
+`doctor` does not require a working browser connection. It checks the socket path, native messaging manifest, manifest `allowed_origins`, and wrapper path, then prints targeted next steps.
+
+Read the `Attempted socket:` line first. The CLI and native host must agree on the same socket path. By default this is `/tmp/surf.sock` on macOS/Linux/WSL2 and `//./pipe/surf` on Windows.
+
+Common fixes:
+- Restart the browser after `surf install <extension-id>`.
+- Confirm the Surf extension is enabled and the extension ID matches the one passed to `surf install`.
+- On WSL2 with Windows Chrome, run `surf install <extension-id>` from WSL2 and restart Windows Chrome. Use `--target linux` only for a Linux browser running inside WSLg.
+- If `SURF_SOCKET` is set, set the same value for both the browser-launched native host and the shell running `surf`.
+
+macOS checklist:
+- Confirm Chrome has a native messaging manifest at `~/Library/Application Support/Google/Chrome/NativeMessagingHosts/surf.browser.host.json`.
+- Confirm the manifest `allowed_origins` entry uses the same extension ID shown on `chrome://extensions` for the Surf extension.
+- Reinstall the manifest with `surf install <extension-id>` after copying a fresh extension build or if the extension ID changed.
+- Fully restart Chrome, then reload the Surf extension on `chrome://extensions`.
+- Open the extension service worker from `chrome://extensions` and check its console for native messaging or socket errors.
+- If `SURF_SOCKET` is set in your shell, make sure Chrome launches the native host with the same value; otherwise both sides should use `/tmp/surf.sock`.
+- Run a simple CLI command such as `surf tab.list`; if it fails, compare its `Attempted socket:` line with the socket expected by the native host.
+
 ## Socket API
 
-For programmatic integration, send JSON to `/tmp/surf.sock`:
+For programmatic integration, send JSON to `/tmp/surf.sock` by default, or to `SURF_SOCKET` when set:
 
 ```bash
 echo '{"type":"tool_request","method":"execute_tool","params":{"tool":"tab.list","args":{}},"id":"1"}' | nc -U /tmp/surf.sock
@@ -614,7 +715,7 @@ echo '{"type":"tool_request","method":"execute_tool","params":{"tool":"tab.list"
 | `element.*` | `styles` |
 | `frame.*` | `list`, `switch`, `main`, `js` |
 | `wait.*` | `element`, `network`, `url`, `dom`, `load` |
-| `cookie.*` | `list`, `get`, `set`, `clear` |
+| `cookie` / `cookie.*` | `list`, `get`, `set`, `clear`, `delete` |
 | `bookmark.*` | `add`, `remove`, `list` |
 | `history.*` | `list`, `search` |
 | `dialog.*` | `accept`, `dismiss`, `info` |

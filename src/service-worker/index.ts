@@ -35,6 +35,144 @@ function getScreenshot(id: string): { base64: string; width: number; height: num
   return screenshotCache.get(id) || null;
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+const providerUploadStrategies = {
+  gemini: {
+    openerSelector: 'button[aria-label="Upload & tools"], button[aria-label="Open upload file menu"]',
+    closeSelector: 'button[aria-label="Close upload file menu"]',
+    uploadItemSelector: '[data-test-id="local-images-files-uploader-button"], [data-testid="local-images-files-uploader-button"], button[aria-label^="Upload files"]',
+  },
+  chatgpt: {
+    directInputSelector: 'form input[type="file"]:not([accept*="image"]), input[type="file"]:not([accept*="image"]), input[type="file"]',
+    openerSelector: 'button[data-testid="composer-plus-btn"], button[aria-label="Add files and more"]',
+  },
+};
+
+async function setFileInputFilesBySelector(
+  tabId: number,
+  filePaths: string[],
+  selector: string,
+): Promise<boolean> {
+  const result = await cdp.sendCommand(tabId, "Runtime.evaluate", {
+    expression: `(() => {
+      const input = document.querySelector(${JSON.stringify(selector)});
+      if (!input || input.tagName !== 'INPUT' || input.type !== 'file') return null;
+      return input;
+    })()`,
+    userGesture: true,
+  });
+  const objectId = result?.result?.objectId;
+  if (!objectId) return false;
+  await cdp.sendCommand(tabId, "DOM.setFileInputFiles", { files: filePaths, objectId });
+  return true;
+}
+
+async function uploadFilesWithChooser(
+  tabId: number,
+  filePaths: string[],
+  provider: "gemini" | "chatgpt",
+): Promise<void> {
+  await cdp.sendCommand(tabId, "Page.setInterceptFileChooserDialog", { enabled: true });
+
+  let timeoutId: ReturnType<typeof setTimeout> | null = null;
+  let handler: ((source: chrome.debugger.Debuggee, method: string, params: any) => void) | null = null;
+  const cleanup = () => {
+    if (timeoutId) { clearTimeout(timeoutId); timeoutId = null; }
+    if (handler) { chrome.debugger.onEvent.removeListener(handler); handler = null; }
+  };
+
+  const attemptFileChooser = (attemptNum: number, timeoutMs: number): Promise<void> => {
+    return new Promise<void>((resolve, reject) => {
+      timeoutId = setTimeout(() => {
+        cleanup();
+        reject(new Error(`${provider} file chooser did not open within ${timeoutMs / 1000}s (attempt ${attemptNum})`));
+      }, timeoutMs);
+      handler = (source: chrome.debugger.Debuggee, method: string, params: any) => {
+        if (source.tabId === tabId && method === "Page.fileChooserOpened") {
+          cleanup();
+          cdp.sendCommand(tabId, "DOM.setFileInputFiles", {
+            files: filePaths,
+            backendNodeId: params.backendNodeId,
+          }).then(() => resolve()).catch(reject);
+        }
+      };
+      chrome.debugger.onEvent.addListener(handler);
+    });
+  };
+
+  const clickUploadSequence = async () => {
+    if (provider === "gemini") {
+      await cdp.sendCommand(tabId, "Runtime.evaluate", {
+        expression: `document.querySelector(${JSON.stringify(providerUploadStrategies.gemini.closeSelector)})?.click()`,
+        userGesture: true,
+      });
+      await sleep(300);
+      await cdp.sendCommand(tabId, "Runtime.evaluate", {
+        expression: `document.querySelector(${JSON.stringify(providerUploadStrategies.gemini.openerSelector)})?.click()`,
+        userGesture: true,
+      });
+      await sleep(500);
+      await cdp.sendCommand(tabId, "Runtime.evaluate", {
+        expression: `document.querySelector(${JSON.stringify(providerUploadStrategies.gemini.uploadItemSelector)})?.click()`,
+        userGesture: true,
+      });
+      return;
+    }
+
+    await cdp.sendCommand(tabId, "Runtime.evaluate", {
+      expression: `document.querySelector(${JSON.stringify(providerUploadStrategies.chatgpt.openerSelector)})?.click()`,
+      userGesture: true,
+    });
+  };
+
+  const maxAttempts = 3;
+  const timeouts = [10000, 15000, 20000];
+  let lastError: Error | null = null;
+
+  try {
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        const fileSetPromise = attemptFileChooser(attempt, timeouts[attempt - 1]);
+        await clickUploadSequence();
+        await fileSetPromise;
+        return;
+      } catch (err) {
+        lastError = err as Error;
+        cleanup();
+        if (attempt < maxAttempts) await sleep(1000);
+      }
+    }
+    throw new Error(`${provider} file upload failed after ${maxAttempts} attempts: ${lastError?.message}`);
+  } finally {
+    cleanup();
+    try { await cdp.sendCommand(tabId, "Page.setInterceptFileChooserDialog", { enabled: false }); } catch {}
+  }
+}
+
+async function uploadFilesToProviderTab(
+  provider: "gemini" | "chatgpt",
+  tabId: number,
+  filePaths: string[],
+): Promise<{ success: true }> {
+  await cdp.attach(tabId);
+  await cdp.sendCommand(tabId, "DOM.enable", {});
+
+  if (provider === "chatgpt") {
+    const directUpload = await setFileInputFilesBySelector(
+      tabId,
+      filePaths,
+      providerUploadStrategies.chatgpt.directInputSelector,
+    );
+    if (directUpload) return { success: true };
+  }
+
+  await uploadFilesWithChooser(tabId, filePaths, provider);
+  return { success: true };
+}
+
 const ELEMENT_COLORS: Record<string, string> = {
   button: '#FF6B6B',
   input: '#4ECDC4',
@@ -131,6 +269,19 @@ function base64ToBlob(base64: string, mimeType = "image/png"): Blob {
     bytes[i] = binary.charCodeAt(i);
   }
   return new Blob([bytes], { type: mimeType });
+}
+
+function codeWithExpressionReturn(code: string): string {
+  return `return (\n${code}\n);`;
+}
+
+function scriptParses(code: string): boolean {
+  try {
+    new Function(code);
+    return true;
+  } catch (err) {
+    return !(err instanceof SyntaxError);
+  }
 }
 
 async function captureFullPage(tabId: number, maxHeight: number): Promise<{ base64: string; width: number; height: number }> {
@@ -235,7 +386,7 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 async function waitForRuntimeReady(tabId: number, timeoutMs = 10000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   const delay = (ms: number) => new Promise(r => setTimeout(r, ms));
-
+  
   // Poll until we can successfully evaluate JS
   while (Date.now() < deadline) {
     try {
@@ -250,110 +401,9 @@ async function waitForRuntimeReady(tabId: number, timeoutMs = 10000): Promise<vo
     }
     await delay(200);
   }
-
+  
   // Timeout but proceed anyway - the page might still work
   console.warn(`waitForRuntimeReady timed out for tab ${tabId}`);
-}
-
-/**
- * Open a URL in a NEW TAB of the user's current/focused window, then
- * MINIMIZE the window so the user's focus is not stolen.
- *
- * Replaces the previous `chrome.windows.create({...})` pattern that opened
- * a new browser window per AI query. The user explicitly does not want new
- * windows — they want all surf-managed tabs to live in the same window they
- * are already browsing in, AND they do not want the window to steal focus
- * from another app they are working in.
- *
- * Falls back to the active tab's window if getLastFocused fails. If we
- * truly cannot find any window, we open a minimal new one as a last resort
- * (this should never happen in a real browser session).
- *
- * @param {string} url - The URL to open
- * @param {number} [loadTimeoutMs=30000] - How long to wait for the tab to load
- * @returns {Promise<number>} The new tab's id
- */
-async function openInCurrentWindow(url: string, loadTimeoutMs: number = 30000): Promise<number> {
-  // Find the window the user is currently in. Prefer last-focused (most
-  // natural), fall back to the active tab's window, then any normal window.
-  let windowId: number | undefined;
-  try {
-    const lastFocused = await chrome.windows.getLastFocused();
-    windowId = lastFocused?.id;
-  } catch {
-    // Some browsers can fail this; try via the active tab
-  }
-  if (windowId === undefined) {
-    try {
-      const [activeTab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
-      windowId = activeTab?.windowId;
-    } catch {}
-  }
-  // Fallback 3: any normal window (minimized or not) — avoids creating a new
-  // window when getLastFocused fails because every existing window is minimized.
-  if (windowId === undefined) {
-    try {
-      const allWindows = await chrome.windows.getAll({ windowTypes: ["normal"] });
-      const normalWin = allWindows.find((w) => w.type === "normal" && w.id !== undefined);
-      windowId = normalWin?.id;
-    } catch {}
-  }
-  // Fallback 4: any tab at all (last resort before creating a window)
-  if (windowId === undefined) {
-    try {
-      const allTabs = await chrome.tabs.query({});
-      windowId = allTabs[0]?.windowId;
-    } catch {}
-  }
-
-  // Last resort: open a tiny new window so we still return a tab id
-  if (windowId === undefined) {
-    const win = await chrome.windows.create({ focused: false, state: "minimized", type: "normal" });
-    if (!win?.id) throw new Error("Failed to create window for surf tab");
-    return (await chrome.tabs.query({ windowId: win.id }))[0]?.id ?? -1;
-  }
-
-  // Open the URL in a new tab of that window. Keep it inactive so the user's
-  // current focus is not stolen.
-  const tab = await chrome.tabs.create({ url, windowId, active: false });
-  if (!tab?.id) throw new Error("Failed to create tab in current window");
-
-  // Minimize the window so the user's focus is not stolen — they may be
-  // working in another app. Only minimize if it isn't already minimized,
-  // and only if no tab in the window is currently playing audio (don't
-  // disrupt media). Also skip if the user is already looking at this window
-  // and the new tab is the only active one — though with active:false that
-  // can't happen.
-  try {
-    const win = await chrome.windows.get(windowId);
-    if (win && win.state !== "minimized" && !win.focused) {
-      // Only minimize if the window isn't currently focused (don't yank
-      // the user's eyes if they were just looking at Edge).
-      await chrome.windows.update(windowId, { state: "minimized" });
-    }
-  } catch {
-    // Non-fatal: if we can't minimize, the tab is still created.
-  }
-
-  // Wait for the tab to finish loading. This works while the window is
-  // minimized — the page loads in the background.
-  if (tab.status !== "complete") {
-    await new Promise<void>((resolve) => {
-      const listener = (tabId: number, info: chrome.tabs.OnUpdatedInfo) => {
-        if (tabId === tab.id && info.status === "complete") {
-          chrome.tabs.onUpdated.removeListener(listener);
-          resolve();
-        }
-      };
-      chrome.tabs.onUpdated.addListener(listener);
-      setTimeout(() => {
-        chrome.tabs.onUpdated.removeListener(listener);
-        resolve();
-      }, loadTimeoutMs);
-    });
-  }
-
-  return tab.id;
 }
 
 // Helper for locate.* commands with actions
@@ -840,6 +890,8 @@ export async function handleMessage(
         return { 
           scrollX: after.x, 
           scrollY: after.y,
+          pageHeight: document.documentElement.scrollHeight,
+          viewportHeight: window.innerHeight,
           scrolled: before.x !== after.x || before.y !== after.y
         };
       };
@@ -1873,11 +1925,15 @@ export async function handleMessage(
         const piHelpersCode = `if(!window.piHelpers){const piHelpers={wait(ms){return new Promise(r=>setTimeout(r,ms))},async waitForSelector(sel,opts={}){const{state='visible',timeout=20000}=opts;const isVis=el=>el&&getComputedStyle(el).display!=='none'&&getComputedStyle(el).visibility!=='hidden'&&getComputedStyle(el).opacity!=='0'&&el.offsetWidth>0&&el.offsetHeight>0;const chk=()=>{const el=document.querySelector(sel);switch(state){case'attached':return el;case'detached':return el?null:document.body;case'hidden':return(!el||!isVis(el))?(el||document.body):null;default:return isVis(el)?el:null}};return new Promise((res,rej)=>{const r=chk();if(r){res(state==='detached'||state==='hidden'?null:r);return}const obs=new MutationObserver(()=>{const r=chk();if(r){obs.disconnect();clearTimeout(tid);res(state==='detached'||state==='hidden'?null:r)}});const tid=setTimeout(()=>{obs.disconnect();rej(new Error('Timeout'))},timeout);obs.observe(document.documentElement,{childList:true,subtree:true,attributes:true,attributeFilter:['style','class','hidden']})})},async waitForText(text,opts={}){const{selector,timeout=20000}=opts;const chk=()=>{const root=selector?document.querySelector(selector):document.body;if(!root)return null;const w=document.createTreeWalker(root,NodeFilter.SHOW_TEXT);while(w.nextNode())if(w.currentNode.textContent?.includes(text))return w.currentNode.parentElement;return null};return new Promise((res,rej)=>{const r=chk();if(r){res(r);return}const obs=new MutationObserver(()=>{const r=chk();if(r){obs.disconnect();clearTimeout(tid);res(r)}});const tid=setTimeout(()=>{obs.disconnect();rej(new Error('Timeout'))},timeout);obs.observe(document.documentElement,{childList:true,subtree:true,characterData:true})})},async waitForHidden(sel,t=20000){await piHelpers.waitForSelector(sel,{state:'hidden',timeout:t})},getByRole(role,opts={}){const{name}=opts;const roles={button:['button','input[type=button]','input[type=submit]','input[type=reset]'],link:['a[href]'],textbox:['input:not([type])','input[type=text]','input[type=email]','input[type=password]','textarea'],checkbox:['input[type=checkbox]'],radio:['input[type=radio]'],combobox:['select'],heading:['h1','h2','h3','h4','h5','h6']};const cands=[...document.querySelectorAll('[role='+role+']')];if(roles[role])roles[role].forEach(s=>cands.push(...document.querySelectorAll(s+':not([role])')));if(!name)return cands[0]||null;const n=name.toLowerCase().trim();for(const el of cands){const l=el.getAttribute('aria-label')?.toLowerCase().trim();const t=el.textContent?.toLowerCase().trim();if(l===n||t===n||l?.includes(n)||t?.includes(n))return el}return null}};window.__piHelpers=piHelpers;window.piHelpers=piHelpers}`;
         await cdp.evaluateScript(tabId, piHelpersCode);
         
-        const escaped = message.code.replace(/`/g, "\\`").replace(/\$/g, "\\$");
-        const expression = `(async () => { 'use strict'; ${escaped} })()`;
+        const body = codeWithExpressionReturn(message.code);
+        const expression = `(async () => { 'use strict'; ${body} })()`;
         
-        const result = await cdp.evaluateScript(tabId, expression);
+        let result = await cdp.evaluateScript(tabId, expression);
         
+        if (result.exceptionDetails && !scriptParses(body)) {
+          result = await cdp.evaluateScript(tabId, `(async () => { 'use strict'; ${message.code} })()`);
+        }
+
         if (result.exceptionDetails) {
           const err = result.exceptionDetails.exception?.description || 
                       result.exceptionDetails.text || 
@@ -1892,6 +1948,311 @@ export async function handleMessage(
         const msg = err instanceof Error ? err.message : "Script execution failed";
         if (msg.includes("Cannot access") || msg.includes("Cannot attach")) {
           return { error: "Cannot execute JavaScript on this page (restricted URL)" };
+        }
+        return { error: msg };
+      }
+    }
+
+    case "ANIMATE_AUDIT": {
+      if (!tabId) throw new Error("No tabId provided");
+      if (!message.selector || typeof message.selector !== "string") throw new Error("selector required");
+
+      if (typeof message.durationMs === "boolean") throw new Error("duration must be a number");
+      if (typeof message.fps === "boolean") throw new Error("fps must be a number");
+      const durationMs = message.durationMs !== undefined ? Number(message.durationMs) : 2000;
+      const fps = message.fps !== undefined ? Number(message.fps) : 10;
+      if (!Number.isFinite(durationMs) || durationMs < 100 || durationMs > 10000) {
+        throw new Error("duration must be between 100 and 10000 ms");
+      }
+      if (!Number.isFinite(fps) || fps < 1 || fps > 30) {
+        throw new Error("fps must be between 1 and 30");
+      }
+
+      try {
+        const expression = `(async () => {
+          const selector = ${JSON.stringify(message.selector)};
+          const durationMs = ${Math.round(durationMs)};
+          const fps = ${Math.round(fps)};
+          const intervalMs = Math.max(1, Math.round(1000 / fps));
+          const maxElements = 25;
+          const maxSamples = Math.min(Math.floor(durationMs / intervalMs) + 1, 301);
+          const startedAt = Date.now();
+          const start = performance.now();
+          const samples = [];
+          const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+          const sample = () => {
+            const now = performance.now();
+            const elements = Array.from(document.querySelectorAll(selector)).slice(0, maxElements).map((el, index) => {
+              const rect = el.getBoundingClientRect();
+              const style = getComputedStyle(el);
+              const text = (el.textContent || "").replace(/\\s+/g, " ").trim().slice(0, 120);
+              return {
+                selector,
+                index,
+                rect: {
+                  x: Math.round(rect.x * 100) / 100,
+                  y: Math.round(rect.y * 100) / 100,
+                  width: Math.round(rect.width * 100) / 100,
+                  height: Math.round(rect.height * 100) / 100,
+                  top: Math.round(rect.top * 100) / 100,
+                  right: Math.round(rect.right * 100) / 100,
+                  bottom: Math.round(rect.bottom * 100) / 100,
+                  left: Math.round(rect.left * 100) / 100,
+                },
+                opacity: style.opacity,
+                transform: style.transform,
+                visibility: style.visibility,
+                display: style.display,
+                text,
+              };
+            });
+            samples.push({ t: Math.round((now - start) * 100) / 100, timestamp: Date.now(), elements });
+          };
+
+          for (let i = 0; i < maxSamples; i++) {
+            sample();
+            const elapsed = performance.now() - start;
+            if (elapsed >= durationMs || i === maxSamples - 1) break;
+            await wait(Math.max(0, Math.min(intervalMs, durationMs - elapsed)));
+          }
+
+          return {
+            selector,
+            durationMs,
+            fps,
+            intervalMs,
+            maxElementsPerSample: maxElements,
+            startedAt,
+            endedAt: Date.now(),
+            sampleCount: samples.length,
+            samples,
+          };
+        })()`;
+
+        const result = await cdp.evaluateScript(tabId, expression);
+        if (result.exceptionDetails) {
+          const err = result.exceptionDetails.exception?.description ||
+            result.exceptionDetails.text ||
+            "Animation audit failed";
+          return { error: err };
+        }
+        return result.result?.value ?? { error: "Animation audit returned no data" };
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : "Animation audit failed";
+        if (msg.includes("Cannot access") || msg.includes("Cannot attach")) {
+          return { error: "Cannot execute animation audit on this page (restricted URL)" };
+        }
+        return { error: msg };
+      }
+    }
+
+    case "PERF_AUDIT": {
+      if (!tabId) throw new Error("No tabId provided");
+      if (typeof message.durationMs === "boolean") throw new Error("duration must be a number");
+      if (message.trigger !== undefined && typeof message.trigger !== "string") {
+        throw new Error("trigger must be action:target");
+      }
+      const durationMs = message.durationMs !== undefined ? Number(message.durationMs) : 3000;
+      if (!Number.isFinite(durationMs) || durationMs < 100 || durationMs > 10000) {
+        throw new Error("duration must be between 100 and 10000 ms");
+      }
+
+      try {
+        const expression = `(async () => {
+          const durationMs = ${Math.round(durationMs)};
+          const trigger = ${JSON.stringify(message.trigger || null)};
+          const startedAt = Date.now();
+          const startedAtPerformance = performance.now();
+          const supportedEntryTypes = typeof PerformanceObserver !== "undefined" && Array.isArray(PerformanceObserver.supportedEntryTypes) ? PerformanceObserver.supportedEntryTypes : [];
+          const requestedTypes = ["layout-shift", "long-animation-frame", "event", "longtask", "paint"];
+          const observedEntryTypes = [];
+          const entries = {
+            layoutShifts: [],
+            longAnimationFrames: [],
+            events: [],
+            longTasks: [],
+            paints: [],
+          };
+          const round = (value) => Math.round(value * 100) / 100;
+          const auditEndsAtPerformance = startedAtPerformance + durationMs;
+          const inAuditWindow = (entry) => entry.startTime >= startedAtPerformance && entry.startTime <= auditEndsAtPerformance;
+          const nodeSummary = (node) => {
+            if (!node || node.nodeType !== Node.ELEMENT_NODE) return null;
+            const el = node;
+            return {
+              tag: el.tagName?.toLowerCase(),
+              id: el.id || undefined,
+              className: typeof el.className === "string" ? el.className.slice(0, 120) : undefined,
+            };
+          };
+          const rectSummary = (rect) => rect ? {
+            x: round(rect.x),
+            y: round(rect.y),
+            width: round(rect.width),
+            height: round(rect.height),
+            top: round(rect.top),
+            right: round(rect.right),
+            bottom: round(rect.bottom),
+            left: round(rect.left),
+          } : null;
+          const pushEntry = (entry) => {
+            if (!inAuditWindow(entry)) return;
+            if (entry.entryType === "layout-shift") {
+              entries.layoutShifts.push({
+                name: entry.name,
+                startTime: round(entry.startTime),
+                duration: round(entry.duration || 0),
+                value: round(entry.value || 0),
+                hadRecentInput: Boolean(entry.hadRecentInput),
+                sources: Array.from(entry.sources || []).slice(0, 10).map((source) => ({
+                  node: nodeSummary(source.node),
+                  previousRect: rectSummary(source.previousRect),
+                  currentRect: rectSummary(source.currentRect),
+                })),
+              });
+              return;
+            }
+            if (entry.entryType === "long-animation-frame") {
+              entries.longAnimationFrames.push({
+                name: entry.name,
+                startTime: round(entry.startTime),
+                duration: round(entry.duration || 0),
+                renderStart: round(entry.renderStart || 0),
+                styleAndLayoutStart: round(entry.styleAndLayoutStart || 0),
+                blockingDuration: round(entry.blockingDuration || 0),
+                firstUIEventTimestamp: round(entry.firstUIEventTimestamp || 0),
+                scripts: Array.from(entry.scripts || []).slice(0, 10).map((script) => ({
+                  name: script.name,
+                  sourceURL: script.sourceURL,
+                  sourceFunctionName: script.sourceFunctionName,
+                  duration: round(script.duration || 0),
+                  invoker: script.invoker,
+                  invokerType: script.invokerType,
+                })),
+              });
+              return;
+            }
+            if (entry.entryType === "event") {
+              entries.events.push({
+                name: entry.name,
+                startTime: round(entry.startTime),
+                duration: round(entry.duration || 0),
+                processingStart: round(entry.processingStart || 0),
+                processingEnd: round(entry.processingEnd || 0),
+                interactionId: entry.interactionId || 0,
+                cancelable: Boolean(entry.cancelable),
+              });
+              return;
+            }
+            if (entry.entryType === "longtask") {
+              entries.longTasks.push({
+                name: entry.name,
+                startTime: round(entry.startTime),
+                duration: round(entry.duration || 0),
+              });
+              return;
+            }
+            if (entry.entryType === "paint") {
+              entries.paints.push({
+                name: entry.name,
+                startTime: round(entry.startTime),
+                duration: round(entry.duration || 0),
+              });
+            }
+          };
+          const observers = [];
+          for (const type of requestedTypes) {
+            if (!supportedEntryTypes.includes(type)) continue;
+            try {
+              const observer = new PerformanceObserver((list) => {
+                for (const entry of list.getEntries()) pushEntry(entry);
+              });
+              const options = type === "event"
+                ? { type, buffered: true, durationThreshold: 16 }
+                : { type, buffered: true };
+              observer.observe(options);
+              observers.push(observer);
+              observedEntryTypes.push(type);
+            } catch {}
+          }
+          const fireTrigger = () => {
+            if (!trigger) return null;
+            const separator = trigger.indexOf(":");
+            if (separator === -1) throw new Error("trigger must be action:target");
+            const action = trigger.slice(0, separator).trim();
+            const target = trigger.slice(separator + 1).trim();
+            if (!action || !target) throw new Error("trigger must be action:target");
+            if (action === "click") {
+              const el = document.querySelector(target);
+              if (!el) return { action, selector: target, fired: false };
+              el.click();
+              return { action, selector: target, fired: true };
+            }
+            if (action === "scroll") {
+              if (["up", "down", "left", "right"].includes(target)) {
+                const deltas = { up: [0, -500], down: [0, 500], left: [-500, 0], right: [500, 0] };
+                const [left, top] = deltas[target];
+                window.scrollBy({ left, top, behavior: "instant" });
+                return { action, target, fired: true };
+              }
+              if (target === "top" || target === "bottom") {
+                window.scrollTo({ top: target === "top" ? 0 : document.documentElement.scrollHeight, behavior: "instant" });
+                return { action, target, fired: true };
+              }
+              const el = document.querySelector(target);
+              if (!el) return { action, selector: target, fired: false };
+              el.scrollTop = el.scrollHeight;
+              el.dispatchEvent(new Event("scroll", { bubbles: true }));
+              return { action, selector: target, fired: true };
+            }
+            throw new Error("trigger action must be click or scroll");
+          };
+          const triggerResult = fireTrigger();
+          await new Promise((resolve) => setTimeout(resolve, durationMs));
+          for (const observer of observers) observer.disconnect();
+          const cls = entries.layoutShifts
+            .filter((entry) => !entry.hadRecentInput)
+            .reduce((sum, entry) => sum + entry.value, 0);
+          const maxDuration = (items) => items.reduce((max, entry) => Math.max(max, entry.duration || 0), 0);
+          const longTaskTotalDuration = entries.longTasks.reduce((sum, entry) => sum + (entry.duration || 0), 0);
+
+          return {
+            durationMs,
+            startedAt,
+            endedAt: Date.now(),
+            elapsedMs: round(performance.now() - startedAtPerformance),
+            supportedEntryTypes,
+            observedEntryTypes,
+            trigger: triggerResult,
+            summary: {
+              cumulativeLayoutShift: round(cls),
+              maxEventDuration: round(maxDuration(entries.events)),
+              maxLongAnimationFrame: round(maxDuration(entries.longAnimationFrames)),
+              longTaskTotalDuration: round(longTaskTotalDuration),
+              counts: {
+                layoutShifts: entries.layoutShifts.length,
+                longAnimationFrames: entries.longAnimationFrames.length,
+                events: entries.events.length,
+                longTasks: entries.longTasks.length,
+                paints: entries.paints.length,
+              },
+            },
+            entries,
+          };
+        })()`;
+
+        const result = await cdp.evaluateScript(tabId, expression);
+        if (result.exceptionDetails) {
+          const err = result.exceptionDetails.exception?.description ||
+            result.exceptionDetails.text ||
+            "Performance audit failed";
+          return { error: err };
+        }
+        return result.result?.value ?? { error: "Performance audit returned no data" };
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : "Performance audit failed";
+        if (msg.includes("Cannot access") || msg.includes("Cannot attach")) {
+          return { error: "Cannot execute performance audit on this page (restricted URL)" };
         }
         return { error: msg };
       }
@@ -2147,17 +2508,29 @@ export async function handleMessage(
 
     case "RESIZE_WINDOW": {
       if (!tabId) throw new Error("No tabId provided");
-      if (!message.width || !message.height) throw new Error("width and height required");
+      if (message.width === undefined && message.height === undefined) {
+        throw new Error("width or height required");
+      }
 
       const tab = await chrome.tabs.get(tabId);
       if (!tab.windowId) throw new Error("Tab has no window");
 
+      const currentWindow =
+        message.width === undefined || message.height === undefined
+          ? await chrome.windows.get(tab.windowId)
+          : null;
+      const width = message.width === undefined ? currentWindow?.width : message.width;
+      const height = message.height === undefined ? currentWindow?.height : message.height;
+      if (width === undefined || height === undefined) {
+        throw new Error("current window size unavailable");
+      }
+
       await chrome.windows.update(tab.windowId, {
-        width: Math.floor(message.width),
-        height: Math.floor(message.height),
+        width: Math.floor(width),
+        height: Math.floor(height),
       });
 
-      return { success: true, width: message.width, height: message.height };
+      return { success: true, width, height };
     }
 
     case "TABS_CREATE": {
@@ -2253,8 +2626,7 @@ export async function handleMessage(
     case "SWITCH_TAB": {
       const targetTabId = message.tabId;
       if (!targetTabId) throw new Error("No tabId provided");
-      const tab = await chrome.tabs.update(targetTabId, { active: true });
-      if (!tab) throw new Error("Tab not found");
+      const tab = (await chrome.tabs.update(targetTabId, { active: true })) as chrome.tabs.Tab;
       if (tab.windowId) {
         await chrome.windows.update(tab.windowId, { focused: true });
       }
@@ -2443,49 +2815,47 @@ export async function handleMessage(
     }
 
     case "TAB_GROUP_CREATE": {
-      const tabIdsRaw: number[] = [...(message.tabIds || [])] as number[];
+      const tabIds: number[] = [...(message.tabIds || [])];
       const name = message.name || "Surf";
-      const validColors = ['grey', 'blue', 'red', 'yellow', 'green', 'pink', 'purple', 'cyan', 'orange'];
-      const color = validColors.includes(message.color) ? message.color : 'blue';
-
-      if (tabIdsRaw.length === 0 && tabId) {
-        tabIdsRaw.push(tabId);
+      const validColors = ["grey", "blue", "red", "yellow", "green", "pink", "purple", "cyan", "orange"];
+      const color = validColors.includes(message.color) ? message.color : "blue";
+      
+      if (tabIds.length === 0 && tabId) {
+        tabIds.push(tabId);
       }
-
-      if (tabIdsRaw.length === 0) throw new Error("No tabs specified");
-
-      // tabIds must be at least [number, ...number[]] per Chrome API
-      const tabIds = tabIdsRaw as [number, ...number[]];
-
+      
+      if (tabIds.length === 0) throw new Error("No tabs specified");
+      const groupTabIds = tabIds.length === 1 ? tabIds[0] : (tabIds as [number, ...number[]]);
+      
       const existingGroups = await chrome.tabGroups.query({ title: name });
-
       let groupId: number;
+      
       if (existingGroups.length > 0) {
         groupId = existingGroups[0].id;
-        await chrome.tabs.group({ tabIds, groupId });
+        await chrome.tabs.group({ tabIds: groupTabIds, groupId });
       } else {
-        const newGroupId = await chrome.tabs.group({ tabIds });
-        groupId = newGroupId;
+        groupId = await chrome.tabs.group({ tabIds: groupTabIds });
         await chrome.tabGroups.update(groupId, {
           title: name,
-          color: color as chrome.tabGroups.Color,
+          color: color as `${chrome.tabGroups.Color}`,
           collapsed: false,
         });
       }
-
-      return { success: true, groupId, name, tabIds: tabIdsRaw };
+      
+      return { success: true, groupId, name, tabIds };
     }
 
     case "TAB_GROUP_REMOVE": {
-      const tabIdsRaw: number[] = [...(message.tabIds || [])] as number[];
-      if (tabIdsRaw.length === 0 && tabId) {
-        tabIdsRaw.push(tabId);
+      const tabIds: number[] = [...(message.tabIds || [])];
+      if (tabIds.length === 0 && tabId) {
+        tabIds.push(tabId);
       }
-
-      if (tabIdsRaw.length === 0) throw new Error("No tabs specified");
-
-      await chrome.tabs.ungroup(tabIdsRaw as [number, ...number[]]);
-      return { success: true, ungrouped: tabIdsRaw };
+      
+      if (tabIds.length === 0) throw new Error("No tabs specified");
+      const ungroupTabIds = tabIds.length === 1 ? tabIds[0] : (tabIds as [number, ...number[]]);
+      
+      await chrome.tabs.ungroup(ungroupTabIds);
+      return { success: true, ungrouped: tabIds };
     }
 
     case "TAB_GROUPS_LIST": {
@@ -2727,28 +3097,42 @@ export async function handleMessage(
     }
 
     case "CHATGPT_NEW_TAB": {
-      const tabId = await openInCurrentWindow("https://chatgpt.com/");
-      await cdp.attach(tabId);
-      await waitForRuntimeReady(tabId, 10000);
-      return { tabId };
+      const tab = await chrome.tabs.create({
+        url: "https://chatgpt.com/",
+        active: true,
+      });
+      if (!tab.id) throw new Error("Failed to create tab");
+      const currentTab = await chrome.tabs.get(tab.id);
+      if (currentTab.status !== "complete") {
+        await new Promise<void>((resolve) => {
+          const listener = (tabId: number, info: chrome.tabs.OnUpdatedInfo) => {
+            if (tabId === tab.id && info.status === "complete") {
+              chrome.tabs.onUpdated.removeListener(listener);
+              resolve();
+            }
+          };
+          chrome.tabs.onUpdated.addListener(listener);
+          setTimeout(() => {
+            chrome.tabs.onUpdated.removeListener(listener);
+            resolve();
+          }, 30000);
+        });
+      }
+      await cdp.attach(tab.id);
+      // Wait for JS runtime to be ready after CDP attach
+      await waitForRuntimeReady(tab.id, 10000);
+      return { tabId: tab.id };
     }
 
     case "CHATGPT_CLOSE_TAB": {
       const chatTabId = message.tabId;
-      console.error("[SW] CHATGPT_CLOSE_TAB received, tabId:", chatTabId);
       if (chatTabId) {
         try {
           await cdp.detach(chatTabId);
-          console.error("[SW] CDP detached for tab", chatTabId);
-        } catch (e) {
-          console.error("[SW] CDP detach failed:", e);
-        }
+        } catch {}
         try {
           await chrome.tabs.remove(chatTabId);
-          console.error("[SW] Tab removed:", chatTabId);
-        } catch (e) {
-          console.error("[SW] Tab remove failed:", e);
-        }
+        } catch {}
       }
       return { success: true };
     }
@@ -2764,46 +3148,32 @@ export async function handleMessage(
       return result;
     }
 
-    case "CLAUDE_NEW_TAB": {
-      const tabId = await openInCurrentWindow("https://claude.ai/");
-      await cdp.attach(tabId);
-      await waitForRuntimeReady(tabId, 10000);
-      return { tabId };
-    }
-
-    case "CLAUDE_CLOSE_TAB": {
-      const claudeTabId = message.tabId;
-      if (claudeTabId) {
-        try {
-          await cdp.detach(claudeTabId);
-        } catch {}
-        try {
-          await chrome.tabs.remove(claudeTabId);
-        } catch {}
-      }
-      return { success: true };
-    }
-
-    case "CLAUDE_CDP_COMMAND": {
-      const { method, params } = message;
-      const result = await cdp.sendCommand(message.tabId, method, params || {});
-      return result;
-    }
-
-    case "CLAUDE_EVALUATE": {
-      const result = await cdp.evaluateScript(message.tabId, message.expression);
-      return result;
-    }
-
     case "PERPLEXITY_NEW_TAB": {
-      // Deep-link URL pattern: https://www.perplexity.ai/#?q=...&model=...&focus=...&space=...
-      // When message.url is set, the page boots already in a search-ready state
-      // and we can skip the typePrompt + selectModel + submitPrompt dance.
-      const targetUrl = message.url || "https://www.perplexity.ai/";
-      const tabId = await openInCurrentWindow(targetUrl);
-      await cdp.attach(tabId);
-      await waitForRuntimeReady(tabId, 10000);
-      return { tabId };
+      const tab = await chrome.tabs.create({
+        url: "https://www.perplexity.ai/",
+        active: true,
+      });
+      if (!tab.id) throw new Error("Failed to create tab");
+      const currentTab = await chrome.tabs.get(tab.id);
+      if (currentTab.status !== "complete") {
+        await new Promise<void>((resolve) => {
+          const listener = (tabId: number, info: chrome.tabs.OnUpdatedInfo) => {
+            if (tabId === tab.id && info.status === "complete") {
+              chrome.tabs.onUpdated.removeListener(listener);
+              resolve();
+            }
+          };
+          chrome.tabs.onUpdated.addListener(listener);
+          setTimeout(() => {
+            chrome.tabs.onUpdated.removeListener(listener);
+            resolve();
+          }, 30000);
+        });
+      }
+      await cdp.attach(tab.id);
+      // Wait for JS runtime to be ready after CDP attach
+      await waitForRuntimeReady(tab.id, 10000);
+      return { tabId: tab.id };
     }
 
     case "PERPLEXITY_CLOSE_TAB": {
@@ -2831,66 +3201,64 @@ export async function handleMessage(
     }
 
     case "GET_TWITTER_COOKIES": {
-      // Grok authentication — was x.com, moved to grok.com.
-      // Fetch all relevant auth surfaces so we don't false-negative on
-      // users who migrated but kept x.com cookies, or vice versa.
-      const domains = [
-        ".x.com",
-        ".twitter.com",
-        ".grok.com",
-        ".x.ai",
-        "x.com",
-        "twitter.com",
-        "grok.com",
-        "x.ai",
-      ];
+      // Grok requires X.com cookies for authentication
+      const domains = [".x.com", ".twitter.com", "x.com", "twitter.com"];
       const allCookies: chrome.cookies.Cookie[] = [];
-
+      
       for (const domain of domains) {
         try {
           const cookies = await chrome.cookies.getAll({ domain });
           allCookies.push(...cookies);
         } catch {}
       }
-
-      // Also try by URL — covers edge cases where the domain filter misses
-      const urls = [
-        "https://x.com",
-        "https://twitter.com",
-        "https://grok.com",
-        "https://x.ai",
-      ];
+      
+      // Also try by URL
+      const urls = ["https://x.com", "https://twitter.com"];
       for (const url of urls) {
         try {
           const cookies = await chrome.cookies.getAll({ url });
           allCookies.push(...cookies);
         } catch {}
       }
-
-      // Dedupe by name (prefer the most specific domain)
+      
+      // Dedupe by name
       const seen = new Map<string, chrome.cookies.Cookie>();
       for (const cookie of allCookies) {
         const existing = seen.get(cookie.name);
-        if (!existing) {
-          seen.set(cookie.name, cookie);
-          continue;
-        }
-        // Prefer grok.com over x.com for the same cookie name
-        if (cookie.domain?.includes("grok.com") && !existing.domain?.includes("grok.com")) {
+        if (!existing || cookie.domain?.includes("x.com")) {
           seen.set(cookie.name, cookie);
         }
       }
-
+      
       return { cookies: Array.from(seen.values()) };
     }
 
     case "GROK_NEW_TAB": {
-      // Grok moved from x.com/i/grok to grok.com. Use the new domain
-      // so the user's existing grok.com session cookies apply.
-      const tabId = await openInCurrentWindow("https://grok.com/");
-      await cdp.attach(tabId);
-      await waitForRuntimeReady(tabId, 10000);
-      return { tabId };
+      const tab = await chrome.tabs.create({
+        url: "https://x.com/i/grok",
+        active: true,
+      });
+      if (!tab.id) throw new Error("Failed to create tab");
+      const currentTab = await chrome.tabs.get(tab.id);
+      if (currentTab.status !== "complete") {
+        await new Promise<void>((resolve) => {
+          const listener = (tabId: number, info: chrome.tabs.OnUpdatedInfo) => {
+            if (tabId === tab.id && info.status === "complete") {
+              chrome.tabs.onUpdated.removeListener(listener);
+              resolve();
+            }
+          };
+          chrome.tabs.onUpdated.addListener(listener);
+          setTimeout(() => {
+            chrome.tabs.onUpdated.removeListener(listener);
+            resolve();
+          }, 30000);
+        });
+      }
+      await cdp.attach(tab.id);
+      // Wait for JS runtime to be ready after CDP attach
+      await waitForRuntimeReady(tab.id, 10000);
+      return { tabId: tab.id };
     }
 
     case "GROK_CLOSE_TAB": {
@@ -2918,8 +3286,12 @@ export async function handleMessage(
     }
 
     case "GEMINI_NEW_TAB": {
-      const tabId = await openInCurrentWindow("https://gemini.google.com/app");
-      return { tabId };
+      const tab = await chrome.tabs.create({
+        url: "https://gemini.google.com/app",
+        active: true,
+      });
+      if (!tab.id) throw new Error("Failed to create tab");
+      return { tabId: tab.id };
     }
 
     case "GEMINI_CLOSE_TAB": {
@@ -2935,87 +3307,17 @@ export async function handleMessage(
       return { success: true };
     }
 
+    case "AI_UPLOAD_FILE_TO_TAB":
     case "UPLOAD_FILE_TO_TAB": {
       const { tabId: uploadTabId, filePaths } = message;
+      const provider = message.type === "UPLOAD_FILE_TO_TAB" ? "gemini" : message.provider;
       if (!uploadTabId || !filePaths?.length) {
-        throw new Error("UPLOAD_FILE_TO_TAB requires tabId and filePaths");
+        throw new Error(`${message.type} requires tabId and filePaths`);
       }
-      await cdp.attach(uploadTabId);
-      await cdp.sendCommand(uploadTabId, "DOM.enable", {});
-      await cdp.sendCommand(uploadTabId, "Page.setInterceptFileChooserDialog", { enabled: true });
-
-      let timeoutId: ReturnType<typeof setTimeout> | null = null;
-      let handler: ((source: chrome.debugger.Debuggee, method: string, params: any) => void) | null = null;
-      const cleanup = () => {
-        if (timeoutId) { clearTimeout(timeoutId); timeoutId = null; }
-        if (handler) { chrome.debugger.onEvent.removeListener(handler); handler = null; }
-      };
-
-      const attemptFileChooser = (attemptNum: number, timeoutMs: number): Promise<void> => {
-        return new Promise<void>((resolve, reject) => {
-          timeoutId = setTimeout(() => {
-            cleanup();
-            reject(new Error(`File chooser did not open within ${timeoutMs / 1000}s (attempt ${attemptNum})`));
-          }, timeoutMs);
-          handler = (source: chrome.debugger.Debuggee, method: string, params: any) => {
-            if (source.tabId === uploadTabId && method === "Page.fileChooserOpened") {
-              cleanup();
-              cdp.sendCommand(uploadTabId, "DOM.setFileInputFiles", {
-                files: filePaths,
-                backendNodeId: params.backendNodeId,
-              }).then(() => resolve()).catch(reject);
-            }
-          };
-          chrome.debugger.onEvent.addListener(handler);
-        });
-      };
-
-      const clickUploadSequence = async () => {
-        // Close menu if already open
-        await cdp.sendCommand(uploadTabId, "Runtime.evaluate", {
-          expression: `document.querySelector('button[aria-label="Close upload file menu"]')?.click()`,
-          userGesture: true,
-        });
-        await new Promise(r => setTimeout(r, 300));
-
-        // Open upload menu
-        await cdp.sendCommand(uploadTabId, "Runtime.evaluate", {
-          expression: `document.querySelector('button[aria-label="Open upload file menu"]')?.click()`,
-          userGesture: true,
-        });
-        await new Promise(r => setTimeout(r, 500));
-
-        // Click "Upload files" button
-        await cdp.sendCommand(uploadTabId, "Runtime.evaluate", {
-          expression: `document.querySelector('[data-test-id="local-images-files-uploader-button"]')?.click()`,
-          userGesture: true,
-        });
-      };
-
-      const maxAttempts = 3;
-      const timeouts = [10000, 15000, 20000];
-      let lastError: Error | null = null;
-
-      try {
-        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-          try {
-            const fileSetPromise = attemptFileChooser(attempt, timeouts[attempt - 1]);
-            await clickUploadSequence();
-            await fileSetPromise;
-            return { success: true };
-          } catch (err) {
-            lastError = err as Error;
-            cleanup();
-            if (attempt < maxAttempts) {
-              await new Promise(r => setTimeout(r, 1000));
-            }
-          }
-        }
-        throw new Error(`File upload failed after ${maxAttempts} attempts: ${lastError?.message}`);
-      } finally {
-        cleanup();
-        try { await cdp.sendCommand(uploadTabId, "Page.setInterceptFileChooserDialog", { enabled: false }); } catch {}
+      if (provider !== "gemini" && provider !== "chatgpt") {
+        throw new Error(`Unsupported upload provider: ${provider}`);
       }
+      return uploadFilesToProviderTab(provider, uploadTabId, filePaths);
     }
 
     case "GEMINI_FETCH_URL": {
@@ -3035,10 +3337,27 @@ export async function handleMessage(
 
     case "AISTUDIO_NEW_TAB": {
       const url = message.url || "https://aistudio.google.com/prompts/new_chat";
-      const tabId = await openInCurrentWindow(url);
-      await cdp.attach(tabId);
-      await waitForRuntimeReady(tabId, 10000);
-      return { tabId };
+      const tab = await chrome.tabs.create({ url, active: true });
+      if (!tab.id) throw new Error("Failed to create tab");
+      const currentTab = await chrome.tabs.get(tab.id);
+      if (currentTab.status !== "complete") {
+        await new Promise<void>((resolve) => {
+          const listener = (tabId: number, info: chrome.tabs.OnUpdatedInfo) => {
+            if (tabId === tab.id && info.status === "complete") {
+              chrome.tabs.onUpdated.removeListener(listener);
+              resolve();
+            }
+          };
+          chrome.tabs.onUpdated.addListener(listener);
+          setTimeout(() => {
+            chrome.tabs.onUpdated.removeListener(listener);
+            resolve();
+          }, 30000);
+        });
+      }
+      await cdp.attach(tab.id);
+      await waitForRuntimeReady(tab.id, 10000);
+      return { tabId: tab.id };
     }
 
     case "AISTUDIO_CLOSE_TAB": {
@@ -3056,34 +3375,6 @@ export async function handleMessage(
     }
 
     case "AISTUDIO_EVALUATE": {
-      return await cdp.evaluateScript(message.tabId, message.expression);
-    }
-
-    case "AIMODE_NEW_TAB": {
-      // AI Mode URLs (nem=143, udm=50) - opens in current window via helper
-      const targetUrl = message.url || (message.pro
-        ? "https://www.google.com/search?nem=143&q=test"
-        : "https://www.google.com/search?udm=50&q=test");
-      const tabId = await openInCurrentWindow(targetUrl);
-      await cdp.attach(tabId);
-      await waitForRuntimeReady(tabId, 10000);
-      return { tabId };
-    }
-
-    case "AIMODE_CLOSE_TAB": {
-      if (message.tabId) {
-        await cdp.detach(message.tabId);
-        await chrome.tabs.remove(message.tabId);
-      }
-      return { success: true };
-    }
-
-    case "AIMODE_CDP_COMMAND": {
-      const { method, params } = message;
-      return await cdp.sendCommand(message.tabId, method, params || {});
-    }
-
-    case "AIMODE_EVALUATE": {
       return await cdp.evaluateScript(message.tabId, message.expression);
     }
 
@@ -3134,49 +3425,41 @@ export async function handleMessage(
       return { cookies: Array.from(seen.values()) };
     }
 
-    case "GET_CLAUDE_COOKIES": {
-      const cookies = await chrome.cookies.getAll({ domain: ".claude.ai" });
-      const anthropicCookies = await chrome.cookies.getAll({ domain: ".anthropic.com" });
-      return { cookies: [...cookies, ...anthropicCookies] };
-    }
-
     case "WINDOW_NEW": {
       // Default to a usable blank page if no URL provided
       const url = message.url || 'data:text/html,<html><head><title>Surf Agent</title></head><body style="font-family:system-ui;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;color:%23666"><div style="text-align:center"><h2>Agent Window</h2><p>Ready for automation</p></div></body></html>';
-
-      // Create window minimized to avoid focus steal
+      
       const createOptions: chrome.windows.CreateData = {
-        focused: false,
-        state: "minimized",
+        focused: message.focused !== false,
         type: "normal",
         url,
       };
-
+      
       if (message.width && message.height) {
         createOptions.width = message.width;
         createOptions.height = message.height;
       }
-
+      
       if (message.incognito) {
         createOptions.incognito = true;
       }
-
-      const window = await chrome.windows.create(createOptions);
-
-      if (!window?.id) throw new Error("Failed to create window");
-
+      
+      const window = (await chrome.windows.create(createOptions)) as chrome.windows.Window;
+      
+      if (!window.id) throw new Error("Failed to create window");
+      
       // Get the tab that was created with the window
       const tabs = await chrome.tabs.query({ windowId: window.id });
       const firstTab = tabs[0];
-
+      
       // Wait for tab to be ready
       if (firstTab?.id) {
         await new Promise(r => setTimeout(r, 150));
       }
-
-      return {
-        success: true,
-        windowId: window.id,
+      
+      return { 
+        success: true, 
+        windowId: window.id, 
         tabId: firstTab?.id,
         hint: `Use --window-id ${window.id} to target this window`,
       };
@@ -3226,9 +3509,9 @@ export async function handleMessage(
       if (message.height) updateInfo.height = message.height;
       if (message.left !== undefined) updateInfo.left = message.left;
       if (message.top !== undefined) updateInfo.top = message.top;
-      if (message.state) updateInfo.state = message.state as chrome.windows.WindowState;
+      if (message.state) updateInfo.state = message.state as `${chrome.windows.WindowState}`;
       
-      const window = await chrome.windows.update(message.windowId, updateInfo);
+      const window = (await chrome.windows.update(message.windowId, updateInfo)) as chrome.windows.Window;
       return { 
         success: true, 
         windowId: message.windowId,
@@ -3250,17 +3533,14 @@ const COMMANDS_WITHOUT_TAB = new Set([
   "LIST_TABS", "NEW_TAB", "TABS_NEW", "CLOSE_TABS", "SWITCH_TAB", "TABS_SWITCH",
   "TABS_REGISTER", "TABS_UNREGISTER", "TABS_LIST_NAMED", "TABS_GET_BY_NAME",
   "CREATE_TAB_GROUP", "UNGROUP_TABS", "LIST_TAB_GROUPS", "GET_HISTORY", "SEARCH_HISTORY",
-  "GET_COOKIES", "SET_COOKIE", "DELETE_COOKIES", "GET_BOOKMARKS", "ADD_BOOKMARK",
+  "GET_COOKIES", "SET_COOKIE", "DELETE_COOKIES", "GET_BOOKMARKS", "ADD_BOOKMARK", 
   "DELETE_BOOKMARK", "DIALOG_DISMISS", "DIALOG_ACCEPT", "DIALOG_INFO",
   "CHATGPT_NEW_TAB", "CHATGPT_CLOSE_TAB", "CHATGPT_EVALUATE", "CHATGPT_CDP_COMMAND",
   "GET_CHATGPT_COOKIES", "GET_GOOGLE_COOKIES", "GET_TWITTER_COOKIES",
-  "CLAUDE_NEW_TAB", "CLAUDE_CLOSE_TAB", "CLAUDE_EVALUATE", "CLAUDE_CDP_COMMAND",
-  "GET_CLAUDE_COOKIES",
   "PERPLEXITY_NEW_TAB", "PERPLEXITY_CLOSE_TAB", "PERPLEXITY_EVALUATE", "PERPLEXITY_CDP_COMMAND",
   "GROK_NEW_TAB", "GROK_CLOSE_TAB", "GROK_EVALUATE", "GROK_CDP_COMMAND",
-  "GEMINI_NEW_TAB", "GEMINI_CLOSE_TAB", "GEMINI_FETCH_URL", "UPLOAD_FILE_TO_TAB",
+  "GEMINI_NEW_TAB", "GEMINI_CLOSE_TAB", "GEMINI_FETCH_URL", "AI_UPLOAD_FILE_TO_TAB", "UPLOAD_FILE_TO_TAB",
   "AISTUDIO_NEW_TAB", "AISTUDIO_CLOSE_TAB", "AISTUDIO_EVALUATE", "AISTUDIO_CDP_COMMAND",
-  "AIMODE_NEW_TAB", "AIMODE_CLOSE_TAB", "AIMODE_EVALUATE", "AIMODE_CDP_COMMAND",
   "DOWNLOADS_SEARCH",
   "WINDOW_NEW", "WINDOW_LIST", "WINDOW_FOCUS", "WINDOW_CLOSE", "WINDOW_RESIZE",
   "EMULATE_DEVICE_LIST"

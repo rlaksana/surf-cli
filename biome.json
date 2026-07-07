@@ -37,7 +37,8 @@
         "noEmptyBlockStatements": "error",
         "noAssignInExpressions": "error",
         "noAsyncPromiseExecutor": "error",
-        "noTsIgnore": "error"
+        "noTsIgnore": "error",
+        "noUnusedExpressions": "error"
       },
       "style": {
         "noNonNullAssertion": "error",
