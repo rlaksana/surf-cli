@@ -364,7 +364,7 @@ describe("chatgpt-client", () => {
       ).rejects.toThrow("ChatGPT file upload failed: composer file input not found");
 
       expect(uploadFile).toHaveBeenCalledWith(123, [
-        expect.stringContaining("fixtures/report.txt"),
+        expect.stringMatching(/fixtures[\\/]report\.txt$/),
       ]);
       expect(closeCalls).toEqual([123]);
     });
