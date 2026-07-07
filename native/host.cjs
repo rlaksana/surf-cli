@@ -574,12 +574,15 @@ function handleToolRequest(msg, socket) {
             socket: null,
             originalId: null,
             tool: "read_page",
-            onComplete: resolve,
+            onComplete: resolve
           });
-          writeMessage({ type: "READ_PAGE", id: pageId });
+          writeMessage({ type: "GET_PAGE_TEXT", tabId: extensionMsg.tabId, id: pageId });
         });
         if (pageResult && pageResult.url) {
-          pageContext = pageResult;
+          pageContext = {
+            url: pageResult.url,
+            text: pageResult.text || pageResult.pageContent || ""
+          };
         }
       }
 
@@ -598,7 +601,7 @@ function handleToolRequest(msg, socket) {
             socket: null,
             originalId: null,
             tool: "get_cookies",
-            onComplete: (r) => resolve(r),
+            onComplete: (r) => resolve(r)
           });
           writeMessage({ type: "GET_CLAUDE_COOKIES", id: cookieId });
         }),
@@ -608,7 +611,7 @@ function handleToolRequest(msg, socket) {
             socket: null,
             originalId: null,
             tool: "create_tab",
-            onComplete: (r) => resolve(r),
+            onComplete: (r) => resolve(r)
           });
           writeMessage({ type: "CLAUDE_NEW_TAB", id: tabCreateId });
         }),
@@ -618,7 +621,7 @@ function handleToolRequest(msg, socket) {
             socket: null,
             originalId: null,
             tool: "close_tab",
-            onComplete: (r) => resolve(r),
+            onComplete: (r) => resolve(r)
           });
           writeMessage({ type: "CLAUDE_CLOSE_TAB", tabId: tabIdToClose, id: tabCloseId });
         }),
@@ -628,7 +631,7 @@ function handleToolRequest(msg, socket) {
             socket: null,
             originalId: null,
             tool: "cdp_evaluate",
-            onComplete: (r) => resolve(r),
+            onComplete: (r) => resolve(r)
           });
           writeMessage({ type: "CLAUDE_EVALUATE", tabId, expression, id: evalId });
         }),
@@ -638,14 +641,22 @@ function handleToolRequest(msg, socket) {
             socket: null,
             originalId: null,
             tool: "cdp_command",
-            onComplete: (r) => resolve(r),
+            onComplete: (r) => resolve(r)
           });
           writeMessage({ type: "CLAUDE_CDP_COMMAND", tabId, method, params, id: cmdId });
         }),
-        log: (msg) => log(`[claude] ${msg}`),
+        log: (msg) => log(`[claude] ${msg}`)
       });
 
       return result;
+    }).then((result) => {
+      sendToolResponse(socket, originalId, {
+        response: result.response,
+        model: result.model,
+        tookMs: result.tookMs
+      }, null);
+    }).catch((err) => {
+      sendToolResponse(socket, originalId, null, err.message);
     });
 
     return;
