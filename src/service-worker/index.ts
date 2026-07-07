@@ -3129,6 +3129,33 @@ export async function handleMessage(
       return { tabId: tab.id };
     }
 
+    case "CLAUDE_NEW_TAB": {
+      const tab = await chrome.tabs.create({
+        url: "https://claude.ai/",
+        active: false,
+      });
+      if (!tab.id) throw new Error("Failed to create tab");
+      const currentTab = await chrome.tabs.get(tab.id);
+      if (currentTab.status !== "complete") {
+        await new Promise<void>((resolve) => {
+          const listener = (tabId: number, info: chrome.tabs.OnUpdatedInfo) => {
+            if (tabId === tab.id && info.status === "complete") {
+              chrome.tabs.onUpdated.removeListener(listener);
+              resolve();
+            }
+          };
+          chrome.tabs.onUpdated.addListener(listener);
+          setTimeout(() => {
+            chrome.tabs.onUpdated.removeListener(listener);
+            resolve();
+          }, 30000);
+        });
+      }
+      await cdp.attach(tab.id);
+      await waitForRuntimeReady(tab.id, 10000);
+      return { tabId: tab.id };
+    }
+
     case "CHATGPT_CLOSE_TAB": {
       const chatTabId = message.tabId;
       if (chatTabId) {
