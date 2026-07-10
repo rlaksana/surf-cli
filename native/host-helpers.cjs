@@ -547,8 +547,13 @@ function mapComputerAction(args, tabId) {
  * Map tool name and args to extension message
  */
 function mapToolToMessage(tool, args, tabId) {
-  const baseMsg = { tabId };
   const a = args || {};
+  // Pass through tab-isolation flags so the extension can choose auto-bg vs active.
+  const baseMsg = {
+    tabId,
+    _newTab: a.newTab === true || a["new-tab"] === true,
+    _keepTab: a.keepTab === true || a["keep-tab"] === true,
+  };
   
   switch (tool) {
     case "computer":

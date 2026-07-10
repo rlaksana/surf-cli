@@ -2620,7 +2620,7 @@ if (args[0] === "workflow.validate") {
   }
 }
 
-const BOOLEAN_FLAGS = ["auto-capture", "json", "stream", "dry-run", "stop-on-error", "fail-fast", "clear", "submit", "all", "case-sensitive", "hard", "annotate", "fullpage", "full-page", "reset", "no-screenshot", "full", "soft-fail", "has-body", "exclude-static", "v", "vv", "request", "by-tab", "har", "jsonl", "no-save", "no-auto-wait", "no-lock"];
+const BOOLEAN_FLAGS = ["auto-capture", "json", "stream", "dry-run", "stop-on-error", "fail-fast", "clear", "submit", "all", "case-sensitive", "hard", "annotate", "fullpage", "full-page", "reset", "no-screenshot", "full", "soft-fail", "has-body", "exclude-static", "v", "vv", "request", "by-tab", "har", "jsonl", "no-save", "no-auto-wait", "no-lock", "new-tab", "keep-tab"];
 
 const AUTO_SCREENSHOT_TOOLS = ["click", "type", "key", "smart_type", "form.fill", "form_input", "drag", "hover", "scroll", "scroll.top", "scroll.bottom", "scroll.to", "dialog.accept", "dialog.dismiss", "js", "eval"];
 
@@ -2703,6 +2703,16 @@ tool = ALIASES[tool] || tool;
 if (options["full-page"] === true) {
   options.fullpage = true;
   delete options["full-page"];
+}
+
+// Normalize kebab-case tab-isolation flags to camelCase for the host.
+if (options["new-tab"] === true) {
+  options.newTab = true;
+  delete options["new-tab"];
+}
+if (options["keep-tab"] === true) {
+  options.keepTab = true;
+  delete options["keep-tab"];
 }
 
 const config = loadConfig();

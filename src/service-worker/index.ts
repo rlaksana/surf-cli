@@ -1,6 +1,7 @@
 import { CDPController } from "../cdp/controller";
 import { debugLog } from "../utils/debug";
 import { initNativeMessaging, postToNativeHost } from "../native/port-manager";
+import { resolveTabForCommand } from "./tab-resolver";
 
 debugLog("Service worker loaded");
 
@@ -3649,82 +3650,56 @@ const COMMANDS_WITHOUT_TAB = new Set([
 ]);
 
 initNativeMessaging(async (msg) => {
-  let tabId = msg.tabId;
-  const windowId = msg.windowId;
-  const isDialogCommand = msg.type?.startsWith("DIALOG_");
-  const needsTab = !COMMANDS_WITHOUT_TAB.has(msg.type);
-  let autoCreatedTab = false;
-  
-  if (tabId && !isDialogCommand) {
+  // COMMANDS_WITHOUT_TAB never need a tab — pass through to handleMessage.
+  if (COMMANDS_WITHOUT_TAB.has(msg.type)) {
+    const result = await handleMessage(msg, {} as chrome.runtime.MessageSender);
+    return { ...result, _resolvedTabId: undefined };
+  }
+
+  const explicitTabId =
+    msg.tabId !== undefined && !Number.isNaN(Number(msg.tabId))
+      ? Number(msg.tabId)
+      : undefined;
+
+  const resolved = await resolveTabForCommand(msg, explicitTabId);
+
+  let result;
+  try {
+    result = await handleMessage(
+      { ...msg, tabId: resolved.tabId },
+      {} as chrome.runtime.MessageSender,
+    );
+  } catch (err) {
+    // Keep the auto-created tab open on error so the user can inspect what
+    // happened. The hint tells them how to close it manually.
+    if (resolved.autoCreated) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      return {
+        error: errMsg,
+        _resolvedTabId: resolved.tabId,
+        _hint: `${resolved.hint ?? ""} Tab ${resolved.tabId} kept open for inspection; close with: surf tab.close ${resolved.tabId}`.trim(),
+      };
+    }
+    throw err;
+  }
+
+  // TODO(technical-debt): 250ms stabilization wait is a band-aid over
+  // non-deterministic CDP message flushing. Replace with a deterministic
+  // listener (e.g. wait for chrome.debugger.onDetach / Page.loadEventFired)
+  // when we move to event-driven cleanup. Acceptable for current scale but
+  // will aggregate into overhead for high-frequency batch processing.
+  if (resolved.closeAfter && resolved.autoCreated) {
+    await new Promise((r) => setTimeout(r, 250));
     try {
-      await chrome.tabs.get(tabId);
+      await chrome.tabs.remove(resolved.tabId);
     } catch {
-      throw new Error(`Invalid tab ID: ${tabId}. Use 'surf tab.list' to see available tabs.`);
+      // Tab may have been closed by the user or another action — ignore.
     }
-  } else if (!tabId && needsTab) {
-    let tabs: chrome.tabs.Tab[];
-    let tab: chrome.tabs.Tab | undefined;
-    
-    if (windowId) {
-      // If windowId specified, only look in that window
-      tabs = await chrome.tabs.query({ active: true, windowId });
-      tab = tabs[0];
-      
-      // Check if active tab is usable (not a restricted URL)
-      const isRestricted = (url?: string) => 
-        !url || url.startsWith('chrome://') || url.startsWith('chrome-extension://') || url === 'about:blank';
-      
-      if (!tab || isRestricted(tab.url)) {
-        // Active tab is restricted, find any usable tab in the window
-        tabs = await chrome.tabs.query({ windowId });
-        tab = tabs.find(t => !isRestricted(t.url));
-      }
-      
-      if (!tab?.id) {
-        // No usable tab - auto-create one with a minimal page
-        const newTab = await chrome.tabs.create({ 
-          windowId, 
-          url: 'data:text/html,<html><head><title>Surf</title></head><body></body></html>',
-          active: true 
-        });
-        if (!newTab.id) {
-          throw new Error(`Failed to create tab in window ${windowId}`);
-        }
-        // Wait briefly for tab to be ready
-        await new Promise(r => setTimeout(r, 100));
-        tab = newTab;
-        autoCreatedTab = true;
-      }
-    } else {
-      // Default behavior: find active tab across windows
-      tabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
-      tab = tabs[0];
-      if (!tab || tab.url?.startsWith('chrome-extension://')) {
-        tabs = await chrome.tabs.query({ active: true, currentWindow: true });
-        tab = tabs[0];
-      }
-      if (!tab || tab.url?.startsWith('chrome-extension://') || tab.url?.startsWith('chrome://')) {
-        tabs = await chrome.tabs.query({ active: true });
-        tab = tabs.find(t => !t.url?.startsWith('chrome-extension://') && !t.url?.startsWith('chrome://'));
-      }
-      if (!tab?.id) {
-        throw new Error("No active tab found. Use 'surf tab.new <url>' to create one, or 'surf tab.list' to see available tabs.");
-      }
-    }
-    tabId = tab.id;
   }
-  
-  const result = await handleMessage({ ...msg, tabId }, {} as chrome.runtime.MessageSender);
-  
-  // Add helpful hints based on what happened
-  const hints: string[] = [];
-  if (autoCreatedTab) {
-    hints.push(`Auto-created tab in window ${windowId} (no usable tabs existed). Navigate to your target URL.`);
-  }
-  
-  return { 
-    ...result, 
-    _resolvedTabId: tabId,
-    _hint: hints.length > 0 ? hints.join(' ') : undefined,
+
+  return {
+    ...result,
+    _resolvedTabId: resolved.tabId,
+    _hint: resolved.hint,
   };
 });
