@@ -48,7 +48,8 @@
     "test:ui": "vitest --ui",
     "test:ai": "node native/tests/ai-provider-smoke.cjs",
     "install:native": "node scripts/install-native-host.cjs",
-    "uninstall:native": "node scripts/uninstall-native-host.cjs"
+    "uninstall:native": "node scripts/uninstall-native-host.cjs",
+    "deploy:local": "npm run build && node scripts/deploy-local.cjs"
   },
   "dependencies": {
     "@google/generative-ai": "^0.24.1",
