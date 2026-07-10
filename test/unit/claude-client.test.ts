@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 // CommonJS import via require pattern used in test/unit/chatgpt-client.test.ts
 // eslint-disable-next-line @typescript-eslint/no-require-imports

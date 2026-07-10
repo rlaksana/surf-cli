@@ -25,11 +25,7 @@ module.exports = {
     // validator scans the current tab's domain, so we accept either path.
     // If surf-cli is on a grok.com tab, check the grok.com cookie namespace;
     // if on x.com, the legacy auth_token cookie.
-    requiredCookies: [
-      { name: "auth_token" },
-      { name: "grok_session" },
-      { name: "session_id" },
-    ],
+    requiredCookies: [{ name: "auth_token" }, { name: "grok_session" }, { name: "session_id" }],
     allowedDomains: ["grok.com", "x.com"],
   },
   timeout: {
