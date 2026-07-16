@@ -670,10 +670,28 @@ async function runGeminiWebViaPage(input) {
 
     if (log) log("Submitting...");
     const sendResult = await jsEval(tabId, `
-      const btn = document.querySelector('button[aria-label="Send message"]');
-      if (!btn) return 'no-btn';
-      btn.click();
-      return 'sent';
+      // Strategy 1: explicit aria-label (legacy UI)
+      let btn = document.querySelector('button[aria-label="Send message"]');
+      if (btn) { btn.click(); return 'sent-label'; }
+      // Strategy 2: button immediately to the right of the textbox with an icon
+      const tb = document.querySelector('.ql-editor[contenteditable=true]');
+      if (tb) {
+        const tbr = tb.getBoundingClientRect();
+        btn = Array.from(document.querySelectorAll('button')).find(b => {
+          if (!b.offsetParent) return false;
+          if (!b.querySelector('mat-icon')) return false;
+          const r = b.getBoundingClientRect();
+          const dy = Math.abs((r.top + r.bottom) / 2 - (tbr.top + tbr.bottom) / 2);
+          return dy < 30 && r.left >= tbr.right - 5 && r.left <= tbr.right + 80;
+        });
+        if (btn) { btn.click(); return 'sent-adjacent'; }
+        // Strategy 3: dispatch Enter keydown on textbox
+        tb.focus();
+        const ev = new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true });
+        tb.dispatchEvent(ev);
+        return 'sent-enter';
+      }
+      return 'no-btn';
     `);
     const sendVal = JSON.parse(checkJsResult(sendResult, "Click send"));
     if (sendVal === "no-btn") throw new Error("Send button not found on Gemini page");
@@ -949,17 +967,35 @@ async function query(options) {
     } else {
       // Text query
       log("Sending text query...");
-      const out = await runGeminiWebWithFallback({
-        prompt: fullPrompt,
-        files,
-        model: resolvedModel,
-        cookieMap,
-        chatMetadata: null,
-        timeoutMs: timeout,
-        log,
-      });
+      let out;
+      if (hasPageCallbacks) {
+        // DOM-driven path: more robust than the internal StreamGenerate HTTPS path,
+        // which depends on positional indices in Gemini's protoBuf-as-JSON envelope
+        // that drift silently when Google changes the wire format.
+        out = await runGeminiWebViaPage({
+          prompt: fullPrompt,
+          model: resolvedModel,
+          timeoutMs: timeout,
+          log,
+          createTab,
+          closeTab,
+          jsEval,
+          fetchUrl,
+        });
+      } else {
+        out = await runGeminiWebWithFallback({
+          prompt: fullPrompt,
+          files,
+          model: resolvedModel,
+          cookieMap,
+          chatMetadata: null,
+          timeoutMs: timeout,
+          log,
+        });
+      }
 
       response = out;
+      if (out._pageTabId && closeTab) { try { await closeTab(out._pageTabId); } catch {} }
     }
   } catch (error) {
     throw new Error(`Gemini request failed: ${error.message}`);

@@ -273,7 +273,11 @@ function base64ToBlob(base64: string, mimeType = "image/png"): Blob {
 }
 
 function codeWithExpressionReturn(code: string): string {
-  return `return (\n${code}\n);`;
+  // Wrap in an async IIFE so the caller can mix statements (const, let, if, return)
+  // AND have the last expression value returned. The previous `return ( ... );` form
+  // only worked for single expressions and broke on any `const`/`let`/`var` declarations
+  // because declarations are not valid in expression position.
+  return `return (async () => { ${code} })()`;
 }
 
 function scriptParses(code: string): boolean {
@@ -1928,9 +1932,9 @@ export async function handleMessage(
         
         const body = codeWithExpressionReturn(message.code);
         const expression = `(async () => { 'use strict'; ${body} })()`;
-        
+
         let result = await cdp.evaluateScript(tabId, expression);
-        
+
         if (result.exceptionDetails && !scriptParses(body)) {
           result = await cdp.evaluateScript(tabId, `(async () => { 'use strict'; ${message.code} })()`);
         }
