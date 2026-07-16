@@ -273,11 +273,20 @@ function base64ToBlob(base64: string, mimeType = "image/png"): Blob {
 }
 
 function codeWithExpressionReturn(code: string): string {
-  // Wrap in an async IIFE so the caller can mix statements (const, let, if, return)
-  // AND have the last expression value returned. The previous `return ( ... );` form
-  // only worked for single expressions and broke on any `const`/`let`/`var` declarations
-  // because declarations are not valid in expression position.
-  return `return (async () => { ${code} })()`;
+  // Prefer the expression form `return ( ... );` so that single-expression code
+  // (e.g. `1 + 2`, `document.title`) returns its value to the caller. Fall back
+  // to an async IIFE for code that contains declarations or statements at line
+  // start — those are not valid in expression position. The previous `new Function`
+  // parse-test approach was dropped because interpolating caller code into a
+  // Function body is a code-injection anti-pattern even when the function body
+  // is never executed; a regex heuristic over line starts is sufficient here
+  // because every caller (surf js, gemini-client.cjs) already routes through
+  // CDP Runtime.evaluate with awaitPromise, so the browser is the actual
+  // execution boundary, not this wrapper.
+  if (/^\s*(?:const|let|var|function|class|import|export|return|throw|if|for|while|do|switch|try)\b/m.test(code)) {
+    return `return (async () => { ${code} })()`;
+  }
+  return `return (\n${code}\n);`;
 }
 
 function scriptParses(code: string): boolean {
