@@ -1,11 +1,114 @@
 ---
 name: surf
 description: Control Chrome browser via CLI for testing, automation, and debugging. Use when the user needs browser automation, screenshots, form filling, page inspection, network/CPU emulation, DevTools streaming, or AI queries via the default `aimode` provider (Google AI Mode — no login required; `nem=143` pro / `udm=50` auto) plus Gemini/Perplexity/Grok/AI Studio/Claude. ChatGPT is temporarily disabled.
+tools: Agent, Bash, Read, Glob
 ---
 
 # Surf Browser Automation
 
 Control Chrome browser via CLI or Unix socket.
+
+## Subagent Return Contract
+
+If this skill is loaded directly in the main agent context by a slash command and the request requires substantive browser automation, AI query, testing, or research work, do not perform the surf workflow in the main context. Immediately spawn an `Agent` subagent to execute `surf` normally with the user's arguments and this skill's CLI conventions, then wait for its `LSC_RETURN — Lossless Semantic Compression` result. Do not recursively delegate when already inside a subagent. Continue inline only for trivial usage/argument validation or when `Agent` is unavailable; if so, keep output compact and state the limitation.
+
+When `surf` is executed inside a subagent, run this skill normally, then return to the main agent only in compact **Lossless Semantic Compression (LSC)** format. Do not return raw process, long reasoning, raw logs, raw browser dumps, full transcripts, full files, full diffs, or repeated context unless the caller explicitly requested raw detail. Preserve meaning through evidence/detail pointers so full detail remains recoverable.
+
+Use this exact template:
+
+```text
+LSC_RETURN — Lossless Semantic Compression
+
+STATUS:
+done | partial | blocked
+
+OUTCOME:
+<one short paragraph with the useful result>
+
+FACTS:
+- <load-bearing fact> → <evidence pointer>
+
+DECISION:
+<decision or conclusion, if any> → <reason> → <evidence pointer>
+
+DELTA:
+- <new finding/change only>
+
+VERIFY:
+- <check/test/source>: pass | fail | not run | found | not found
+
+RISK:
+- <severity>: <remaining risk or uncertainty>
+
+NEXT:
+- <next concrete action>
+
+TABS:                                          # REQUIRED for every surf run
+- opened: <count> (ids: [<id1>, <id2>, ...])
+- closed: <count>
+- still_open: <count>  // must equal opened - closed
+- pre_existing_preserved: true | false
+
+DETAIL:
+- <URL/provider/command/screenshot/artifact/query where full detail can be reopened>
+```
+
+Evidence pointers should use the smallest recoverable locator available: URL, provider name, surf command, page ref, screenshot path, downloaded artifact path, report section, timestamped run note, or query.
+
+## Tab Discipline (Mandatory)
+
+Surf shares the user's real Chrome profile. Every tab the agent opens is a real tab in the user's browser. Tab clutter and focus-stealing are user-visible side effects, not cosmetic concerns. The following two rules are mandatory defaults for every surf invocation — including ones delegated to subagents.
+
+### Rule 1 — Open research tabs in the background
+
+The user's currently focused tab MUST NOT change as a side effect of surf work.
+
+- Open research URLs with `surf tab.new <url>`. By default it does not steal focus — the user's current tab stays active.
+- **Do not call `surf tab.switch` on a research tab** to read it. Read with `surf page.read --tab-id <id>` instead — that reads without switching focus.
+- **Do not use `surf navigate <research-url>`** for research URLs. `surf navigate` overwrites the user's current tab. Use `tab.new` for any new URL you want to investigate.
+- **Do not call `surf window.new` for "isolation"** unless the user explicitly asks for it. New windows steal focus and clutter the user's taskbar.
+- `surf screenshot` accepts `--tab-id <id>` to capture without switching.
+- `surf read`, `surf click`, `surf type`, etc. all accept `--tab-id` — prefer that over `tab.switch` whenever possible.
+
+### Rule 2 — Auto-close every tab the agent opens
+
+Every tab opened by the agent MUST be closed as soon as its purpose is complete — either at the end of the step that needed it, or at the end of the run via a single batch.
+
+- `surf tab.close <id>` closes one tab.
+- `surf tab.close --ids <id1> <id2> ...` closes many.
+- Track every tab ID you opened. Do not close pre-existing user tabs you did not create.
+- On error or unexpected exit, close any tab the agent created. Never leave orphan tabs behind.
+
+### Updated LSC contract — mandatory tab accounting
+
+The LSC return MUST include these fields in addition to the existing template (place between `NEXT:` and `DETAIL:`):
+
+```
+TABS:
+- opened: <count> (ids: [<id1>, <id2>, ...])
+- closed: <count>
+- still_open: <count>  // must equal opened - closed
+- pre_existing_preserved: true | false
+```
+
+### Delegation prompt requirements
+
+When delegating surf research to a subagent, the delegation prompt MUST include Rules 1 and 2 verbatim or near-verbatim. Phrases like "jangan close", "preserve research tabs", "biarkan terbuka", or "leave tabs open for user to read" are red flags and MUST be rewritten before the prompt is sent — they defeat Rule 2.
+
+### Carve-out
+
+The mandatory rules apply by default. One explicit exception: when the user themselves drives an interactive browsing session (e.g., "open this URL and tell me what you see" with intent that the user also sees the new tab), `tab.switch` is appropriate. The LSC tab-accounting fields are still required.
+
+### Anti-pattern summary
+
+| Anti-pattern | Why it's wrong | Fix |
+|---|---|---|
+| `surf navigate <research-url>` | Overwrites user's current tab | `surf tab.new <research-url>` + `page.read --tab-id <id>` |
+| `surf tab.switch <research-tab>` | Steals user focus | `page.read --tab-id <id>` (no switch) |
+| Delegation prompt with "jangan close" / "preserve research tabs" | Defeats Rule 2 | Rewrite the prompt; tabs auto-close |
+| `surf window.new` for isolation without asking | Steals focus + window clutter | Skip unless the user asks |
+| Closing user's pre-existing tab | Destructive | Preserve all tabs the agent did not create |
+| Screenshotting without `--tab-id` | Implies `tab.switch` | Pass `--tab-id <id>` |
 
 ## Native Host / Socket Notes
 
