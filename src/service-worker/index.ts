@@ -970,25 +970,28 @@ export async function handleMessage(
     case "EXECUTE_NAVIGATE": {
       if (!tabId) throw new Error("No tabId provided");
       if (!message.url) throw new Error("No url provided");
-      
-      const navigationPromise = new Promise<void>((resolve) => {
-        navigationResolvers.set(tabId, resolve);
-        setTimeout(() => {
-          if (navigationResolvers.has(tabId)) {
-            navigationResolvers.delete(tabId);
-            resolve();
-          }
-        }, 30000);
-      });
-      
+
       // HARD-CODED POLICY: never reuse the user's active tab.
-      // Open a fresh background tab for navigate; CDP attaches to it.
+      // Open a fresh background tab; CDP attaches to it.
       const navTab = await createBackgroundTab({ url: message.url });
       if (!navTab.id) throw new Error("Failed to create navigation tab");
       const navTabId = navTab.id;
-      navigationResolvers.set(navTabId, resolve);
+
+      let resolveNavigation!: () => void;
+      const navigationPromise = new Promise<void>((res) => {
+        resolveNavigation = res;
+        navigationResolvers.set(navTabId, res);
+        setTimeout(() => {
+          if (navigationResolvers.has(navTabId)) {
+            navigationResolvers.delete(navTabId);
+            res();
+          }
+        }, 30000);
+      });
+      void resolveNavigation;
+
       await navigationPromise;
-      await new Promise(resolve => setTimeout(resolve, 500));
+      await new Promise((res) => setTimeout(res, 500));
       return { success: true, tabId: navTabId };
     }
 
