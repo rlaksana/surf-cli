@@ -37,39 +37,30 @@ function isAgentTabUrl(url: string | undefined): boolean {
   return AGENT_TAB_URL_PATTERNS.some((re) => re.test(url));
 }
 
-// Single chokepoint for tab creation. Forces active: false AND schedules
-// auto-close. This is the only legal way to create a tab from this
-// service worker.
-//
-// HARD-CODED POLICY (user override — no escape hatch):
-//   - active: true is rejected at runtime.
-//   - default auto-close after AUTO_CLOSE_DEFAULT_MS (5s) so that any
-//     tab left behind after the operation completes is reaped.
-//   - AI provider tabs need longer grace (they run queries that take
-//     minutes); pass keepOpenMs: 10*60*1000 in those callers.
-const AUTO_CLOSE_DEFAULT_MS = 5_000;
-
+// Single chokepoint for tab creation. Forces active: false. Never
+// schedules a force-close — close happens explicitly via TAB_CLOSE
+// when the caller is done. The browser may keep the tab alive in
+// between (e.g., while an AI query is running).
 async function createBackgroundTab(
-  options: chrome.tabs.CreateProperties & { keepOpenMs?: number },
+  options: chrome.tabs.CreateProperties,
 ): Promise<chrome.tabs.Tab> {
-  const { keepOpenMs, ...rest } = options;
-  if ((rest as { active?: boolean }).active === true) {
+  if ((options as { active?: boolean }).active === true) {
     throw new Error(
       "createBackgroundTab: active:true is forbidden by hardcoded policy",
     );
   }
-  const tab = await chrome.tabs.create({ ...rest, active: false });
-  const closeMs = typeof keepOpenMs === "number" ? keepOpenMs : AUTO_CLOSE_DEFAULT_MS;
-  if (closeMs > 0 && typeof tab.id === "number") {
-    const tabId = tab.id;
-    setTimeout(() => {
-      chrome.tabs.remove(tabId).catch(() => {
-        // Tab may already be gone (AI client closed it in finally,
-        // user closed it manually, etc.) — ignore.
-      });
-    }, closeMs);
+  return chrome.tabs.create({ ...options, active: false });
+}
+
+// HARD-CODED POLICY: tabs the caller has finished with MUST be closed.
+// Native host sends TAB_CLOSE when the operation that opened the tab
+// has resolved (finally blocks, query-response complete, etc.).
+async function tabClose(tabId: number): Promise<void> {
+  try {
+    await chrome.tabs.remove(tabId);
+  } catch {
+    // Tab may already be gone — ignore.
   }
-  return tab;
 }
 
 const STALE_AGENT_TAB_MS = 10 * 60 * 1000; // 10 minutes
@@ -3263,7 +3254,7 @@ export async function handleMessage(
     }
 
     case "CHATGPT_NEW_TAB": {
-      const tab = await createBackgroundTab({ url: "https://chatgpt.com/", keepOpenMs: 10 * 60 * 1000 });
+      const tab = await createBackgroundTab({ url: "https://chatgpt.com/" });
       if (!tab.id) throw new Error("Failed to create tab");
       const currentTab = await chrome.tabs.get(tab.id);
       if (currentTab.status !== "complete") {
@@ -3312,7 +3303,7 @@ export async function handleMessage(
     }
 
     case "PERPLEXITY_NEW_TAB": {
-      const tab = await createBackgroundTab({ url: "https://www.perplexity.ai/", keepOpenMs: 10 * 60 * 1000 });
+      const tab = await createBackgroundTab({ url: "https://www.perplexity.ai/" });
       if (!tab.id) throw new Error("Failed to create tab");
       const currentTab = await chrome.tabs.get(tab.id);
       if (currentTab.status !== "complete") {
@@ -3394,7 +3385,7 @@ export async function handleMessage(
     }
 
     case "GROK_NEW_TAB": {
-      const tab = await createBackgroundTab({ url: "https://x.com/i/grok", keepOpenMs: 10 * 60 * 1000 });
+      const tab = await createBackgroundTab({ url: "https://x.com/i/grok" });
       if (!tab.id) throw new Error("Failed to create tab");
       const currentTab = await chrome.tabs.get(tab.id);
       if (currentTab.status !== "complete") {
@@ -3443,7 +3434,7 @@ export async function handleMessage(
     }
 
     case "GEMINI_NEW_TAB": {
-      const tab = await createBackgroundTab({ url: "https://gemini.google.com/app", keepOpenMs: 10 * 60 * 1000 });
+      const tab = await createBackgroundTab({ url: "https://gemini.google.com/app" });
       if (!tab.id) throw new Error("Failed to create tab");
       return { tabId: tab.id };
     }
@@ -3491,7 +3482,7 @@ export async function handleMessage(
 
     case "AISTUDIO_NEW_TAB": {
       const url = message.url || "https://aistudio.google.com/prompts/new_chat";
-      const tab = await createBackgroundTab({ url, keepOpenMs: 10 * 60 * 1000 });
+      const tab = await createBackgroundTab({ url });
       if (!tab.id) throw new Error("Failed to create tab");
       const currentTab = await chrome.tabs.get(tab.id);
       if (currentTab.status !== "complete") {
@@ -3687,6 +3678,46 @@ chrome.runtime.onStartup.addListener(() => {
   debugLog("Extension startup — running agent-tab reconciler");
   void runStartupReconciler();
 });
+
+// HARD-CODED POLICY: auto-close on done.
+// When a tab created by createBackgroundTab finishes loading and the
+// URL has not changed for IDLE_MS, treat it as "operation done" and
+// close it. This protects long-running automation (Gemini/ChatGPT
+// queries run for minutes) by only closing once the page has been
+// stable at its final URL for IDLE_MS.
+const IDLE_MS = 3000;
+const TRACKED_TABS = new Set<number>();
+
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (!isAgentTabUrl(tab.url)) return;
+  if (!TRACKED_TABS.has(tabId)) TRACKED_TABS.add(tabId);
+  if (changeInfo.status !== "complete") return;
+  setTimeout(async () => {
+    try {
+      const t = await chrome.tabs.get(tabId);
+      if (!t || t.url !== tab.url) return; // still navigating / URL changed
+      if (t.active) return; // never close the user's active tab
+      await chrome.tabs.remove(tabId);
+      TRACKED_TABS.delete(tabId);
+    } catch {
+      TRACKED_TABS.delete(tabId);
+    }
+  }, IDLE_MS);
+});
+
+chrome.tabs.onRemoved.addListener((tabId) => {
+  TRACKED_TABS.delete(tabId);
+});
+
+// Explicit close hook for callers that know exactly when they are done.
+async function tabCloseOnDone(tabId: number): Promise<void> {
+  TRACKED_TABS.add(tabId);
+  try {
+    await tabClose(tabId);
+  } finally {
+    TRACKED_TABS.delete(tabId);
+  }
+}
 
 const COMMANDS_WITHOUT_TAB = new Set([
   "LIST_TABS", "NEW_TAB", "TABS_NEW", "TAB_GC", "CLOSE_TABS", "TAB_MOVE", "SWITCH_TAB", "TABS_SWITCH",
