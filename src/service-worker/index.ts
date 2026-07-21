@@ -11,6 +11,77 @@ const activeStreamTabs = new Map<number, number>();
 // When frame.switch is called, subsequent content script messages go to that frame
 const frameContexts = new Map<number, number>();
 
+// ============================================================================
+// HARD-CODED POLICY: tab rules (user override — no escape hatch).
+// Every tab the extension creates MUST be background. The user's working
+// tab must never be touched, focused, or overwritten. There is no public
+// path that focuses a tab; "switch_tab" still moves focus by design but
+// the only way to observe a focused tab is via the user clicking it.
+// ============================================================================
+
+// URL patterns for AI provider tabs that the extension opens.
+// Used by runStartupReconciler() and TAB_GC to enforce zero residue.
+const AGENT_TAB_URL_PATTERNS: RegExp[] = [
+  /^https?:\/\/(?:[a-z0-9-]+\.)?chatgpt\.com\//i,
+  /^https?:\/\/claude\.ai\//i,
+  /^https?:\/\/(?:[a-z0-9-]+\.)?gemini\.google\.com\//i,
+  /^https?:\/\/(?:[a-z0-9-]+\.)?aistudio\.google\.com\//i,
+  /^https?:\/\/(?:www\.)?perplexity\.ai\//i,
+  /^https?:\/\/(?:www\.)?x\.com\/i\/grok/i,
+  /^https?:\/\/grok\.com\//i,
+  /^https?:\/\/(?:www\.)?google\.com\/search\?(?:[^&]*&)*udm=(?:50|14)\b/i,
+];
+
+function isAgentTabUrl(url: string | undefined): boolean {
+  if (!url) return false;
+  return AGENT_TAB_URL_PATTERNS.some((re) => re.test(url));
+}
+
+// Single chokepoint for tab creation. Forces active: false and rejects
+// any caller that asks for focus. This is the only legal way to create
+// a tab from this service worker.
+async function createBackgroundTab(
+  options: chrome.tabs.CreateProperties,
+): Promise<chrome.tabs.Tab> {
+  if ((options as { active?: boolean }).active === true) {
+    throw new Error(
+      "createBackgroundTab: active:true is forbidden by hardcoded policy",
+    );
+  }
+  return chrome.tabs.create({ ...options, active: false });
+}
+
+const STALE_AGENT_TAB_MS = 10 * 60 * 1000; // 10 minutes
+
+// Reconciler: on Chrome startup, close agent tabs older than the threshold.
+// Fail-safe — if lastAccessed is unknown (some Chrome versions omit it),
+// we skip the tab rather than risk closing a live user tab.
+async function runStartupReconciler(): Promise<void> {
+  const cutoff = Date.now() - STALE_AGENT_TAB_MS;
+  let closed = 0;
+  try {
+    const tabs = await chrome.tabs.query({});
+    for (const tab of tabs) {
+      if (!tab.id) continue;
+      if (!isAgentTabUrl(tab.url)) continue;
+      if (typeof tab.lastAccessed !== "number") continue;
+      if (tab.lastAccessed >= cutoff) continue;
+      if (tab.active) continue; // never close the user's active tab
+      try {
+        await chrome.tabs.remove(tab.id);
+        closed++;
+      } catch {
+        // Tab may already be gone — ignore.
+      }
+    }
+  } catch {
+    // Reconciler must not throw — it would block service worker startup.
+  }
+  if (closed > 0) {
+    debugLog(`startup reconciler closed ${closed} stale agent tab(s)`);
+  }
+}
+
 // Helper to get the frame ID for content script messaging
 function getFrameIdForTab(tabId: number): number {
   return frameContexts.get(tabId) ?? 0;
@@ -910,12 +981,15 @@ export async function handleMessage(
         }, 30000);
       });
       
-      await chrome.tabs.update(tabId, { url: message.url });
+      // HARD-CODED POLICY: never reuse the user's active tab.
+      // Open a fresh background tab for navigate; CDP attaches to it.
+      const navTab = await createBackgroundTab({ url: message.url });
+      if (!navTab.id) throw new Error("Failed to create navigation tab");
+      const navTabId = navTab.id;
+      navigationResolvers.set(navTabId, resolve);
       await navigationPromise;
-      
       await new Promise(resolve => setTimeout(resolve, 500));
-      
-      return { success: true };
+      return { success: true, tabId: navTabId };
     }
 
     case "GET_VIEWPORT_SIZE": {
@@ -2525,9 +2599,8 @@ export async function handleMessage(
     case "TABS_CREATE": {
       const activeTab = tabId ? await chrome.tabs.get(tabId) : null;
 
-      const newTab = await chrome.tabs.create({
+      const newTab = await createBackgroundTab({
         url: message.url || "about:blank",
-        active: false,
       });
 
       if (!newTab.id) throw new Error("Failed to create tab");
@@ -2591,20 +2664,49 @@ export async function handleMessage(
       };
     }
 
+    // HARD-CODED POLICY: surf tab.gc — close (or list) leaked agent tabs.
+    // Matches AGENT_TAB_URL_PATTERNS. Without dryRun, closes them.
+    case "TAB_GC": {
+      const dryRun = message.dryRun === true;
+      const tabs = await chrome.tabs.query({});
+      const leaks = tabs
+        .filter((t) => t.id !== undefined && isAgentTabUrl(t.url))
+        .map((t) => ({
+          id: t.id,
+          title: t.title,
+          url: t.url,
+          lastAccessed: t.lastAccessed,
+          active: t.active,
+        }));
+      if (dryRun) {
+        return { dryRun: true, leaks, count: leaks.length };
+      }
+      let closed = 0;
+      const errors: Array<{ id?: number; error: string }> = [];
+      for (const leak of leaks) {
+        // HARD-CODED POLICY: never close the user's active tab.
+        if (leak.active) continue;
+        if (typeof leak.id !== "number") continue;
+        try {
+          await chrome.tabs.remove(leak.id);
+          closed++;
+        } catch (e) {
+          errors.push({ id: leak.id, error: e instanceof Error ? e.message : String(e) });
+        }
+      }
+      return { dryRun: false, requested: leaks.length, closed, errors };
+    }
+
     case "NEW_TAB": {
       const urls = message.urls || (message.url ? [message.url] : ["about:blank"]);
       const createdTabs = [];
-      for (let i = 0; i < urls.length; i++) {
-        const createOptions: chrome.tabs.CreateProperties = {
-          url: urls[i],
-          active: i === 0,
-        };
+      for (const url of urls) {
+        const createOptions: chrome.tabs.CreateProperties = { url };
         // Support creating tab in specific window
-        if (message.windowId) {
-          createOptions.windowId = message.windowId;
-        }
-        const newTab = await chrome.tabs.create(createOptions);
-        if (newTab.id) createdTabs.push({ tabId: newTab.id, url: urls[i] });
+        if (message.windowId) createOptions.windowId = message.windowId;
+        // HARD-CODED POLICY: never focus even the first tab of a multi-URL op.
+        const newTab = await createBackgroundTab(createOptions);
+        if (newTab.id) createdTabs.push({ tabId: newTab.id, url });
       }
       if (createdTabs.length === 1) {
         return { success: true, tabId: createdTabs[0].tabId, url: createdTabs[0].url };
@@ -2613,13 +2715,19 @@ export async function handleMessage(
     }
 
     case "SWITCH_TAB": {
+      // HARD-CODED POLICY: surf never focuses a tab. Even explicit
+      // `surf switch <id>` is a no-op for visibility. Returns metadata
+      // about the target tab so the caller can update local state.
       const targetTabId = message.tabId;
       if (!targetTabId) throw new Error("No tabId provided");
-      const tab = (await chrome.tabs.update(targetTabId, { active: true })) as chrome.tabs.Tab;
-      if (tab.windowId) {
-        await chrome.windows.update(tab.windowId, { focused: true });
-      }
-      return { success: true, tabId: targetTabId, url: tab.url, title: tab.title };
+      const tab = (await chrome.tabs.get(targetTabId)) as chrome.tabs.Tab;
+      return {
+        success: true,
+        tabId: targetTabId,
+        url: tab.url,
+        title: tab.title,
+        note: "background-mode: focus not changed (policy)",
+      };
     }
 
     case "CLOSE_TAB": {
@@ -3131,10 +3239,7 @@ export async function handleMessage(
     }
 
     case "CHATGPT_NEW_TAB": {
-      const tab = await chrome.tabs.create({
-        url: "https://chatgpt.com/",
-        active: true,
-      });
+      const tab = await createBackgroundTab({ url: "https://chatgpt.com/" });
       if (!tab.id) throw new Error("Failed to create tab");
       const currentTab = await chrome.tabs.get(tab.id);
       if (currentTab.status !== "complete") {
@@ -3183,10 +3288,7 @@ export async function handleMessage(
     }
 
     case "PERPLEXITY_NEW_TAB": {
-      const tab = await chrome.tabs.create({
-        url: "https://www.perplexity.ai/",
-        active: true,
-      });
+      const tab = await createBackgroundTab({ url: "https://www.perplexity.ai/" });
       if (!tab.id) throw new Error("Failed to create tab");
       const currentTab = await chrome.tabs.get(tab.id);
       if (currentTab.status !== "complete") {
@@ -3268,10 +3370,7 @@ export async function handleMessage(
     }
 
     case "GROK_NEW_TAB": {
-      const tab = await chrome.tabs.create({
-        url: "https://x.com/i/grok",
-        active: true,
-      });
+      const tab = await createBackgroundTab({ url: "https://x.com/i/grok" });
       if (!tab.id) throw new Error("Failed to create tab");
       const currentTab = await chrome.tabs.get(tab.id);
       if (currentTab.status !== "complete") {
@@ -3320,10 +3419,7 @@ export async function handleMessage(
     }
 
     case "GEMINI_NEW_TAB": {
-      const tab = await chrome.tabs.create({
-        url: "https://gemini.google.com/app",
-        active: true,
-      });
+      const tab = await createBackgroundTab({ url: "https://gemini.google.com/app" });
       if (!tab.id) throw new Error("Failed to create tab");
       return { tabId: tab.id };
     }
@@ -3371,7 +3467,7 @@ export async function handleMessage(
 
     case "AISTUDIO_NEW_TAB": {
       const url = message.url || "https://aistudio.google.com/prompts/new_chat";
-      const tab = await chrome.tabs.create({ url, active: true });
+      const tab = await createBackgroundTab({ url });
       if (!tab.id) throw new Error("Failed to create tab");
       const currentTab = await chrome.tabs.get(tab.id);
       if (currentTab.status !== "complete") {
@@ -3563,8 +3659,13 @@ chrome.runtime.onInstalled.addListener((details) => {
   debugLog("Extension installed/updated:", details.reason);
 });
 
+chrome.runtime.onStartup.addListener(() => {
+  debugLog("Extension startup — running agent-tab reconciler");
+  void runStartupReconciler();
+});
+
 const COMMANDS_WITHOUT_TAB = new Set([
-  "LIST_TABS", "NEW_TAB", "TABS_NEW", "CLOSE_TABS", "TAB_MOVE", "SWITCH_TAB", "TABS_SWITCH",
+  "LIST_TABS", "NEW_TAB", "TABS_NEW", "TAB_GC", "CLOSE_TABS", "TAB_MOVE", "SWITCH_TAB", "TABS_SWITCH",
   "TABS_REGISTER", "TABS_UNREGISTER", "TABS_LIST_NAMED", "TABS_GET_BY_NAME",
   "CREATE_TAB_GROUP", "UNGROUP_TABS", "LIST_TAB_GROUPS", "GET_HISTORY", "SEARCH_HISTORY",
   "GET_COOKIES", "SET_COOKIE", "DELETE_COOKIES", "GET_BOOKMARKS", "ADD_BOOKMARK", 
@@ -3612,9 +3713,8 @@ initNativeMessaging(async (msg) => {
       if (!tab?.id) {
         // No usable tab - auto-create one with a minimal page
         const newTab = await chrome.tabs.create({ 
-          windowId, 
+          windowId,
           url: 'data:text/html,<html><head><title>Surf</title></head><body></body></html>',
-          active: true 
         });
         if (!newTab.id) {
           throw new Error(`Failed to create tab in window ${windowId}`);
