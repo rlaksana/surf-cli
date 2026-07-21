@@ -37,18 +37,39 @@ function isAgentTabUrl(url: string | undefined): boolean {
   return AGENT_TAB_URL_PATTERNS.some((re) => re.test(url));
 }
 
-// Single chokepoint for tab creation. Forces active: false and rejects
-// any caller that asks for focus. This is the only legal way to create
-// a tab from this service worker.
+// Single chokepoint for tab creation. Forces active: false AND schedules
+// auto-close. This is the only legal way to create a tab from this
+// service worker.
+//
+// HARD-CODED POLICY (user override — no escape hatch):
+//   - active: true is rejected at runtime.
+//   - default auto-close after AUTO_CLOSE_DEFAULT_MS (5s) so that any
+//     tab left behind after the operation completes is reaped.
+//   - AI provider tabs need longer grace (they run queries that take
+//     minutes); pass keepOpenMs: 10*60*1000 in those callers.
+const AUTO_CLOSE_DEFAULT_MS = 5_000;
+
 async function createBackgroundTab(
-  options: chrome.tabs.CreateProperties,
+  options: chrome.tabs.CreateProperties & { keepOpenMs?: number },
 ): Promise<chrome.tabs.Tab> {
-  if ((options as { active?: boolean }).active === true) {
+  const { keepOpenMs, ...rest } = options;
+  if ((rest as { active?: boolean }).active === true) {
     throw new Error(
       "createBackgroundTab: active:true is forbidden by hardcoded policy",
     );
   }
-  return chrome.tabs.create({ ...options, active: false });
+  const tab = await chrome.tabs.create({ ...rest, active: false });
+  const closeMs = typeof keepOpenMs === "number" ? keepOpenMs : AUTO_CLOSE_DEFAULT_MS;
+  if (closeMs > 0 && typeof tab.id === "number") {
+    const tabId = tab.id;
+    setTimeout(() => {
+      chrome.tabs.remove(tabId).catch(() => {
+        // Tab may already be gone (AI client closed it in finally,
+        // user closed it manually, etc.) — ignore.
+      });
+    }, closeMs);
+  }
+  return tab;
 }
 
 const STALE_AGENT_TAB_MS = 10 * 60 * 1000; // 10 minutes
@@ -3242,7 +3263,7 @@ export async function handleMessage(
     }
 
     case "CHATGPT_NEW_TAB": {
-      const tab = await createBackgroundTab({ url: "https://chatgpt.com/" });
+      const tab = await createBackgroundTab({ url: "https://chatgpt.com/", keepOpenMs: 10 * 60 * 1000 });
       if (!tab.id) throw new Error("Failed to create tab");
       const currentTab = await chrome.tabs.get(tab.id);
       if (currentTab.status !== "complete") {
@@ -3291,7 +3312,7 @@ export async function handleMessage(
     }
 
     case "PERPLEXITY_NEW_TAB": {
-      const tab = await createBackgroundTab({ url: "https://www.perplexity.ai/" });
+      const tab = await createBackgroundTab({ url: "https://www.perplexity.ai/", keepOpenMs: 10 * 60 * 1000 });
       if (!tab.id) throw new Error("Failed to create tab");
       const currentTab = await chrome.tabs.get(tab.id);
       if (currentTab.status !== "complete") {
@@ -3373,7 +3394,7 @@ export async function handleMessage(
     }
 
     case "GROK_NEW_TAB": {
-      const tab = await createBackgroundTab({ url: "https://x.com/i/grok" });
+      const tab = await createBackgroundTab({ url: "https://x.com/i/grok", keepOpenMs: 10 * 60 * 1000 });
       if (!tab.id) throw new Error("Failed to create tab");
       const currentTab = await chrome.tabs.get(tab.id);
       if (currentTab.status !== "complete") {
@@ -3422,7 +3443,7 @@ export async function handleMessage(
     }
 
     case "GEMINI_NEW_TAB": {
-      const tab = await createBackgroundTab({ url: "https://gemini.google.com/app" });
+      const tab = await createBackgroundTab({ url: "https://gemini.google.com/app", keepOpenMs: 10 * 60 * 1000 });
       if (!tab.id) throw new Error("Failed to create tab");
       return { tabId: tab.id };
     }
@@ -3470,7 +3491,7 @@ export async function handleMessage(
 
     case "AISTUDIO_NEW_TAB": {
       const url = message.url || "https://aistudio.google.com/prompts/new_chat";
-      const tab = await createBackgroundTab({ url });
+      const tab = await createBackgroundTab({ url, keepOpenMs: 10 * 60 * 1000 });
       if (!tab.id) throw new Error("Failed to create tab");
       const currentTab = await chrome.tabs.get(tab.id);
       if (currentTab.status !== "complete") {
