@@ -63,35 +63,14 @@ async function tabClose(tabId: number): Promise<void> {
   }
 }
 
-const STALE_AGENT_TAB_MS = 10 * 60 * 1000; // 10 minutes
+const STALE_AGENT_TAB_MS = 10 * 60 * 1000; // 10 minutes (retained for reference; unused while disabled)
 
-// Reconciler: on Chrome startup, close agent tabs older than the threshold.
-// Fail-safe — if lastAccessed is unknown (some Chrome versions omit it),
-// we skip the tab rather than risk closing a live user tab.
+// Reconciler: disabled. See policy comment near IDLE_MS above.
+// The old behaviour closed any AI-provider tab older than 10 minutes on
+// Chrome startup. We cannot prove ownership from URL alone, and closing
+// the user's tab is worse than leaking a Surf residue tab.
 async function runStartupReconciler(): Promise<void> {
-  const cutoff = Date.now() - STALE_AGENT_TAB_MS;
-  let closed = 0;
-  try {
-    const tabs = await chrome.tabs.query({});
-    for (const tab of tabs) {
-      if (!tab.id) continue;
-      if (!isAgentTabUrl(tab.url)) continue;
-      if (typeof tab.lastAccessed !== "number") continue;
-      if (tab.lastAccessed >= cutoff) continue;
-      if (tab.active) continue; // never close the user's active tab
-      try {
-        await chrome.tabs.remove(tab.id);
-        closed++;
-      } catch {
-        // Tab may already be gone — ignore.
-      }
-    }
-  } catch {
-    // Reconciler must not throw — it would block service worker startup.
-  }
-  if (closed > 0) {
-    debugLog(`startup reconciler closed ${closed} stale agent tab(s)`);
-  }
+  /* startup reconciler disabled — see policy comment above */
 }
 
 // Helper to get the frame ID for content script messaging
@@ -3679,30 +3658,20 @@ chrome.runtime.onStartup.addListener(() => {
   void runStartupReconciler();
 });
 
-// HARD-CODED POLICY: auto-close on done.
-// When a tab created by createBackgroundTab finishes loading and the
-// URL has not changed for IDLE_MS, treat it as "operation done" and
-// close it. This protects long-running automation (Gemini/ChatGPT
-// queries run for minutes) by only closing once the page has been
-// stable at its final URL for IDLE_MS.
-const IDLE_MS = 3000;
-const TRACKED_TABS = new Set<number>();
+// HARD-CODED POLICY: auto-close disabled.
+// URL-based auto-close is turned OFF. Surf used to close any tab whose URL
+// matched an AI provider after IDLE_MS of stability. That logic was unsafe:
+// it could not prove the tab belonged to Surf (a user tab on chatgpt.com is
+// indistinguishable from a Surf tab on chatgpt.com), and it would occasionally
+// close the user's own tab mid-session. Until a reliable ownership signal
+// exists, Surf must NOT close tabs on its own. Callers that genuinely own a
+// tab may still close it explicitly via tabClose() / tabCloseOnDone().
+const IDLE_MS = 3000; // retained for reference; not used while disabled
+const TRACKED_TABS = new Set<number>(); // reserved for future ownership tracking
 
-chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
-  if (!isAgentTabUrl(tab.url)) return;
-  if (!TRACKED_TABS.has(tabId)) TRACKED_TABS.add(tabId);
-  if (changeInfo.status !== "complete") return;
-  setTimeout(async () => {
-    try {
-      const t = await chrome.tabs.get(tabId);
-      if (!t || t.url !== tab.url) return; // still navigating / URL changed
-      if (t.active) return; // never close the user's active tab
-      await chrome.tabs.remove(tabId);
-      TRACKED_TABS.delete(tabId);
-    } catch {
-      TRACKED_TABS.delete(tabId);
-    }
-  }, IDLE_MS);
+// Intentionally no-op: do not track or close tabs based on URL.
+chrome.tabs.onUpdated.addListener(() => {
+  /* auto-close disabled — see policy comment above */
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
