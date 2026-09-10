@@ -1352,7 +1352,7 @@ const TOOLS = {
           width: "Window width",
           height: "Window height",
           incognito: "Open incognito window",
-          unfocused: "Don't focus the new window"
+          unfocused: "No-op: windows are always created in background"
         },
         examples: [
           { cmd: 'window.new "https://example.com"', desc: "New window with URL" },
@@ -1369,7 +1369,7 @@ const TOOLS = {
       "window.focus": {
         desc: "Focus a window by ID",
         args: ["id"],
-        examples: [{ cmd: "window.focus 123", desc: "Focus window" }]
+        examples: [{ cmd: "window.focus 123", desc: "Returns window info (policy: never focuses)" }]
       },
       "window.close": {
         desc: "Close a window by ID",
@@ -1521,7 +1521,7 @@ All commands in that window:
 Manage windows:
   surf window.list              # List all windows
   surf window.list --tabs       # Include tab details
-  surf window.focus 123         # Bring window to front
+  surf window.focus 123         # Info only — policy forbids changing focus
   surf window.close 123         # Close when done
 
 Tips:

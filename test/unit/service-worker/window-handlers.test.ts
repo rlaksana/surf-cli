@@ -40,12 +40,27 @@ describe("window command handlers", () => {
       expect(chrome.windows.create).toHaveBeenCalledWith(
         expect.objectContaining({
           url: "https://example.com",
-          focused: true,
+          focused: false,
           type: "normal",
         }),
       );
       expect(result.windowId).toBe(123);
       expect(result.tabId).toBe(456);
+    });
+
+    it("ignores focused:true — hardcoded background policy", async () => {
+      const chrome = (globalThis as any).chrome;
+      chrome.windows.create.mockResolvedValue({ id: 123 });
+      chrome.tabs.query.mockResolvedValue([{ id: 456 }]);
+
+      await handleMessage(
+        { type: "WINDOW_NEW", url: "https://example.com", focused: true },
+        {},
+      );
+
+      expect(chrome.windows.create).toHaveBeenCalledWith(
+        expect.objectContaining({ focused: false }),
+      );
     });
 
     it("creates window with dimensions", async () => {
@@ -117,14 +132,15 @@ describe("window command handlers", () => {
   });
 
   describe("WINDOW_FOCUS", () => {
-    it("focuses window by ID", async () => {
+    it("never focuses — returns policy note", async () => {
       const chrome = (globalThis as any).chrome;
       chrome.windows.update.mockResolvedValue({});
 
       const result = await handleMessage({ type: "WINDOW_FOCUS", windowId: 123 }, {});
 
-      expect(chrome.windows.update).toHaveBeenCalledWith(123, { focused: true });
+      expect(chrome.windows.update).not.toHaveBeenCalled();
       expect(result.success).toBe(true);
+      expect(result.note).toContain("policy");
     });
 
     it("throws without windowId", async () => {

@@ -71,6 +71,10 @@ type ChromeMock = {
       addListener: ReturnType<typeof vi.fn>;
       removeListener: ReturnType<typeof vi.fn>;
     };
+    onStartup: {
+      addListener: ReturnType<typeof vi.fn>;
+      removeListener: ReturnType<typeof vi.fn>;
+    };
     connectNative: ReturnType<typeof vi.fn>;
     lastError: null | { message: string };
     getURL: ReturnType<typeof vi.fn>;
@@ -92,6 +96,12 @@ type ChromeMock = {
     onChanged: {
       addListener: ReturnType<typeof vi.fn>;
       removeListener: ReturnType<typeof vi.fn>;
+    };
+    session: {
+      get: ReturnType<typeof vi.fn>;
+      set: ReturnType<typeof vi.fn>;
+      remove: ReturnType<typeof vi.fn>;
+      clear: ReturnType<typeof vi.fn>;
     };
   };
   windows: {
@@ -171,6 +181,10 @@ export function createChromeMock(): ChromeMock {
         addListener: vi.fn(),
         removeListener: vi.fn(),
       },
+      onStartup: {
+        addListener: vi.fn(),
+        removeListener: vi.fn(),
+      },
       connectNative: vi.fn().mockReturnValue({
         postMessage: vi.fn(),
         disconnect: vi.fn(),
@@ -197,6 +211,12 @@ export function createChromeMock(): ChromeMock {
       onChanged: {
         addListener: vi.fn(),
         removeListener: vi.fn(),
+      },
+      session: {
+        get: vi.fn().mockResolvedValue({}),
+        set: vi.fn().mockResolvedValue(undefined),
+        remove: vi.fn().mockResolvedValue(undefined),
+        clear: vi.fn().mockResolvedValue(undefined),
       },
     },
     windows: {

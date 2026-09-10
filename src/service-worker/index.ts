@@ -63,6 +63,57 @@ async function tabClose(tabId: number): Promise<void> {
   }
 }
 
+// Dedicated background tab for commands that don't pass --tab-id.
+// HARD-CODED POLICY: the default resolver must never target the user's
+// active tab — surf runs in its own session-owned background tab. The ID
+// survives service-worker restarts via chrome.storage.session (cleared on
+// browser restart); a closed/stale ID is detected and the tab is recreated
+// on the next command.
+let surfTabIdCache: number | null = null;
+
+const SURF_TAB_URL = 'data:text/html,<html><head><title>Surf</title></head><body></body></html>';
+
+export async function getOrCreateSurfTab(): Promise<{
+  tab: chrome.tabs.Tab;
+  created: boolean;
+} | null> {
+  if (surfTabIdCache !== null) {
+    try {
+      return { tab: await chrome.tabs.get(surfTabIdCache), created: false };
+    } catch {
+      surfTabIdCache = null; // closed manually — recreate below
+    }
+  }
+  try {
+    const stored = await chrome.storage.session.get("surfTabId");
+    const storedId = stored?.surfTabId;
+    if (typeof storedId === "number") {
+      const tab = await chrome.tabs.get(storedId);
+      surfTabIdCache = storedId;
+      return { tab, created: false };
+    }
+  } catch {
+    // storage.session unavailable — fall through to creation
+  }
+
+  const [active] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+  const created = await createBackgroundTab(
+    active?.windowId !== undefined
+      ? { windowId: active.windowId, url: SURF_TAB_URL }
+      : { url: SURF_TAB_URL },
+  );
+  if (!created.id) return null;
+  surfTabIdCache = created.id;
+  try {
+    await chrome.storage.session.set({ surfTabId: created.id });
+  } catch {
+    // non-fatal: worst case the tab is recreated after a SW restart
+  }
+  // Give the blank page a moment before the first command runs on it
+  await new Promise((r) => setTimeout(r, 100));
+  return { tab: created, created: true };
+}
+
 const STALE_AGENT_TAB_MS = 10 * 60 * 1000; // 10 minutes (retained for reference; unused while disabled)
 
 // Reconciler: disabled. See policy comment near IDLE_MS above.
@@ -3553,8 +3604,10 @@ export async function handleMessage(
       // Default to a usable blank page if no URL provided
       const url = message.url || 'data:text/html,<html><head><title>Surf Agent</title></head><body style="font-family:system-ui;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;color:%23666"><div style="text-align:center"><h2>Agent Window</h2><p>Ready for automation</p></div></body></html>';
       
+      // HARD-CODED POLICY: surf never takes focus. New windows are always
+      // created in the background; message.focused is ignored.
       const createOptions: chrome.windows.CreateData = {
-        focused: message.focused !== false,
+        focused: false,
         type: "normal",
         url,
       };
@@ -3612,10 +3665,13 @@ export async function handleMessage(
     }
 
     case "WINDOW_FOCUS": {
+      // HARD-CODED POLICY: surf never focuses a window (mirrors SWITCH_TAB).
       if (!message.windowId) throw new Error("No windowId provided");
-      
-      await chrome.windows.update(message.windowId, { focused: true });
-      return { success: true, windowId: message.windowId };
+      return {
+        success: true,
+        windowId: message.windowId,
+        note: "background-mode: focus not changed (policy)",
+      };
     }
 
     case "WINDOW_CLOSE": {
@@ -3711,6 +3767,7 @@ initNativeMessaging(async (msg) => {
   const isDialogCommand = msg.type?.startsWith("DIALOG_");
   const needsTab = !COMMANDS_WITHOUT_TAB.has(msg.type);
   let autoCreatedTab = false;
+  let createdSurfTab = false;
   
   if (tabId && !isDialogCommand) {
     try {
@@ -3736,7 +3793,7 @@ initNativeMessaging(async (msg) => {
       
       if (!tab?.id) {
         // No usable tab - auto-create one with a minimal page
-        const newTab = await chrome.tabs.create({ 
+        const newTab = await createBackgroundTab({
           windowId,
           url: 'data:text/html,<html><head><title>Surf</title></head><body></body></html>',
         });
@@ -3749,20 +3806,15 @@ initNativeMessaging(async (msg) => {
         autoCreatedTab = true;
       }
     } else {
-      // Default behavior: find active tab across windows
-      tabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
-      tab = tabs[0];
-      if (!tab || isRestrictedTabUrl(tab.url)) {
-        tabs = await chrome.tabs.query({ active: true, currentWindow: true });
-        tab = tabs[0];
-      }
-      if (!tab || isRestrictedTabUrl(tab.url)) {
-        tabs = await chrome.tabs.query({ active: true });
-        tab = tabs.find(t => !isRestrictedTabUrl(t.url));
-      }
-      if (!tab?.id) {
+      // HARD-CODED POLICY: surf never operates on the user's active tab.
+      // Default commands run in the session-owned background surf tab;
+      // pass --tab-id to target a specific tab.
+      const surfTab = await getOrCreateSurfTab();
+      if (!surfTab?.tab.id) {
         throw new Error("No active tab found. Use 'surf tab.new <url>' to create one, or 'surf tab.list' to see available tabs.");
       }
+      tab = surfTab.tab;
+      createdSurfTab = surfTab.created;
     }
     tabId = tab.id;
   }
@@ -3773,6 +3825,9 @@ initNativeMessaging(async (msg) => {
   const hints: string[] = [];
   if (autoCreatedTab) {
     hints.push(`Auto-created tab in window ${windowId} (no usable tabs existed). Navigate to your target URL.`);
+  }
+  if (createdSurfTab) {
+    hints.push(`Dedicated background tab created (id ${tabId}). Surf runs here by default; pass --tab-id to target a specific tab.`);
   }
   
   return { 

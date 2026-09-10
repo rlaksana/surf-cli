@@ -48,8 +48,8 @@ describe("mapToolToMessage", () => {
       expect(msg.incognito).toBe(true);
     });
 
-    it("maps window.new --unfocused to focused: false", () => {
-      const msg = helpers.mapToolToMessage("window.new", { unfocused: true });
+    it("always maps window.new to focused: false (background policy)", () => {
+      const msg = helpers.mapToolToMessage("window.new", {});
       expect(msg.focused).toBe(false);
     });
 

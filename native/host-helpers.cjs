@@ -1178,7 +1178,7 @@ function mapToolToMessage(tool, args, tabId) {
         width: a.width ? parseInt(a.width, 10) : undefined,
         height: a.height ? parseInt(a.height, 10) : undefined,
         incognito: a.incognito || false,
-        focused: a.unfocused ? false : true,
+        focused: false,
       };
     case "window.list":
       return { type: "WINDOW_LIST", includeTabs: a.tabs || false };
