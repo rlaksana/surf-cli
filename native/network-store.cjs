@@ -1,22 +1,23 @@
 /**
  * Network Storage Module for surf-cli
- * 
+ *
  * Handles persistent storage of network requests with:
  * - JSONL append-only log
  * - Content-hash dedup for body storage
  * - Auto-cleanup with TTL and size limits
  */
 
-const fs = require("fs");
-const path = require("path");
-const crypto = require("crypto");
-const readline = require("readline");
+const fs = require("node:fs");
+const path = require("node:path");
+const crypto = require("node:crypto");
+const readline = require("node:readline");
 
 // Configuration
-const DEFAULT_BASE = process.platform === "win32"
-  ? require("path").join(require("os").tmpdir(), "surf")
-  : "/tmp/surf";
-const DEFAULT_TTL = 24 * 60 * 60 * 1000;  // 24 hours
+const DEFAULT_BASE =
+  process.platform === "win32"
+    ? require("node:path").join(require("node:os").tmpdir(), "surf")
+    : "/tmp/surf";
+const DEFAULT_TTL = 24 * 60 * 60 * 1000; // 24 hours
 const DEFAULT_MAX_SIZE = 200 * 1024 * 1024; // 200MB
 const AUTO_CLEANUP_INTERVAL = 60 * 60 * 1000; // 1 hour
 
@@ -68,7 +69,7 @@ function getMetaPath() {
 function ensureDirectories() {
   const base = getBasePath();
   const bodies = getBodiesPath();
-  
+
   if (!fs.existsSync(base)) {
     fs.mkdirSync(base, { recursive: true });
   }
@@ -86,7 +87,7 @@ function readMeta() {
     if (fs.existsSync(metaPath)) {
       return JSON.parse(fs.readFileSync(metaPath, "utf-8"));
     }
-  } catch (err) {
+  } catch (_err) {
     // Ignore errors, return default
   }
   return { lastCleanup: 0 };
@@ -116,17 +117,17 @@ function generateId() {
  */
 function storeBody(content, isRequest = false) {
   ensureDirectories();
-  
+
   const buffer = Buffer.isBuffer(content) ? content : Buffer.from(content);
   const hash = crypto.createHash("sha256").update(buffer).digest("hex").slice(0, 16);
   const ext = isRequest ? "req" : "res";
   const bodyPath = path.join(getBodiesPath(), `${hash}.${ext}`);
-  
+
   // Only write if doesn't exist (dedup)
   if (!fs.existsSync(bodyPath)) {
     fs.writeFileSync(bodyPath, buffer);
   }
-  
+
   return hash;
 }
 
@@ -139,12 +140,12 @@ function storeBody(content, isRequest = false) {
 function readBody(hash, isRequest = false) {
   const ext = isRequest ? "req" : "res";
   const bodyPath = path.join(getBodiesPath(), `${hash}.${ext}`);
-  
+
   try {
     if (fs.existsSync(bodyPath)) {
       return fs.readFileSync(bodyPath);
     }
-  } catch (err) {
+  } catch (_err) {
     // Ignore errors
   }
   return null;
@@ -168,29 +169,31 @@ function getBodyPath(hash, isRequest = false) {
  */
 async function appendEntry(entry) {
   ensureDirectories();
-  
+
   // Serialize writes
   const releasePromise = writeLock;
   let release;
-  writeLock = new Promise(r => { release = r; });
-  
+  writeLock = new Promise((r) => {
+    release = r;
+  });
+
   await releasePromise;
-  
+
   try {
     const id = entry.id || generateId();
     const timestamp = entry.timestamp || Date.now();
-    
+
     const fullEntry = {
       id,
       timestamp,
-      ...entry
+      ...entry,
     };
-    
-    const line = JSON.stringify(fullEntry) + "\n";
-    
+
+    const line = `${JSON.stringify(fullEntry)}\n`;
+
     // Atomic append using flag 'a'
     fs.appendFileSync(getRequestsPath(), line, { flag: "a" });
-    
+
     return fullEntry;
   } finally {
     release();
@@ -204,26 +207,26 @@ async function appendEntry(entry) {
  */
 function appendEntrySync(entry) {
   ensureDirectories();
-  
+
   const id = entry.id || generateId();
   const timestamp = entry.timestamp || Date.now();
-  
+
   const fullEntry = {
     id,
     timestamp,
-    ...entry
+    ...entry,
   };
-  
-  const line = JSON.stringify(fullEntry) + "\n";
-  
+
+  const line = `${JSON.stringify(fullEntry)}\n`;
+
   // Use a simple lock file for synchronous operations
   const lockPath = path.join(getBasePath(), ".lock");
   let lockFd;
-  
+
   try {
     // Try to acquire lock
     lockFd = fs.openSync(lockPath, "wx");
-  } catch (err) {
+  } catch (_err) {
     // Lock exists - check if stale and remove, otherwise proceed without lock
     try {
       const stat = fs.statSync(lockPath);
@@ -231,21 +234,21 @@ function appendEntrySync(entry) {
         fs.unlinkSync(lockPath);
         try {
           lockFd = fs.openSync(lockPath, "wx");
-        } catch (e) {
+        } catch (_e) {
           // Still can't get lock, proceed without it
         }
       }
-    } catch (e) {
+    } catch (_e) {
       // Lock file gone or inaccessible, proceed without lock
     }
-    
+
     if (lockFd === undefined) {
       // Proceed without lock as fallback
       fs.appendFileSync(getRequestsPath(), line, { flag: "a" });
       return fullEntry;
     }
   }
-  
+
   try {
     fs.appendFileSync(getRequestsPath(), line, { flag: "a" });
   } finally {
@@ -253,10 +256,10 @@ function appendEntrySync(entry) {
       fs.closeSync(lockFd);
       try {
         fs.unlinkSync(lockPath);
-      } catch (e) {}
+      } catch (_e) {}
     }
   }
-  
+
   return fullEntry;
 }
 
@@ -267,7 +270,7 @@ function getOriginFromUrl(url) {
   try {
     const parsed = new URL(url);
     return parsed.origin;
-  } catch (e) {
+  } catch (_e) {
     return null;
   }
 }
@@ -276,26 +279,26 @@ function getOriginFromUrl(url) {
  * Check if URL matches pattern
  */
 function matchesUrlPattern(url, pattern) {
-  if (!pattern) return true;
-  
+  if (!pattern) {
+    return true;
+  }
+
   // Support regex patterns
   if (pattern.startsWith("/") && pattern.endsWith("/")) {
     try {
       const regex = new RegExp(pattern.slice(1, -1));
       return regex.test(url);
-    } catch (e) {
+    } catch (_e) {
       return false;
     }
   }
-  
+
   // Simple glob-like matching
   if (pattern.includes("*")) {
-    const regexPattern = pattern
-      .replace(/[.+^${}()|[\]\\]/g, "\\$&")
-      .replace(/\*/g, ".*");
+    const regexPattern = pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*");
     return new RegExp(regexPattern).test(url);
   }
-  
+
   // Simple substring match
   return url.includes(pattern);
 }
@@ -304,73 +307,90 @@ function matchesUrlPattern(url, pattern) {
  * Check if entry matches filters
  */
 function matchesFilters(entry, filters) {
-  if (!filters) return true;
-  
-  const {
-    origin,
-    method,
-    status,
-    type,
-    since,
-    hasBody,
-    excludeStatic,
-    urlPattern
-  } = filters;
-  
+  if (!filters) {
+    return true;
+  }
+
+  const { origin, method, status, type, since, hasBody, excludeStatic, urlPattern } = filters;
+
   // Filter by origin
   if (origin) {
     const entryOrigin = getOriginFromUrl(entry.url);
-    if (entryOrigin !== origin) return false;
+    if (entryOrigin !== origin) {
+      return false;
+    }
   }
-  
+
   // Filter by method
   if (method && entry.method !== method.toUpperCase()) {
     return false;
   }
-  
+
   // Filter by status
   if (status !== undefined) {
-    if (typeof status === "number" && entry.status !== status) return false;
+    if (typeof status === "number" && entry.status !== status) {
+      return false;
+    }
     if (typeof status === "string") {
       const statusStr = String(entry.status);
       if (status.endsWith("xx")) {
         // Range like "2xx", "4xx"
-        if (!statusStr.startsWith(status[0])) return false;
+        if (!statusStr.startsWith(status[0])) {
+          return false;
+        }
       } else if (entry.status !== parseInt(status, 10)) {
         return false;
       }
     }
   }
-  
+
   // Filter by content type
   if (type) {
     const contentType = entry.contentType || entry.responseHeaders?.["content-type"] || "";
-    if (!contentType.includes(type)) return false;
+    if (!contentType.includes(type)) {
+      return false;
+    }
   }
-  
+
   // Filter by timestamp
   if (since && entry.timestamp < since) {
     return false;
   }
-  
+
   // Filter by body presence
   if (hasBody !== undefined) {
     const hasResponseBody = !!entry.responseBodyHash;
-    if (hasBody !== hasResponseBody) return false;
+    if (hasBody !== hasResponseBody) {
+      return false;
+    }
   }
-  
+
   // Exclude static assets
   if (excludeStatic) {
-    const staticExts = [".css", ".js", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".woff", ".woff2", ".ttf", ".ico"];
+    const staticExts = [
+      ".css",
+      ".js",
+      ".png",
+      ".jpg",
+      ".jpeg",
+      ".gif",
+      ".svg",
+      ".woff",
+      ".woff2",
+      ".ttf",
+      ".ico",
+    ];
     const urlPath = entry.url.split("?")[0].toLowerCase();
-    if (staticExts.some(ext => urlPath.endsWith(ext))) return false;
+    if (staticExts.some((ext) => urlPath.endsWith(ext))) {
+      return false;
+    }
   }
-  
+
   // URL pattern matching
   if (urlPattern && !matchesUrlPattern(entry.url, urlPattern)) {
     return false;
   }
-  
+
   return true;
 }
 
@@ -381,34 +401,36 @@ function matchesFilters(entry, filters) {
  */
 async function readEntries(filters = {}) {
   const requestsPath = getRequestsPath();
-  
+
   if (!fs.existsSync(requestsPath)) {
     return [];
   }
-  
+
   const { last } = filters;
   const entries = [];
-  
+
   return new Promise((resolve, reject) => {
     const fileStream = fs.createReadStream(requestsPath, { encoding: "utf-8" });
     const rl = readline.createInterface({
       input: fileStream,
-      crlfDelay: Infinity
+      crlfDelay: Infinity,
     });
-    
+
     rl.on("line", (line) => {
-      if (!line.trim()) return;
-      
+      if (!line.trim()) {
+        return;
+      }
+
       try {
         const entry = JSON.parse(line);
         if (matchesFilters(entry, filters)) {
           entries.push(entry);
         }
-      } catch (err) {
+      } catch (_err) {
         // Skip malformed lines
       }
     });
-    
+
     rl.on("close", () => {
       // Apply 'last' filter after collecting all matches
       if (last && last > 0) {
@@ -417,7 +439,7 @@ async function readEntries(filters = {}) {
         resolve(entries);
       }
     });
-    
+
     rl.on("error", reject);
   });
 }
@@ -429,34 +451,36 @@ async function readEntries(filters = {}) {
  */
 function readEntriesSync(filters = {}) {
   const requestsPath = getRequestsPath();
-  
+
   if (!fs.existsSync(requestsPath)) {
     return [];
   }
-  
+
   const { last } = filters;
   const entries = [];
-  
+
   const content = fs.readFileSync(requestsPath, "utf-8");
   const lines = content.split("\n");
-  
+
   for (const line of lines) {
-    if (!line.trim()) continue;
-    
+    if (!line.trim()) {
+      continue;
+    }
+
     try {
       const entry = JSON.parse(line);
       if (matchesFilters(entry, filters)) {
         entries.push(entry);
       }
-    } catch (err) {
+    } catch (_err) {
       // Skip malformed lines
     }
   }
-  
+
   if (last && last > 0) {
     return entries.slice(-last);
   }
-  
+
   return entries;
 }
 
@@ -467,7 +491,7 @@ function readEntriesSync(filters = {}) {
  */
 async function getEntry(id) {
   const entries = await readEntries();
-  return entries.find(e => e.id === id) || null;
+  return entries.find((e) => e.id === id) || null;
 }
 
 /**
@@ -477,7 +501,7 @@ async function getEntry(id) {
  */
 function getEntrySync(id) {
   const entries = readEntriesSync();
-  return entries.find(e => e.id === id) || null;
+  return entries.find((e) => e.id === id) || null;
 }
 
 /**
@@ -487,14 +511,14 @@ function getEntrySync(id) {
 async function getOrigins() {
   const entries = await readEntries();
   const origins = {};
-  
+
   for (const entry of entries) {
     const origin = getOriginFromUrl(entry.url);
     if (origin) {
       origins[origin] = (origins[origin] || 0) + 1;
     }
   }
-  
+
   return origins;
 }
 
@@ -505,14 +529,14 @@ async function getOrigins() {
 function getOriginsSync() {
   const entries = readEntriesSync();
   const origins = {};
-  
+
   for (const entry of entries) {
     const origin = getOriginFromUrl(entry.url);
     if (origin) {
       origins[origin] = (origins[origin] || 0) + 1;
     }
   }
-  
+
   return origins;
 }
 
@@ -526,16 +550,20 @@ async function getStats() {
   const origins = {};
   let oldestEntry = Infinity;
   let newestEntry = 0;
-  
+
   for (const entry of entries) {
     const origin = getOriginFromUrl(entry.url);
     if (origin) {
       origins[origin] = (origins[origin] || 0) + 1;
     }
-    if (entry.timestamp < oldestEntry) oldestEntry = entry.timestamp;
-    if (entry.timestamp > newestEntry) newestEntry = entry.timestamp;
+    if (entry.timestamp < oldestEntry) {
+      oldestEntry = entry.timestamp;
+    }
+    if (entry.timestamp > newestEntry) {
+      newestEntry = entry.timestamp;
+    }
   }
-  
+
   // Calculate body size
   let totalBodySize = 0;
   const bodiesDir = getBodiesPath();
@@ -545,17 +573,17 @@ async function getStats() {
       try {
         const stat = fs.statSync(path.join(bodiesDir, file));
         totalBodySize += stat.size;
-      } catch (err) {}
+      } catch (_err) {}
     }
   }
-  
+
   return {
     totalRequests: entries.length,
     totalBodySize,
     oldestEntry: oldestEntry === Infinity ? null : oldestEntry,
     newestEntry: newestEntry === 0 ? null : newestEntry,
     lastCleanup: meta.lastCleanup || null,
-    origins
+    origins,
   };
 }
 
@@ -568,16 +596,20 @@ function getStatsSync() {
   const origins = {};
   let oldestEntry = Infinity;
   let newestEntry = 0;
-  
+
   for (const entry of entries) {
     const origin = getOriginFromUrl(entry.url);
     if (origin) {
       origins[origin] = (origins[origin] || 0) + 1;
     }
-    if (entry.timestamp < oldestEntry) oldestEntry = entry.timestamp;
-    if (entry.timestamp > newestEntry) newestEntry = entry.timestamp;
+    if (entry.timestamp < oldestEntry) {
+      oldestEntry = entry.timestamp;
+    }
+    if (entry.timestamp > newestEntry) {
+      newestEntry = entry.timestamp;
+    }
   }
-  
+
   // Calculate body size
   let totalBodySize = 0;
   const bodiesDir = getBodiesPath();
@@ -587,17 +619,17 @@ function getStatsSync() {
       try {
         const stat = fs.statSync(path.join(bodiesDir, file));
         totalBodySize += stat.size;
-      } catch (err) {}
+      } catch (_err) {}
     }
   }
-  
+
   return {
     totalRequests: entries.length,
     totalBodySize,
     oldestEntry: oldestEntry === Infinity ? null : oldestEntry,
     newestEntry: newestEntry === 0 ? null : newestEntry,
     lastCleanup: meta.lastCleanup || null,
-    origins
+    origins,
   };
 }
 
@@ -610,58 +642,62 @@ async function cleanup(options = {}) {
   const { ttl = DEFAULT_TTL, maxSize = DEFAULT_MAX_SIZE } = options;
   const now = Date.now();
   const cutoffTime = now - ttl;
-  
+
   const requestsPath = getRequestsPath();
   const bodiesDir = getBodiesPath();
-  
+
   if (!fs.existsSync(requestsPath)) {
     writeMeta({ lastCleanup: now });
     return { deletedEntries: 0, deletedBodies: 0, freedBytes: 0 };
   }
-  
+
   // Read all entries
   let entries = readEntriesSync();
   const originalCount = entries.length;
-  
+
   // 1. Delete entries older than TTL
-  entries = entries.filter(e => e.timestamp >= cutoffTime);
-  
+  entries = entries.filter((e) => e.timestamp >= cutoffTime);
+
   // 2. If still over maxSize, calculate total size and remove oldest
   let totalSize = 0;
   const requestsSize = fs.existsSync(requestsPath) ? fs.statSync(requestsPath).size : 0;
   totalSize += requestsSize;
-  
+
   if (fs.existsSync(bodiesDir)) {
     const files = fs.readdirSync(bodiesDir);
     for (const file of files) {
       try {
         totalSize += fs.statSync(path.join(bodiesDir, file)).size;
-      } catch (e) {}
+      } catch (_e) {}
     }
   }
-  
+
   if (totalSize > maxSize && entries.length > 0) {
     // Sort by timestamp and remove oldest entries until under limit
     entries.sort((a, b) => a.timestamp - b.timestamp);
-    
+
     while (entries.length > 0 && totalSize > maxSize) {
       entries.shift();
       // Rough estimate: recalculate after removing some entries
       totalSize = totalSize * (entries.length / (entries.length + 1));
     }
   }
-  
+
   // 3. Collect referenced body hashes
   const referencedHashes = new Set();
   for (const entry of entries) {
-    if (entry.requestBodyHash) referencedHashes.add(`${entry.requestBodyHash}.req`);
-    if (entry.responseBodyHash) referencedHashes.add(`${entry.responseBodyHash}.res`);
+    if (entry.requestBodyHash) {
+      referencedHashes.add(`${entry.requestBodyHash}.req`);
+    }
+    if (entry.responseBodyHash) {
+      referencedHashes.add(`${entry.responseBodyHash}.res`);
+    }
   }
-  
+
   // 4. Delete orphaned body files
   let deletedBodies = 0;
   let freedBytes = 0;
-  
+
   if (fs.existsSync(bodiesDir)) {
     const bodyFiles = fs.readdirSync(bodiesDir);
     for (const file of bodyFiles) {
@@ -672,30 +708,31 @@ async function cleanup(options = {}) {
           freedBytes += stat.size;
           fs.unlinkSync(filePath);
           deletedBodies++;
-        } catch (e) {}
+        } catch (_e) {}
       }
     }
   }
-  
+
   // 5. Rewrite entries file with remaining entries
   const deletedEntries = originalCount - entries.length;
-  
+
   if (deletedEntries > 0 || entries.length === 0) {
     // Atomic write: write to temp then rename
-    const tempPath = requestsPath + ".tmp";
-    const content = entries.map(e => JSON.stringify(e)).join("\n") + (entries.length > 0 ? "\n" : "");
+    const tempPath = `${requestsPath}.tmp`;
+    const content =
+      entries.map((e) => JSON.stringify(e)).join("\n") + (entries.length > 0 ? "\n" : "");
     fs.writeFileSync(tempPath, content);
     fs.renameSync(tempPath, requestsPath);
   }
-  
+
   // 6. Update meta
   writeMeta({ lastCleanup: now });
-  
+
   return {
     deletedEntries,
     deletedBodies,
     freedBytes,
-    remainingEntries: entries.length
+    remainingEntries: entries.length,
   };
 }
 
@@ -706,61 +743,69 @@ async function cleanup(options = {}) {
  */
 async function clear(options = {}) {
   const { before, origin: targetOrigin } = options;
-  
+
   const requestsPath = getRequestsPath();
   const bodiesDir = getBodiesPath();
-  
+
   // If no options, clear everything
   if (!before && !targetOrigin) {
     let deletedEntries = 0;
     let deletedBodies = 0;
-    
+
     if (fs.existsSync(requestsPath)) {
       const entries = readEntriesSync();
       deletedEntries = entries.length;
       fs.unlinkSync(requestsPath);
     }
-    
+
     if (fs.existsSync(bodiesDir)) {
       const files = fs.readdirSync(bodiesDir);
       for (const file of files) {
         try {
           fs.unlinkSync(path.join(bodiesDir, file));
           deletedBodies++;
-        } catch (e) {}
+        } catch (_e) {}
       }
     }
-    
+
     return { deletedEntries, deletedBodies };
   }
-  
+
   // Selective clear
   if (!fs.existsSync(requestsPath)) {
     return { deletedEntries: 0, deletedBodies: 0 };
   }
-  
+
   const entries = readEntriesSync();
   const originalCount = entries.length;
-  
-  const remaining = entries.filter(entry => {
+
+  const remaining = entries.filter((entry) => {
     // Keep if doesn't match clear criteria
-    if (before && entry.timestamp >= before) return true;
+    if (before && entry.timestamp >= before) {
+      return true;
+    }
     if (targetOrigin) {
       const entryOrigin = getOriginFromUrl(entry.url);
-      if (entryOrigin !== targetOrigin) return true;
+      if (entryOrigin !== targetOrigin) {
+        return true;
+      }
     }
     return false;
   });
-  
+
   const deletedEntries = originalCount - remaining.length;
-  
+
   // Collect hashes to keep
   const keepHashes = new Set();
   for (const entry of remaining) {
-    if (entry.requestBodyHash) keepHashes.add(`${entry.requestBodyHash}.req`);
-    if (entry.responseBodyHash) keepHashes.add(`${entry.responseBodyHash}.res`);
+    if (entry.requestBodyHash) {
+      keepHashes.add(`${entry.requestBodyHash}.req`);
+    }
+    if (entry.responseBodyHash) {
+      keepHashes.add(`${entry.responseBodyHash}.res`);
+    }
   }
-  
+
   // Delete orphaned bodies
   let deletedBodies = 0;
   if (fs.existsSync(bodiesDir)) {
@@ -770,19 +815,20 @@ async function clear(options = {}) {
         try {
           fs.unlinkSync(path.join(bodiesDir, file));
           deletedBodies++;
-        } catch (e) {}
+        } catch (_e) {}
       }
     }
   }
-  
+
   // Rewrite entries file
   if (deletedEntries > 0) {
-    const tempPath = requestsPath + ".tmp";
-    const content = remaining.map(e => JSON.stringify(e)).join("\n") + (remaining.length > 0 ? "\n" : "");
+    const tempPath = `${requestsPath}.tmp`;
+    const content =
+      remaining.map((e) => JSON.stringify(e)).join("\n") + (remaining.length > 0 ? "\n" : "");
     fs.writeFileSync(tempPath, content);
     fs.renameSync(tempPath, requestsPath);
   }
-  
+
   return { deletedEntries, deletedBodies };
 }
 
@@ -793,16 +839,16 @@ function maybeAutoCleanup() {
   try {
     const meta = readMeta();
     const now = Date.now();
-    
+
     if (now - (meta.lastCleanup || 0) > AUTO_CLEANUP_INTERVAL) {
       // Run cleanup asynchronously to not block module load
       setImmediate(() => {
-        cleanup().catch(err => {
+        cleanup().catch((_err) => {
           // Ignore cleanup errors
         });
       });
     }
-  } catch (err) {
+  } catch (_err) {
     // Ignore errors during auto-cleanup check
   }
 }
@@ -811,17 +857,15 @@ function maybeAutoCleanup() {
 maybeAutoCleanup();
 
 module.exports = {
-  // Configuration
-  getBasePath,
   getRequestsPath,
   getBodiesPath,
   getMetaPath,
-  
+
   // Body storage
   storeBody,
   readBody,
   getBodyPath,
-  
+
   // Entry operations
   appendEntry,
   appendEntrySync,
@@ -829,22 +873,24 @@ module.exports = {
   readEntriesSync,
   getEntry,
   getEntrySync,
-  
+
   // Aggregations
   getOrigins,
   getOriginsSync,
   getStats,
   getStatsSync,
-  
+
   // Maintenance
   cleanup,
   clear,
   maybeAutoCleanup,
-  
+
   // Configuration
   setBasePath,
+  // Configuration
+
   getBasePath,
-  
+
   // Constants
   DEFAULT_BASE,
   DEFAULT_TTL,

@@ -1,11 +1,114 @@
 ---
 name: surf
-description: Control Chrome browser via CLI for testing, automation, and debugging. Use when the user needs browser automation, screenshots, form filling, page inspection, network/CPU emulation, DevTools streaming, or AI queries via ChatGPT/Gemini/Perplexity/Grok/AI Studio.
+description: Control Chrome browser via CLI for testing, automation, and debugging. Use when the user needs browser automation, screenshots, form filling, page inspection, network/CPU emulation, DevTools streaming, or AI queries via the default `aimode` provider (Google AI Mode — no login required; `nem=143` pro / `udm=50` auto) plus Gemini/Perplexity/Grok/AI Studio/Claude. ChatGPT is temporarily disabled.
+tools: Agent, Bash, Read, Glob
 ---
 
 # Surf Browser Automation
 
 Control Chrome browser via CLI or Unix socket.
+
+## Subagent Return Contract
+
+If this skill is loaded directly in the main agent context by a slash command and the request requires substantive browser automation, AI query, testing, or research work, do not perform the surf workflow in the main context. Immediately spawn an `Agent` subagent to execute `surf` normally with the user's arguments and this skill's CLI conventions, then wait for its `LSC_RETURN — Lossless Semantic Compression` result. Do not recursively delegate when already inside a subagent. Continue inline only for trivial usage/argument validation or when `Agent` is unavailable; if so, keep output compact and state the limitation.
+
+When `surf` is executed inside a subagent, run this skill normally, then return to the main agent only in compact **Lossless Semantic Compression (LSC)** format. Do not return raw process, long reasoning, raw logs, raw browser dumps, full transcripts, full files, full diffs, or repeated context unless the caller explicitly requested raw detail. Preserve meaning through evidence/detail pointers so full detail remains recoverable.
+
+Use this exact template:
+
+```text
+LSC_RETURN — Lossless Semantic Compression
+
+STATUS:
+done | partial | blocked
+
+OUTCOME:
+<one short paragraph with the useful result>
+
+FACTS:
+- <load-bearing fact> → <evidence pointer>
+
+DECISION:
+<decision or conclusion, if any> → <reason> → <evidence pointer>
+
+DELTA:
+- <new finding/change only>
+
+VERIFY:
+- <check/test/source>: pass | fail | not run | found | not found
+
+RISK:
+- <severity>: <remaining risk or uncertainty>
+
+NEXT:
+- <next concrete action>
+
+TABS:                                          # REQUIRED for every surf run
+- opened: <count> (ids: [<id1>, <id2>, ...])
+- closed: <count>
+- still_open: <count>  // must equal opened - closed
+- pre_existing_preserved: true | false
+
+DETAIL:
+- <URL/provider/command/screenshot/artifact/query where full detail can be reopened>
+```
+
+Evidence pointers should use the smallest recoverable locator available: URL, provider name, surf command, page ref, screenshot path, downloaded artifact path, report section, timestamped run note, or query.
+
+## Tab Discipline (Mandatory)
+
+Surf shares the user's real Chrome profile. Every tab the agent opens is a real tab in the user's browser. Tab clutter and focus-stealing are user-visible side effects, not cosmetic concerns. The following two rules are mandatory defaults for every surf invocation — including ones delegated to subagents.
+
+### Rule 1 — Open research tabs in the background
+
+The user's currently focused tab MUST NOT change as a side effect of surf work.
+
+- Open research URLs with `surf tab.new <url>`. By default it does not steal focus — the user's current tab stays active.
+- **Do not call `surf tab.switch` on a research tab** to read it. Read with `surf page.read --tab-id <id>` instead — that reads without switching focus.
+- **Do not use `surf navigate <research-url>`** for research URLs. `surf navigate` overwrites the user's current tab. Use `tab.new` for any new URL you want to investigate.
+- **Do not call `surf window.new` for "isolation"** unless the user explicitly asks for it. New windows steal focus and clutter the user's taskbar.
+- `surf screenshot` accepts `--tab-id <id>` to capture without switching.
+- `surf read`, `surf click`, `surf type`, etc. all accept `--tab-id` — prefer that over `tab.switch` whenever possible.
+
+### Rule 2 — Auto-close every tab the agent opens
+
+Every tab opened by the agent MUST be closed as soon as its purpose is complete — either at the end of the step that needed it, or at the end of the run via a single batch.
+
+- `surf tab.close <id>` closes one tab.
+- `surf tab.close --ids <id1> <id2> ...` closes many.
+- Track every tab ID you opened. Do not close pre-existing user tabs you did not create.
+- On error or unexpected exit, close any tab the agent created. Never leave orphan tabs behind.
+
+### Updated LSC contract — mandatory tab accounting
+
+The LSC return MUST include these fields in addition to the existing template (place between `NEXT:` and `DETAIL:`):
+
+```
+TABS:
+- opened: <count> (ids: [<id1>, <id2>, ...])
+- closed: <count>
+- still_open: <count>  // must equal opened - closed
+- pre_existing_preserved: true | false
+```
+
+### Delegation prompt requirements
+
+When delegating surf research to a subagent, the delegation prompt MUST include Rules 1 and 2 verbatim or near-verbatim. Phrases like "jangan close", "preserve research tabs", "biarkan terbuka", or "leave tabs open for user to read" are red flags and MUST be rewritten before the prompt is sent — they defeat Rule 2.
+
+### Carve-out
+
+The mandatory rules apply by default. One explicit exception: when the user themselves drives an interactive browsing session (e.g., "open this URL and tell me what you see" with intent that the user also sees the new tab), `tab.switch` is appropriate. The LSC tab-accounting fields are still required.
+
+### Anti-pattern summary
+
+| Anti-pattern | Why it's wrong | Fix |
+|---|---|---|
+| `surf navigate <research-url>` | Overwrites user's current tab | `surf tab.new <research-url>` + `page.read --tab-id <id>` |
+| `surf tab.switch <research-tab>` | Steals user focus | `page.read --tab-id <id>` (no switch) |
+| Delegation prompt with "jangan close" / "preserve research tabs" | Defeats Rule 2 | Rewrite the prompt; tabs auto-close |
+| `surf window.new` for isolation without asking | Steals focus + window clutter | Skip unless the user asks |
+| Closing user's pre-existing tab | Destructive | Preserve all tabs the agent did not create |
+| Screenshotting without `--tab-id` | Implies `tab.switch` | Pass `--tab-id <id>` |
 
 ## Native Host / Socket Notes
 
@@ -72,15 +175,26 @@ surf animate-audit --selector ".thing" --duration 2000 --fps 10
 
 ## AI Assistants (No API Keys)
 
-Query AI models using your browser's logged-in session. Must be logged into the respective service in Chrome.
+Query AI models using your browser's logged-in session. Most require a login; **AI Mode (`aimode`) is the default** because it needs no login and works out of the box.
 
-### ChatGPT
+**ChatGPT is temporarily disabled** - use AI Mode (default), Gemini, Claude, Perplexity, Grok, or AI Studio instead.
+
+### AI Mode (Google) — DEFAULT
+
+Google's AI-powered search at `google.com/search?udm=50` (auto) or `?nem=143` (pro). No login required, public endpoint.
+
 ```bash
-surf chatgpt "explain this code"
-surf chatgpt "summarize" --with-page              # Include current page context
-surf chatgpt "review" --model gpt-4o              # Specify model
-surf chatgpt "analyze" --file document.pdf        # With file attachment
+surf aimode "explain quantum computing"          # Default: pro mode (nem=143)
+surf aimode "berita hari ini"                     # Indonesian: works (auto mode)
+surf aimode "summarize" --auto                    # Force auto mode (udm=50, has copy button)
+surf aimode "deep dive" --timeout 300             # Extended timeout (default 120s)
 ```
+
+**When to pick pro vs auto:**
+- `--auto` (`udm=50`) — standard AI Mode, faster, exposes a copy button on the response
+- default (`nem=143`) — pro mode, deeper reasoning, slower on complex prompts
+
+**Why this is the default:** no auth needed, no rate-limit hit on free queries, and Indonesian/Indonesian-context prompts work reliably because Google handles the full search+generation pipeline.
 
 ### Gemini
 ```bash
@@ -95,11 +209,39 @@ surf gemini "wide banner" --generate-image /tmp/banner.png --aspect-ratio 16:9
 ```
 
 ### Perplexity
+
+Uses the **deep-link URL pattern** (`https://www.perplexity.ai/#?q=...&model=...&focus=...&space=...`) so the page boots already configured — no need to script the typePrompt / selectModel / submitPrompt dance.
+
+**Default model:** `claude46sonnetthinking` (Claude Sonnet 4.6 Thinking). Picked as the most reliable for exact-format output in head-to-head PONG tests against other Pro thinking models.
+
 ```bash
-surf perplexity "what is quantum computing"
-surf perplexity "explain this page" --with-page   # Include page context
-surf perplexity "deep dive" --mode research       # Research mode (Pro)
-surf perplexity "latest news" --model sonar       # Model selection (Pro)
+surf perplexity "what is quantum computing"            # Default: Claude Sonnet 4.6 Thinking
+surf perplexity "explain this page" --with-page        # Include page context
+surf perplexity "deep dive" --mode research            # Research mode (Pro)
+surf perplexity "latest news" --focus web               # Web focus
+surf perplexity "ticker $AAPL" --focus edgar            # Finance (SEC filings)
+surf perplexity "..." --space <spaceId>                # Run inside a Perplexity Space
+```
+
+**Model selection** (Pro users): use the `reasoning_model` field from `https://www.perplexity.ai/rest/models/config` as the `--model` value — that's the model id Perplexity uses for Thinking mode. Top Pro thinking picks:
+
+| Model | Notes |
+|---|---|
+| `claude46sonnetthinking` (default) | Best format compliance |
+| `gemini31pro_high` | Highest intelligence among Pro picks |
+| `gpt54_thinking` | Top Pro reasoning |
+| `kimik26thinking` | Strong reasoning alt |
+| `nv_nemotron_3_ultra` | NVIDIA Nemotron 3 Ultra |
+
+**Max-tier models** (e.g. `gpt55_thinking`, `claude48opusthinking`) are silently rejected for Pro subscribers — pick a Pro-tier `reasoning_model` id.
+
+**Focus values:** `writing, web, social, scholar, edgar` (comma-separated, e.g. `--focus writing,scholar`).
+
+### Claude
+```bash
+surf claude "explain this code"
+surf claude "summarize" --with-page              # Include current page context
+surf claude "analyze" --model claude-opus-4      # Specify model (default: claude-opus-4)
 ```
 
 ### Grok (via x.com - requires X.com login in Chrome)
@@ -621,8 +763,9 @@ surf wait.element ".missing" --auto-capture --timeout 2000
 14. **Native host diagnostics** - If commands fail with socket/native-host errors, run `surf doctor` or `surf doctor --browser all` before guessing at reinstall steps
 15. **Animation capture** - Use `surf record --duration 2000 --fps 10 --output /tmp/anim.gif` when the agent needs to see motion; use `animate-audit` for numeric timelines and `perf-audit` for jank/layout-shift snapshots
 16. **Hard isolation** - Use separate browser/profile instances plus separate `SURF_SOCKET` values when agents must not share a host or target
-17. **Semantic locators** - `locate.role`, `locate.text`, `locate.label` for more robust element finding
-18. **Frame context** - Use `frame.switch` before interacting with iframe content
+17. **Perplexity default = Claude Sonnet 4.6 Thinking** - Picked for format compliance; override with `--model <id>` from `/rest/models/config`. Perplexity's "Thinking" toggle is the `reasoning_model` field, not a URL flag — pass that id to `?model=...`
+18. **Semantic locators** - `locate.role`, `locate.text`, `locate.label` for more robust element finding
+19. **Frame context** - Use `frame.switch` before interacting with iframe content
 
 ## Socket API
 

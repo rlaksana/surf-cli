@@ -3,37 +3,50 @@ const GENERATE_CONTENT_URL_FRAGMENT =
   "google.internal.alkali.applications.makersuite.v1.MakerSuiteService/GenerateContent";
 
 function normalizeModelString(model) {
-  return String(model || "").trim().toLowerCase();
+  return String(model || "")
+    .trim()
+    .toLowerCase();
 }
 
 function buildAiStudioUrl(model) {
   const normalized = normalizeModelString(model);
-  if (!normalized) return AISTUDIO_URL;
+  if (!normalized) {
+    return AISTUDIO_URL;
+  }
 
   // Only use the URL param when the caller passes a literal AI Studio model id.
   // If the model id is wrong/unknown, AI Studio will fall back to the last-selected
   // model in the UI, which is acceptable.
   const looksLikeUrlModelId =
-    /^[a-z0-9.\-]+$/.test(normalized) && (normalized.includes("preview") || normalized.includes("latest"));
+    /^[a-z0-9.-]+$/.test(normalized) &&
+    (normalized.includes("preview") || normalized.includes("latest"));
 
-  if (!looksLikeUrlModelId) return AISTUDIO_URL;
+  if (!looksLikeUrlModelId) {
+    return AISTUDIO_URL;
+  }
 
   return `${AISTUDIO_URL}?model=${encodeURIComponent(normalized)}`;
 }
 
 function delay(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function getNestedValue(value, pathParts, fallback) {
   let current = value;
   for (const part of pathParts) {
-    if (current == null) return fallback;
-    if (typeof part === 'number') {
-      if (!Array.isArray(current)) return fallback;
+    if (current == null) {
+      return fallback;
+    }
+    if (typeof part === "number") {
+      if (!Array.isArray(current)) {
+        return fallback;
+      }
       current = current[part];
     } else {
-      if (typeof current !== 'object') return fallback;
+      if (typeof current !== "object") {
+        return fallback;
+      }
       current = current[part];
     }
   }
@@ -58,36 +71,38 @@ function buildClickDispatcher() {
   }`;
 }
 
-function cleanAiStudioResponse(rawText, userPrompt = '') {
-  if (!rawText) return '';
+function cleanAiStudioResponse(rawText, userPrompt = "") {
+  if (!rawText) {
+    return "";
+  }
 
   // Lines that match exactly (full trimmed line, case-insensitive) are stripped
   // These are AI Studio UI chrome artifacts that can leak into DOM text extraction
   const bannedExact = new Set([
-    'user',
-    'model',
-    'info',
-    'warning',
-    'close',
-    'edit',
-    'more_vert',
-    'thumb_up',
-    'thumb_down',
-    'good response',
-    'bad response',
-    'rerun this turn',
-    'open options',
-    'running...',
+    "user",
+    "model",
+    "info",
+    "warning",
+    "close",
+    "edit",
+    "more_vert",
+    "thumb_up",
+    "thumb_down",
+    "good response",
+    "bad response",
+    "rerun this turn",
+    "open options",
+    "running...",
 
     // Code block UI chrome from AI Studio (can leak from rendered mode)
-    'code',
-    'download',
-    'content_copy',
-    'expand_less',
-    'expand_more',
+    "code",
+    "download",
+    "content_copy",
+    "expand_less",
+    "expand_more",
   ]);
 
-  const promptTrimmed = String(userPrompt || '').trim();
+  const promptTrimmed = String(userPrompt || "").trim();
 
   let lines = String(rawText).split(/\r?\n/);
 
@@ -100,7 +115,13 @@ function cleanAiStudioResponse(rawText, userPrompt = '') {
   // plus occasional UI banners
   const lastModelIdx = (() => {
     for (let i = lines.length - 1; i >= 0; i--) {
-      if (String(lines[i] || '').trim().toLowerCase() === 'model') return i;
+      if (
+        String(lines[i] || "")
+          .trim()
+          .toLowerCase() === "model"
+      ) {
+        return i;
+      }
     }
     return -1;
   })();
@@ -118,19 +139,19 @@ function cleanAiStudioResponse(rawText, userPrompt = '') {
     const trimmed = line.trim();
     const lower = trimmed.toLowerCase();
 
-    const isFenceLine = trimmed.startsWith('```');
+    const isFenceLine = trimmed.startsWith("```");
 
     // Fence lines: preserve exactly (minus trailing whitespace)
     if (isFenceLine) {
       inCodeFence = !inCodeFence;
-      cleanedLines.push(line.replace(/[\t ]+$/g, ''));
+      cleanedLines.push(line.replace(/[\t ]+$/g, ""));
       previousWasBlank = false;
       continue;
     }
 
     // Inside code fences: preserve indentation and blank lines
     if (inCodeFence) {
-      cleanedLines.push(line.replace(/[\t ]+$/g, ''));
+      cleanedLines.push(line.replace(/[\t ]+$/g, ""));
       previousWasBlank = false;
       continue;
     }
@@ -138,86 +159,116 @@ function cleanAiStudioResponse(rawText, userPrompt = '') {
     // Outside code: drop UI-only lines and prompt echo
     if (trimmed.length === 0) {
       if (!previousWasBlank) {
-        cleanedLines.push('');
+        cleanedLines.push("");
         previousWasBlank = true;
       }
       continue;
     }
 
-    if (bannedExact.has(lower)) continue;
-    if (promptTrimmed && trimmed === promptTrimmed) continue;
+    if (bannedExact.has(lower)) {
+      continue;
+    }
+    if (promptTrimmed && trimmed === promptTrimmed) {
+      continue;
+    }
 
     // Common AI Studio footer/disclaimer
-    if (lower.includes('google ai models may make mistakes')) continue;
-    if (lower.includes('double-check outputs')) continue;
-    if (lower.startsWith('response ready')) continue;
+    if (lower.includes("google ai models may make mistakes")) {
+      continue;
+    }
+    if (lower.includes("double-check outputs")) {
+      continue;
+    }
+    if (lower.startsWith("response ready")) {
+      continue;
+    }
 
     // Drive enable prompt (AI Studio UI banner)
-    if (lower.includes('turn drive on for future conversations')) continue;
-    if (lower.includes('your work is currently not being saved')) continue;
-    if (lower.includes('enable google drive')) continue;
+    if (lower.includes("turn drive on for future conversations")) {
+      continue;
+    }
+    if (lower.includes("your work is currently not being saved")) {
+      continue;
+    }
+    if (lower.includes("enable google drive")) {
+      continue;
+    }
 
     // Remove inline UI icon tokens, but only outside code
     const withoutIcons = trimmed
-      .replace(/\bthumb_up\b/g, '')
-      .replace(/\bthumb_down\b/g, '')
-      .replace(/\bmore_vert\b/g, '')
+      .replace(/\bthumb_up\b/g, "")
+      .replace(/\bthumb_down\b/g, "")
+      .replace(/\bmore_vert\b/g, "")
       .trim();
 
-    if (withoutIcons.length === 0) continue;
+    if (withoutIcons.length === 0) {
+      continue;
+    }
 
     cleanedLines.push(withoutIcons);
     previousWasBlank = false;
   }
 
   // Trim leading/trailing blank lines
-  while (cleanedLines.length > 0 && cleanedLines[0].trim().length === 0) cleanedLines.shift();
-  while (cleanedLines.length > 0 && cleanedLines[cleanedLines.length - 1].trim().length === 0) cleanedLines.pop();
+  while (cleanedLines.length > 0 && cleanedLines[0].trim().length === 0) {
+    cleanedLines.shift();
+  }
+  while (cleanedLines.length > 0 && cleanedLines[cleanedLines.length - 1].trim().length === 0) {
+    cleanedLines.pop();
+  }
 
-  return cleanedLines.join('\n');
+  return cleanedLines.join("\n");
 }
 
 function hasRequiredCookies(cookies) {
-  if (!cookies || !Array.isArray(cookies)) return false;
-  const sid = cookies.find(c => c.name === "__Secure-1PSID" && c.value);
+  if (!cookies || !Array.isArray(cookies)) {
+    return false;
+  }
+  const sid = cookies.find((c) => c.name === "__Secure-1PSID" && c.value);
   return Boolean(sid);
 }
 
 function extractModelKeywords(modelId) {
   const normalized = normalizeModelString(modelId);
-  if (!normalized) return [];
+  if (!normalized) {
+    return [];
+  }
 
   const ignored = new Set(["gemini", "preview", "latest"]);
 
   const tokens = normalized
     .split("-")
-    .map(t => t.trim())
+    .map((t) => t.trim())
     .filter(Boolean)
-    .filter(t => !ignored.has(t))
-    .filter(t => !/^\d+(?:\.\d+)?$/.test(t));
+    .filter((t) => !ignored.has(t))
+    .filter((t) => !/^\d+(?:\.\d+)?$/.test(t));
 
   // Keep short-but-meaningful tokens like "pro"
-  const keywords = tokens.filter(t => t.length >= 3);
+  const keywords = tokens.filter((t) => t.length >= 3);
 
   return Array.from(new Set(keywords));
 }
 
 function normalizeAiStudioRpcJson(rawText) {
-  let text = String(rawText || '').trim();
-  if (!text) return text;
+  let text = String(rawText || "").trim();
+  if (!text) {
+    return text;
+  }
 
   // Strip Google's common XSSI prefix
   //   )]}'\n<json>
   if (text.startsWith(")]}'")) {
-    const newlineIndex = text.indexOf('\n');
-    text = (newlineIndex === -1 ? '' : text.slice(newlineIndex + 1)).trim();
-    if (!text) return text;
+    const newlineIndex = text.indexOf("\n");
+    text = (newlineIndex === -1 ? "" : text.slice(newlineIndex + 1)).trim();
+    if (!text) {
+      return text;
+    }
   }
 
   // Some RPC errors are returned in JS-ish array form with a leading elision:
   //   [,[7,"The caller does not have permission"]]
   // Normalize this into valid JSON before parsing
-  if (text.startsWith('[,')) {
+  if (text.startsWith("[,")) {
     return `[null${text.slice(1)}`;
   }
 
@@ -226,16 +277,18 @@ function normalizeAiStudioRpcJson(rawText) {
 
 function parseAiStudioRpcError(rawText) {
   const normalized = normalizeAiStudioRpcJson(rawText);
-  if (!normalized) return null;
+  if (!normalized) {
+    return null;
+  }
 
   try {
     const parsed = JSON.parse(normalized);
     const code = getNestedValue(parsed, [1, 0], null);
     const message = getNestedValue(parsed, [1, 1], null);
 
-    if (typeof message === 'string' && message.trim()) {
+    if (typeof message === "string" && message.trim()) {
       return {
-        code: typeof code === 'number' ? code : undefined,
+        code: typeof code === "number" ? code : undefined,
         message: message.trim(),
       };
     }
@@ -247,33 +300,40 @@ function parseAiStudioRpcError(rawText) {
 }
 
 function isThinkingModelChunk(chunk) {
-  if (!Array.isArray(chunk)) return false;
+  if (!Array.isArray(chunk)) {
+    return false;
+  }
 
   // Observed structure for thinking chunks:
   // [null, "<thinking>", ..., 1]
-  if (chunk.length >= 16 && chunk[15] === 1) return true;
+  if (chunk.length >= 16 && chunk[15] === 1) {
+    return true;
+  }
 
   const last = chunk[chunk.length - 1];
   return chunk.length > 2 && last === 1;
 }
 
 function collectModelTextSegments(node, out) {
-  if (!Array.isArray(node)) return;
+  if (!Array.isArray(node)) {
+    return;
+  }
 
   // Stream chunk patterns seen in GenerateContent response payload:
   //   [ [[null, "<chunk>"]], "model" ]
   //   [ [[[null, "<chunk>"]]], "model" ]
-  if (node.length >= 2 && node[1] === 'model') {
+  if (node.length >= 2 && node[1] === "model") {
     const payloadLevel2 = getNestedValue(node, [0, 0], null);
     const payloadLevel3 = getNestedValue(node, [0, 0, 0], null);
 
-    const segment = typeof payloadLevel2?.[1] === 'string'
-      ? payloadLevel2[1]
-      : typeof payloadLevel3?.[1] === 'string'
-        ? payloadLevel3[1]
-        : null;
+    const segment =
+      typeof payloadLevel2?.[1] === "string"
+        ? payloadLevel2[1]
+        : typeof payloadLevel3?.[1] === "string"
+          ? payloadLevel3[1]
+          : null;
 
-    if (typeof segment === 'string' && segment.length > 0) {
+    if (typeof segment === "string" && segment.length > 0) {
       out.push({
         text: segment,
         thinking: isThinkingModelChunk(payloadLevel2) || isThinkingModelChunk(payloadLevel3),
@@ -291,18 +351,22 @@ function collectModelTextSegments(node, out) {
 }
 
 function extractFinalResponseText(value) {
-  const text = String(value || '').trim();
-  if (!text) return '';
+  const text = String(value || "").trim();
+  if (!text) {
+    return "";
+  }
 
   const lines = text.split(/\r?\n/);
-  const headingIndex = lines.findIndex((line, index) => index > 0 && /^#{1,6}\s+/.test(String(line || '').trim()));
+  const headingIndex = lines.findIndex(
+    (line, index) => index > 0 && /^#{1,6}\s+/.test(String(line || "").trim()),
+  );
 
   if (headingIndex <= 0) {
     return text;
   }
 
-  const preambleText = lines.slice(0, headingIndex).join('\n').trim();
-  const finalText = lines.slice(headingIndex).join('\n').trim();
+  const preambleText = lines.slice(0, headingIndex).join("\n").trim();
+  const finalText = lines.slice(headingIndex).join("\n").trim();
 
   if (!preambleText || !finalText) {
     return text;
@@ -311,18 +375,20 @@ function extractFinalResponseText(value) {
   const lower = preambleText.toLowerCase();
   // Heuristic can false-positive on conversational preambles when a heading follows.
   const looksLikeThinking =
-    lower.includes('considering') ||
-    lower.includes('focusing') ||
-    lower.includes('reasoning') ||
+    lower.includes("considering") ||
+    lower.includes("focusing") ||
+    lower.includes("reasoning") ||
     lower.includes("i'm") ||
-    lower.includes('i am');
+    lower.includes("i am");
 
   return looksLikeThinking ? finalText : text;
 }
 
 function parseAiStudioGenerateContentText(rawText) {
   const normalized = normalizeAiStudioRpcJson(rawText);
-  if (!normalized) return '';
+  if (!normalized) {
+    return "";
+  }
 
   let parsed;
   try {
@@ -337,7 +403,7 @@ function parseAiStudioGenerateContentText(rawText) {
   const finalText = segments
     .filter((segment) => !segment.thinking)
     .map((segment) => segment.text)
-    .join('')
+    .join("")
     .trim();
 
   if (finalText) {
@@ -346,25 +412,29 @@ function parseAiStudioGenerateContentText(rawText) {
 
   const combinedText = segments
     .map((segment) => segment.text)
-    .join('')
+    .join("")
     .trim();
 
   return extractFinalResponseText(combinedText);
 }
 
 function extractGenerateEntries(entries) {
-  if (!Array.isArray(entries)) return [];
+  if (!Array.isArray(entries)) {
+    return [];
+  }
 
   return entries
     .filter((entry) => {
-      const url = String(entry?.url || '');
-      return entry && typeof entry === 'object' && url.includes(GENERATE_CONTENT_URL_FRAGMENT);
+      const url = String(entry?.url || "");
+      return entry && typeof entry === "object" && url.includes(GENERATE_CONTENT_URL_FRAGMENT);
     })
     .sort((a, b) => (a.ts || 0) - (b.ts || 0));
 }
 
 function extractLastUserPromptFromGenerateRequestBody(rawBody) {
-  if (!rawBody || typeof rawBody !== 'string') return null;
+  if (!rawBody || typeof rawBody !== "string") {
+    return null;
+  }
 
   try {
     const parsed = JSON.parse(rawBody);
@@ -372,10 +442,12 @@ function extractLastUserPromptFromGenerateRequestBody(rawBody) {
 
     for (let i = turns.length - 1; i >= 0; i--) {
       const turn = turns[i];
-      if (!Array.isArray(turn) || turn[1] !== 'user') continue;
+      if (!Array.isArray(turn) || turn[1] !== "user") {
+        continue;
+      }
 
       const prompt = getNestedValue(turn, [0, 0, 1], null);
-      if (typeof prompt === 'string' && prompt.trim()) {
+      if (typeof prompt === "string" && prompt.trim()) {
         return prompt.trim();
       }
     }
@@ -387,11 +459,15 @@ function extractLastUserPromptFromGenerateRequestBody(rawBody) {
 }
 
 function doesGenerateEntryMatchPrompt(entry, expectedPrompt) {
-  const expected = String(expectedPrompt || '').trim();
-  if (!expected) return true;
+  const expected = String(expectedPrompt || "").trim();
+  if (!expected) {
+    return true;
+  }
 
-  const requestBody = typeof entry?.requestBody === 'string' ? entry.requestBody : '';
-  if (!requestBody) return false;
+  const requestBody = typeof entry?.requestBody === "string" ? entry.requestBody : "";
+  if (!requestBody) {
+    return false;
+  }
 
   const extractedPrompt = extractLastUserPromptFromGenerateRequestBody(requestBody);
   if (extractedPrompt) {

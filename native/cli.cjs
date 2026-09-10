@@ -430,7 +430,7 @@ const REMOVED_COMMANDS = {
 
 const TOOLS = {
   ai: {
-    desc: "AI assistants (ChatGPT, Gemini)",
+    desc: "AI assistants (ChatGPT, Claude, Gemini)",
     commands: {
       "chatgpt": {
         desc: "Send prompt to ChatGPT (uses browser cookies)",
@@ -446,6 +446,20 @@ const TOOLS = {
           { cmd: 'chatgpt "summarize" --with-page', desc: "With page context" },
           { cmd: 'chatgpt "review" --file code.ts', desc: "With file" },
           { cmd: 'chatgpt "analyze" --model gpt-4o', desc: "Specify model" },
+        ]
+      },
+      "claude": {
+        desc: "Send prompt to Claude.ai (uses browser cookies)",
+        args: ["query"],
+        opts: {
+          "with-page": "Include current page context",
+          model: "Model: claude-3-5-sonnet (default), claude-3-opus, etc.",
+          timeout: "Timeout in seconds (default: 300 = 5min)"
+        },
+        examples: [
+          { cmd: 'claude "explain this code"', desc: "Basic query" },
+          { cmd: 'claude "summarize" --with-page', desc: "With page context" },
+          { cmd: 'claude "review this code"', desc: "Code review" },
         ]
       },
       "gemini": {
@@ -535,6 +549,19 @@ const TOOLS = {
           { cmd: 'aistudio.build "build a portfolio site"', desc: "Build with defaults" },
           { cmd: 'aistudio.build "todo app with auth" --model gemini-3.1-pro-preview', desc: "Build with model override" },
           { cmd: 'aistudio.build "crm dashboard" --output ./out', desc: "Build and extract to directory" },
+        ]
+      },
+      "aimode": {
+        desc: "Query Google AI Mode (default AI provider; no login required)",
+        args: ["query"],
+        opts: {
+          auto: "Use auto mode (udm=50) instead of pro mode (nem=143, default)",
+          timeout: "Timeout in seconds (default: 120)",
+        },
+        examples: [
+          { cmd: 'aimode "explain quantum computing"', desc: "Pro mode (nem=143, default)" },
+          { cmd: 'aimode "berita hari ini" --auto', desc: "Auto mode (udm=50)" },
+          { cmd: 'aimode "summarize" --timeout 300', desc: "Extended timeout" },
         ]
       },
       "ai": {
@@ -2662,7 +2689,7 @@ if (args[0] === "workflow.validate") {
   }
 }
 
-const BOOLEAN_FLAGS = ["auto-capture", "json", "stream", "dry-run", "stop-on-error", "fail-fast", "clear", "submit", "all", "case-sensitive", "hard", "annotate", "fullpage", "full-page", "reset", "no-screenshot", "full", "soft-fail", "has-body", "exclude-static", "v", "vv", "request", "by-tab", "har", "jsonl", "no-save", "no-auto-wait", "no-lock"];
+const BOOLEAN_FLAGS = ["auto-capture", "json", "stream", "dry-run", "stop-on-error", "fail-fast", "clear", "submit", "all", "case-sensitive", "hard", "annotate", "fullpage", "full-page", "reset", "no-screenshot", "full", "soft-fail", "has-body", "exclude-static", "v", "vv", "request", "by-tab", "har", "jsonl", "no-save", "no-auto-wait", "no-lock", "new-tab", "keep-tab"];
 
 const parseArgs = (rawArgs) => {
   const result = { positional: [], options: {} };
@@ -2745,6 +2772,16 @@ if (options["full-page"] === true) {
   delete options["full-page"];
 }
 
+// Normalize kebab-case tab-isolation flags to camelCase for the host.
+if (options["new-tab"] === true) {
+  options.newTab = true;
+  delete options["new-tab"];
+}
+if (options["keep-tab"] === true) {
+  options.keepTab = true;
+  delete options["keep-tab"];
+}
+
 const config = loadConfig();
 const autoSaveEnabled = config.autoSaveScreenshots !== false && !options["no-save"];
 if (tool === "screenshot" && !options.output && !options.savePath && firstArg === undefined && autoSaveEnabled) {
@@ -2782,10 +2819,12 @@ const PRIMARY_ARG_MAP = {
   ai: "query",
   gemini: "query",
   chatgpt: "query",
+  claude: "query",
   perplexity: "query",
   grok: "query",
   aistudio: "query",
   "aistudio.build": "query",
+  aimode: "query",
   navigate: "url",
   go: "url",
   js: "code",
@@ -3467,6 +3506,10 @@ async function handleResponse(response) {
     data = { response: data };
   }
 
+  if (tool === 'aimode' && typeof data === 'string') {
+    data = { response: data };
+  }
+
   if (tool === "perf-audit" && outputPath) {
     const saveTo = path.resolve(outputPath);
     fs.mkdirSync(path.dirname(saveTo), { recursive: true });
@@ -3655,6 +3698,15 @@ async function handleResponse(response) {
     const meta = [];
     if (data.model) meta.push(data.model);
     if (data.thinkingTime) meta.push(`thought ${data.thinkingTime}s`);
+    if (Number.isFinite(data.tookMs)) meta.push(`${(data.tookMs / 1000).toFixed(1)}s`);
+    if (meta.length > 0) {
+      console.error(`\n[${meta.join(' | ')}]`);
+    }
+  } else if (tool === "aimode" && data?.response) {
+    console.log(data.response);
+
+    const meta = [];
+    if (data.model) meta.push(data.model);
     if (Number.isFinite(data.tookMs)) meta.push(`${(data.tookMs / 1000).toFixed(1)}s`);
     if (meta.length > 0) {
       console.error(`\n[${meta.join(' | ')}]`);

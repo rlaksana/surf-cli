@@ -1,6 +1,6 @@
-const fs = require("fs");
+const fs = require("node:fs");
 const { raceAbort, throwIfAborted } = require("./abort.cjs");
-const { execFileSync } = require("child_process");
+const { execFileSync } = require("node:child_process");
 const {
   delay,
   hasRequiredCookies,
@@ -15,9 +15,10 @@ const BUILD_LAYOUT_ERROR = "AI Studio Build page layout changed — check select
 async function evaluate(cdp, expression) {
   const result = await cdp(expression);
   if (result.exceptionDetails) {
-    const desc = result.exceptionDetails.exception?.description ||
-                 result.exceptionDetails.text ||
-                 "Evaluation failed";
+    const desc =
+      result.exceptionDetails.exception?.description ||
+      result.exceptionDetails.text ||
+      "Evaluation failed";
     throw new Error(desc);
   }
   if (result.error) {
@@ -51,21 +52,31 @@ function tokenizeModelOption(optionText) {
 
 function pickBestModelOption(options, userModel) {
   const userTokens = tokenizeModelInput(userModel);
-  if (userTokens.length === 0) return null;
+  if (userTokens.length === 0) {
+    return null;
+  }
 
   const candidates = options.filter((option) => {
     const optionTokens = tokenizeModelOption(option.text);
-    if (optionTokens.length === 0) return false;
+    if (optionTokens.length === 0) {
+      return false;
+    }
     return userTokens.every((token) => optionTokens.includes(token));
   });
 
-  if (candidates.length === 0) return null;
+  if (candidates.length === 0) {
+    return null;
+  }
 
   const sorted = candidates.sort((a, b) => {
     const aDefault = /\bdefault\b/i.test(a.text);
     const bDefault = /\bdefault\b/i.test(b.text);
-    if (aDefault !== bDefault) return aDefault ? 1 : -1;
-    if (a.text.length !== b.text.length) return a.text.length - b.text.length;
+    if (aDefault !== bDefault) {
+      return aDefault ? 1 : -1;
+    }
+    if (a.text.length !== b.text.length) {
+      return a.text.length - b.text.length;
+    }
     return a.text.localeCompare(b.text);
   });
 
@@ -77,7 +88,9 @@ async function waitForBuildPageReady(cdp, timeoutMs = 30000) {
   let sawTextareaAt = 0;
 
   while (Date.now() < deadline) {
-    const state = await evaluate(cdp, `(() => {
+    const state = await evaluate(
+      cdp,
+      `(() => {
       const url = location.href;
       const login = url.includes("accounts.google.com") || url.includes("/signin");
       const textarea = document.querySelector("ms-applet-generator-form textarea.prompt-textarea")
@@ -93,15 +106,20 @@ async function waitForBuildPageReady(cdp, timeoutMs = 30000) {
         hasTextarea: !!textarea,
         hasBuildButton: !!buildButton,
       };
-    })()`);
+    })()`,
+    );
 
     if (state?.login) {
       throw new Error("Sign into Google in Chrome first.");
     }
 
     if (state?.hasTextarea) {
-      if (!sawTextareaAt) sawTextareaAt = Date.now();
-      if (state.hasBuildButton) return;
+      if (!sawTextareaAt) {
+        sawTextareaAt = Date.now();
+      }
+      if (state.hasBuildButton) {
+        return;
+      }
       if (Date.now() - sawTextareaAt > 10000) {
         throw new Error(BUILD_LAYOUT_ERROR);
       }
@@ -114,13 +132,16 @@ async function waitForBuildPageReady(cdp, timeoutMs = 30000) {
 }
 
 async function selectModelInAdvancedSettings(cdp, inputCdp, requestedModel, log) {
-  const openResult = await evaluate(cdp, `(() => {
+  const openResult = await evaluate(
+    cdp,
+    `(() => {
     ${buildClickDispatcher()}
     const btn = document.querySelector("button.model-button");
     if (!btn) return { success: false };
     dispatchClickSequence(btn);
     return { success: true };
-  })()`);
+  })()`,
+  );
 
   if (!openResult?.success) {
     throw new Error(BUILD_LAYOUT_ERROR);
@@ -128,17 +149,27 @@ async function selectModelInAdvancedSettings(cdp, inputCdp, requestedModel, log)
 
   const dialogDeadline = Date.now() + 8000;
   while (Date.now() < dialogDeadline) {
-    const dialogOpen = await evaluate(cdp, "Boolean(document.querySelector('mat-dialog-container'))");
-    if (dialogOpen) break;
+    const dialogOpen = await evaluate(
+      cdp,
+      "Boolean(document.querySelector('mat-dialog-container'))",
+    );
+    if (dialogOpen) {
+      break;
+    }
     await delay(150);
   }
 
-  const dialogExists = await evaluate(cdp, "Boolean(document.querySelector('mat-dialog-container'))");
+  const dialogExists = await evaluate(
+    cdp,
+    "Boolean(document.querySelector('mat-dialog-container'))",
+  );
   if (!dialogExists) {
     throw new Error(BUILD_LAYOUT_ERROR);
   }
 
-  const dropdownClicked = await evaluate(cdp, `(() => {
+  const dropdownClicked = await evaluate(
+    cdp,
+    `(() => {
     ${buildClickDispatcher()}
     const dialog = document.querySelector("mat-dialog-container");
     if (!dialog) return { success: false };
@@ -146,7 +177,8 @@ async function selectModelInAdvancedSettings(cdp, inputCdp, requestedModel, log)
     if (!trigger) return { success: false };
     dispatchClickSequence(trigger);
     return { success: true };
-  })()`);
+  })()`,
+  );
 
   if (!dropdownClicked?.success) {
     throw new Error(BUILD_LAYOUT_ERROR);
@@ -155,11 +187,14 @@ async function selectModelInAdvancedSettings(cdp, inputCdp, requestedModel, log)
   const optionDeadline = Date.now() + 8000;
   let options = [];
   while (Date.now() < optionDeadline) {
-    const currentOptions = await evaluate(cdp, `(() => {
+    const currentOptions = await evaluate(
+      cdp,
+      `(() => {
       return Array.from(document.querySelectorAll('mat-option[role="option"]')).map((el) => {
         return { text: (el.textContent || "").replace(/\\s+/g, " ").trim() };
       });
-    })()`);
+    })()`,
+    );
 
     if (Array.isArray(currentOptions) && currentOptions.length > 0) {
       options = currentOptions;
@@ -170,7 +205,7 @@ async function selectModelInAdvancedSettings(cdp, inputCdp, requestedModel, log)
 
   const match = pickBestModelOption(
     options.map((option, index) => ({ ...option, index })),
-    requestedModel
+    requestedModel,
   );
 
   if (!match) {
@@ -182,14 +217,17 @@ async function selectModelInAdvancedSettings(cdp, inputCdp, requestedModel, log)
     return false;
   }
 
-  const selected = await evaluate(cdp, `(() => {
+  const selected = await evaluate(
+    cdp,
+    `(() => {
     ${buildClickDispatcher()}
     const options = Array.from(document.querySelectorAll('mat-option[role="option"]'));
     const target = options[${match.index}];
     if (!target) return { success: false };
     dispatchClickSequence(target);
     return { success: true };
-  })()`);
+  })()`,
+  );
 
   if (!selected?.success) {
     throw new Error(BUILD_LAYOUT_ERROR);
@@ -204,14 +242,17 @@ async function selectModelInAdvancedSettings(cdp, inputCdp, requestedModel, log)
 }
 
 async function typePromptAndBuild(cdp, inputCdp, prompt) {
-  const focused = await evaluate(cdp, `(() => {
+  const focused = await evaluate(
+    cdp,
+    `(() => {
     ${buildClickDispatcher()}
     const input = document.querySelector("ms-applet-generator-form textarea.prompt-textarea");
     if (!input) return { success: false };
     dispatchClickSequence(input);
     input.focus?.();
     return { success: true };
-  })()`);
+  })()`,
+  );
 
   if (!focused?.success) {
     throw new Error(BUILD_LAYOUT_ERROR);
@@ -224,13 +265,19 @@ async function typePromptAndBuild(cdp, inputCdp, prompt) {
   const deadline = Date.now() + 10000;
   let ready = false;
   while (Date.now() < deadline) {
-    const enabled = await evaluate(cdp, `(() => {
+    const enabled = await evaluate(
+      cdp,
+      `(() => {
       const btn = Array.from(document.querySelectorAll("ms-applet-generator-form button"))
         .find((b) => (b.textContent || "").toLowerCase().includes("build"));
       return Boolean(btn && btn.getAttribute("aria-disabled") === "false");
-    })()`);
+    })()`,
+    );
 
-    if (enabled) { ready = true; break; }
+    if (enabled) {
+      ready = true;
+      break;
+    }
     await delay(150);
   }
 
@@ -238,14 +285,17 @@ async function typePromptAndBuild(cdp, inputCdp, prompt) {
     throw new Error(BUILD_LAYOUT_ERROR);
   }
 
-  const clicked = await evaluate(cdp, `(() => {
+  const clicked = await evaluate(
+    cdp,
+    `(() => {
     ${buildClickDispatcher()}
     const btn = Array.from(document.querySelectorAll("ms-applet-generator-form button"))
       .find((b) => (b.textContent || "").toLowerCase().includes("build"));
     if (!btn) return { success: false };
     dispatchClickSequence(btn);
     return { success: true };
-  })()`);
+  })()`,
+  );
 
   if (!clicked?.success) {
     throw new Error(BUILD_LAYOUT_ERROR);
@@ -257,7 +307,9 @@ async function waitForBuildCompletion(cdp, timeoutMs, log = () => {}) {
   let lastProgress = "";
 
   while (Date.now() < deadline) {
-    const state = await evaluate(cdp, `(() => {
+    const state = await evaluate(
+      cdp,
+      `(() => {
       const url = location.href;
       const isLogin = url.includes("accounts.google.com") || url.includes("/signin");
       const commandTexts = Array.from(document.querySelectorAll("span.command-text"))
@@ -289,7 +341,8 @@ async function waitForBuildCompletion(cdp, timeoutMs, log = () => {}) {
         durationText,
         lowerCommands,
       };
-    })()`);
+    })()`,
+    );
 
     if (state?.isLogin) {
       throw new Error("Sign into Google in Chrome first.");
@@ -324,7 +377,9 @@ async function waitForBuildCompletion(cdp, timeoutMs, log = () => {}) {
   }
 
   const timeoutSec = Math.floor(timeoutMs / 1000);
-  throw new Error(`Build did not complete within ${timeoutSec}s. Check aistudio.google.com/apps for status.`);
+  throw new Error(
+    `Build did not complete within ${timeoutSec}s. Check aistudio.google.com/apps for status.`,
+  );
 }
 
 async function dispatchMouseHoverClick(inputCdp, x, y) {
@@ -371,7 +426,9 @@ async function pressEscape(inputCdp) {
 
 async function activateCodeTab(cdp, inputCdp) {
   for (let attempt = 0; attempt < 2; attempt++) {
-    const info = await evaluate(cdp, `(() => {
+    const info = await evaluate(
+      cdp,
+      `(() => {
       const btn = document.querySelector('button[data-test-id="code-editor-toggle"]');
       if (!btn) return { found: false };
       const rect = btn.getBoundingClientRect();
@@ -382,7 +439,8 @@ async function activateCodeTab(cdp, inputCdp) {
         x: rect.left + (rect.width / 2),
         y: rect.top + (rect.height / 2),
       };
-    })()`);
+    })()`,
+    );
 
     if (!info?.found) {
       throw new Error("Could not switch to Code view.");
@@ -395,10 +453,13 @@ async function activateCodeTab(cdp, inputCdp) {
     await dispatchMouseHoverClick(inputCdp, info.x, info.y);
     await delay(250);
 
-    const activated = await evaluate(cdp, `(() => {
+    const activated = await evaluate(
+      cdp,
+      `(() => {
       const btn = document.querySelector('button[data-test-id="code-editor-toggle"]');
       return Boolean(btn && btn.getAttribute("aria-selected") === "true");
-    })()`);
+    })()`,
+    );
 
     if (activated) {
       return;
@@ -416,26 +477,34 @@ async function activateCodeTab(cdp, inputCdp) {
 async function waitForDownloadButton(cdp, timeoutMs = 5000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    const found = await evaluate(cdp, `(() => {
+    const found = await evaluate(
+      cdp,
+      `(() => {
       const btn = document.querySelector('button[aria-label="Download app"]');
       if (!btn) return false;
       const visible = btn.offsetParent !== null || btn.getClientRects().length > 0;
       return Boolean(visible);
-    })()`);
-    if (found) return;
+    })()`,
+    );
+    if (found) {
+      return;
+    }
     await delay(120);
   }
   throw new Error("Download button not found in Code view.");
 }
 
 async function clickDownloadButton(cdp) {
-  const clicked = await evaluate(cdp, `(() => {
+  const clicked = await evaluate(
+    cdp,
+    `(() => {
     ${buildClickDispatcher()}
     const btn = document.querySelector('button[aria-label="Download app"]');
     if (!btn) return false;
     dispatchClickSequence(btn);
     return true;
-  })()`);
+  })()`,
+  );
 
   if (!clicked) {
     throw new Error("Download button not found in Code view.");
@@ -452,10 +521,14 @@ async function waitForDownloadComplete(searchDownloads, sinceId, timeoutMs = 300
     const items = Array.isArray(downloads) ? downloads : [];
 
     const completed = items.find((d) => d.id > sinceId && d.state === "complete");
-    if (completed) return completed.filename;
+    if (completed) {
+      return completed.filename;
+    }
 
     const failed = items.find((d) => d.id > sinceId && d.state === "interrupted");
-    if (failed) throw new Error(`Download failed: ${failed.error || "unknown error"}`);
+    if (failed) {
+      throw new Error(`Download failed: ${failed.error || "unknown error"}`);
+    }
 
     await delay(500);
   }
@@ -553,7 +626,9 @@ async function build({
       zipPath,
       ...(extractedPath ? { extractedPath } : {}),
       model: modelUsed,
-      buildDuration: Number.isFinite(buildDuration) ? buildDuration : Math.floor((Date.now() - startedAt) / 1000),
+      buildDuration: Number.isFinite(buildDuration)
+        ? buildDuration
+        : Math.floor((Date.now() - startedAt) / 1000),
       tookMs: Date.now() - startedAt,
     };
   } finally {

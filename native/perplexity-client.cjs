@@ -1,13 +1,39 @@
 /**
  * Perplexity Web Client for surf-cli
- * 
+ *
  * CDP-based client for perplexity.ai using browser automation.
- * Similar approach to the ChatGPT client.
+ * Uses Perplexity's deep-link URL pattern to skip the typePrompt /
+ * selectModel / submitPrompt dance:
+ *   https://www.perplexity.ai/#?q={query}&model={model}&focus={focus}&space={spaceId}
+ *
+ * The page boots already in a search-ready state with model + focus
+ * pre-selected, and the user's query is auto-submitted by Perplexity.
+ * We only have to wait for the response.
  */
 
 const { abortableDelay, raceAbort, throwIfAborted } = require("./abort.cjs");
 
 const PERPLEXITY_URL = "https://www.perplexity.ai/";
+
+/**
+ * Build a Perplexity deep-link URL that boots the page already configured
+ * with query, model, focus and space. Unspecified params are omitted.
+ *
+ * Perplexity accepts comma-separated focus values: "writing,web,social,scholar,edgar".
+ * Unknown models/focus/space are silently ignored by Perplexity — caller is
+ * responsible for passing valid values (see surf-cli docs for available lists).
+ */
+function buildDeepLinkUrl({ prompt, model, focus, spaceId } = {}) {
+  const hash = new URLSearchParams();
+  if (prompt) hash.set("q", prompt);
+  if (model) hash.set("model", model);
+  if (focus) hash.set("focus", focus);
+  if (spaceId) hash.set("space", spaceId);
+  if (hash.toString()) {
+    return `${PERPLEXITY_URL}#?${hash.toString()}`;
+  }
+  return PERPLEXITY_URL;
+}
 
 // ============================================================================
 // Helpers
@@ -38,9 +64,10 @@ function buildClickDispatcher() {
 async function evaluate(cdp, expression) {
   const result = await cdp(expression);
   if (result.exceptionDetails) {
-    const desc = result.exceptionDetails.exception?.description || 
-                 result.exceptionDetails.text || 
-                 "Evaluation failed";
+    const desc =
+      result.exceptionDetails.exception?.description ||
+      result.exceptionDetails.text ||
+      "Evaluation failed";
     throw new Error(desc);
   }
   if (result.error) {
@@ -68,7 +95,9 @@ async function waitForPageLoad(cdp, timeoutMs = 30000) {
 }
 
 async function checkLoginStatus(cdp) {
-  const result = await evaluate(cdp, `(() => {
+  const result = await evaluate(
+    cdp,
+    `(() => {
     const buttons = Array.from(document.querySelectorAll('button, a'));
     
     // Look for sign-in indicators (not logged in)
@@ -94,8 +123,9 @@ async function checkLoginStatus(cdp) {
       loggedIn: hasAccount || hasUpgrade || !hasSignIn,
       isPro: hasAccount && !hasUpgrade,
     };
-  })()`);
-  
+  })()`,
+  );
+
   return result || { loggedIn: false, isPro: false };
 }
 
@@ -103,30 +133,35 @@ async function waitForPromptReady(cdp, timeoutMs = 20000) {
   // Wait for page to be interactive and Perplexity's React app to hydrate
   // Instead of complex element detection, just wait for the page to settle
   const deadline = Date.now() + timeoutMs;
-  
+
   // First wait for basic page ready
   while (Date.now() < deadline) {
     const state = await evaluate(cdp, `document.readyState`);
-    if (state === 'complete') break;
+    if (state === "complete") {
+      break;
+    }
     await delay(200);
   }
-  
+
   // Extra wait for React hydration
   await delay(2000);
-  
+
   // Try to verify the page has the expected structure
-  const verified = await evaluate(cdp, `(() => {
+  const verified = await evaluate(
+    cdp,
+    `(() => {
     // Check if we're on Perplexity and the page is loaded
     const isPerplexity = location.hostname.includes('perplexity');
     const hasInput = document.body.innerText.includes('Ask anything') ||
                      document.body.innerText.includes('Ask a follow-up');
     return { ready: isPerplexity || hasInput, url: location.href };
-  })()`);
-  
-  if (verified && verified.ready) {
+  })()`,
+  );
+
+  if (verified?.ready) {
     return verified;
   }
-  
+
   // Even if verification fails, proceed anyway after timeout
   // since the page might have different text
   return { ready: true, fallback: true };
@@ -138,8 +173,10 @@ async function waitForPromptReady(cdp, timeoutMs = 20000) {
 
 async function selectMode(cdp, mode) {
   const normalizedMode = mode.toLowerCase();
-  
-  const result = await evaluate(cdp, `(() => {
+
+  const result = await evaluate(
+    cdp,
+    `(() => {
     ${buildClickDispatcher()}
     
     const targetMode = ${JSON.stringify(normalizedMode)};
@@ -160,19 +197,22 @@ async function selectMode(cdp, mode) {
     }
     
     return { success: false, error: 'Mode not found' };
-  })()`);
-  
+  })()`,
+  );
+
   if (!result || !result.success) {
-    throw new Error(`Failed to select mode: ${result?.error || 'unknown'}`);
+    throw new Error(`Failed to select mode: ${result?.error || "unknown"}`);
   }
-  
+
   await delay(300);
   return result.mode;
 }
 
 async function selectModel(cdp, model, timeoutMs = 8000) {
   // Click the model selector button
-  const buttonClicked = await evaluate(cdp, `(() => {
+  const buttonClicked = await evaluate(
+    cdp,
+    `(() => {
     ${buildClickDispatcher()}
     
     const buttons = Array.from(document.querySelectorAll('button'));
@@ -187,20 +227,23 @@ async function selectModel(cdp, model, timeoutMs = 8000) {
     
     dispatchClickSequence(modelBtn);
     return { success: true };
-  })()`);
-  
+  })()`,
+  );
+
   if (!buttonClicked || !buttonClicked.success) {
     throw new Error(`Model selector not found: ${buttonClicked?.error}`);
   }
-  
+
   await delay(500);
-  
+
   // Select from menu - loop in Node.js to avoid CDP timeout issues
-  const normalizedModel = model.toLowerCase().replace(/[^a-z0-9]/g, '');
+  const normalizedModel = model.toLowerCase().replace(/[^a-z0-9]/g, "");
   const deadline = Date.now() + timeoutMs;
-  
+
   while (Date.now() < deadline) {
-    const result = await evaluate(cdp, `(() => {
+    const result = await evaluate(
+      cdp,
+      `(() => {
       ${buildClickDispatcher()}
       
       const targetModel = ${JSON.stringify(normalizedModel)};
@@ -234,9 +277,10 @@ async function selectModel(cdp, model, timeoutMs = 8000) {
       }
       
       return { found: true, success: false, error: 'No matching model in menu' };
-    })()`);
-    
-    if (result && result.found) {
+    })()`,
+    );
+
+    if (result?.found) {
       if (result.success) {
         await delay(200);
         return result.model;
@@ -245,10 +289,10 @@ async function selectModel(cdp, model, timeoutMs = 8000) {
       await evaluate(cdp, `document.body.click()`);
       throw new Error(`Failed to select model: ${result?.error}`);
     }
-    
+
     await delay(100);
   }
-  
+
   // Timeout - close menu
   await evaluate(cdp, `document.body.click()`);
   throw new Error(`Failed to select model: timeout waiting for menu`);
@@ -261,7 +305,9 @@ async function selectModel(cdp, model, timeoutMs = 8000) {
 async function typePrompt(cdp, inputCdp, prompt) {
   // Click on the input area to focus it
   // Perplexity uses a complex input - just click in the general area
-  const clicked = await evaluate(cdp, `(() => {
+  const _clicked = await evaluate(
+    cdp,
+    `(() => {
     ${buildClickDispatcher()}
     
     // Strategy 1: Find element with "Ask anything" placeholder text
@@ -296,14 +342,15 @@ async function typePrompt(cdp, inputCdp, prompt) {
     }
     
     return { success: false, error: 'Could not find input' };
-  })()`);
-  
+  })()`,
+  );
+
   await delay(500);
-  
+
   // Type using CDP Input API (this works regardless of element type)
   await inputCdp("Input.insertText", { text: prompt });
   await delay(300);
-  
+
   // Backspace then re-add last char to reveal submit button
   await inputCdp("Input.dispatchKeyEvent", {
     type: "keyDown",
@@ -320,7 +367,7 @@ async function typePrompt(cdp, inputCdp, prompt) {
     nativeVirtualKeyCode: 8,
   });
   await delay(100);
-  
+
   // Re-add last character
   const lastChar = prompt.slice(-1);
   await inputCdp("Input.insertText", { text: lastChar });
@@ -329,23 +376,26 @@ async function typePrompt(cdp, inputCdp, prompt) {
 
 async function submitPrompt(cdp, inputCdp) {
   // Get submit button coordinates
-  const btnInfo = await evaluate(cdp, "(function() { const btn = document.querySelector('button[aria-label=Submit]'); if (!btn) return null; const r = btn.getBoundingClientRect(); return { x: r.x + r.width/2, y: r.y + r.height/2 }; })()");
-  
-  if (btnInfo && btnInfo.x && btnInfo.y) {
+  const btnInfo = await evaluate(
+    cdp,
+    "(function() { const btn = document.querySelector('button[aria-label=Submit]'); if (!btn) return null; const r = btn.getBoundingClientRect(); return { x: r.x + r.width/2, y: r.y + r.height/2 }; })()",
+  );
+
+  if (btnInfo?.x && btnInfo.y) {
     // Click using CDP
     await inputCdp("Input.dispatchMouseEvent", {
       type: "mousePressed",
       x: btnInfo.x,
       y: btnInfo.y,
       button: "left",
-      clickCount: 1
+      clickCount: 1,
     });
     await inputCdp("Input.dispatchMouseEvent", {
       type: "mouseReleased",
       x: btnInfo.x,
       y: btnInfo.y,
       button: "left",
-      clickCount: 1
+      clickCount: 1,
     });
   } else {
     // Fallback: press Enter
@@ -365,7 +415,7 @@ async function submitPrompt(cdp, inputCdp) {
       nativeVirtualKeyCode: 13,
     });
   }
-  
+
   await delay(500);
 }
 
@@ -395,17 +445,17 @@ function extractPerplexityResponseText() {
 async function waitForResponse(cdp, timeoutMs = 120000, signal) {
   throwIfAborted(signal);
   const deadline = Date.now() + timeoutMs;
-  let previousText = '';
+  let previousText = "";
   let stableCycles = 0;
   const requiredStableCycles = 10;
   let lastChangeAt = Date.now();
   const minStableMs = 2500;
-  
+
   // First, wait for navigation to search results page
   const navDeadline = Date.now() + 15000;
   while (Date.now() < navDeadline) {
-    const url = await evaluate(cdp, 'location.href');
-    if (url && url.includes('/search/')) {
+    const url = await evaluate(cdp, "location.href");
+    if (url?.includes("/search/")) {
       break;
     }
     await delay(200, signal);
@@ -421,24 +471,30 @@ async function waitForResponse(cdp, timeoutMs = 120000, signal) {
       const hasStop = !!document.querySelector('button[aria-label*=stop], button[aria-label*=Stop]');
       const hasCopy = !!document.querySelector('button[aria-label*=copy], button[aria-label*=Copy]');
       const hasRelated = document.body.innerText.indexOf('Related') > -1;
+      const hasFollowUp = document.body.innerText.indexOf('Ask a follow-up') > -1 ||
+                           document.body.innerText.indexOf('Follow-ups') > -1;
+      const bodyText = document.body.innerText;
+      const hasAnswer = bodyText.indexOf('Answer') > -1 || bodyText.indexOf('Searching the web') > -1;
       return {
         text: text,
         generating: hasStop,
         hasActions: hasCopy,
         hasRelated: hasRelated,
-        hasFollowUp: false,
+        hasFollowUp: hasFollowUp,
+        hasAnswer: hasAnswer,
         sourcesCount: 0,
         url: location.href
       };
-    })()`);
-    
+    })()`,
+    );
+
     if (!snapshot) {
       await delay(300, signal);
       continue;
     }
-    
-    const currentText = snapshot.text || '';
-    
+
+    const currentText = snapshot.text || "";
+
     // Track text changes
     if (currentText !== previousText && currentText.length > previousText.length) {
       previousText = currentText;
@@ -447,27 +503,29 @@ async function waitForResponse(cdp, timeoutMs = 120000, signal) {
     } else {
       stableCycles++;
     }
-    
+
     const stableMs = Date.now() - lastChangeAt;
-    
+
     // Response is complete if:
     // 1. Not generating (no stop button)
     // 2. Has action buttons OR Related section OR follow-up input OR stable for long enough
     // 3. Has meaningful content
     const isStable = stableCycles >= requiredStableCycles && stableMs >= minStableMs;
     const hasCompletionIndicators = snapshot.hasActions || snapshot.hasRelated || snapshot.hasFollowUp;
-    const isDone = !snapshot.generating && (hasCompletionIndicators || isStable);
-    
+    // If we have answer indicators and stable text, consider it done even without explicit completion UI
+    const hasAnswerIndicators = snapshot.hasAnswer && currentText.length > 50;
+    const isDone = !snapshot.generating && (hasCompletionIndicators || isStable || hasAnswerIndicators);
+
     if (isDone && currentText.trim().length > 0) {
       // Clean up the response text
       let cleanText = currentText;
-      
+
       // Remove "Related" section if present at the end
-      const relatedIdx = cleanText.lastIndexOf('\nRelated\n');
+      const relatedIdx = cleanText.lastIndexOf("\nRelated\n");
       if (relatedIdx > 0) {
         cleanText = cleanText.substring(0, relatedIdx).trim();
       }
-      
+
       return {
         text: cleanText,
         sources: snapshot.sourcesCount,
@@ -477,17 +535,17 @@ async function waitForResponse(cdp, timeoutMs = 120000, signal) {
     
     await delay(300, signal);
   }
-  
+
   // Timeout - return whatever we have
   if (previousText.trim().length > 0) {
     return {
       text: previousText,
       sources: 0,
-      url: await evaluate(cdp, 'location.href'),
+      url: await evaluate(cdp, "location.href"),
       partial: true,
     };
   }
-  
+
   throw new Error("Response timeout - Perplexity did not complete in time");
 }
 
@@ -499,7 +557,9 @@ async function query(options) {
   const {
     prompt,
     model,
-    mode = 'search',
+    mode = "search",
+    focus,
+    spaceId,
     timeout = 120000,
     createTab,
     closeTab,
@@ -509,15 +569,21 @@ async function query(options) {
     signal,
   } = options;
   throwIfAborted(signal);
-  
+
   const startTime = Date.now();
   log("Starting Perplexity query");
-  
-  // Create tab
-  const tabInfo = await raceAbort(createTab, signal);
+
+  // Build deep-link URL — Perplexity boots the page already configured with
+  // the query, model, focus, and space. Skips typePrompt + selectModel +
+  // selectMode + submitPrompt entirely.
+  const deepLinkUrl = buildDeepLinkUrl({ prompt, model, focus, spaceId });
+  log(`Deep-link URL: ${deepLinkUrl}`);
+
+  // Create tab with deep-link URL
+  const tabInfo = await raceAbort(() => createTab(deepLinkUrl), signal);
   log(`createTab returned: ${JSON.stringify(tabInfo)}`);
   const { tabId } = tabInfo || {};
-  
+
   if (!tabId) {
     throw new Error(`Failed to create Perplexity tab: ${JSON.stringify(tabInfo)}`);
   }
@@ -527,68 +593,43 @@ async function query(options) {
   const inputCdp = (method, params) => raceAbort(() => cdpCommand(tabId, method, params), signal);
   
   try {
-    // Wait for page load
+    // Make tab active so Perplexity deep-link auto-submits
+    try {
+      await inputCdp("Page.bringToFront", {});
+    } catch {}
+
+    // Wait for page load (boots the deep-link)
     await waitForPageLoad(cdp);
     log("Page loaded");
-    
-    // Check login status (informational)
-    const loginStatus = await checkLoginStatus(cdp);
-    log(`Login: ${loginStatus.loggedIn ? 'yes' : 'anonymous'}${loginStatus.isPro ? ' (Pro)' : ''}`);
-    
-    // Wait for input
-    await waitForPromptReady(cdp);
-    log("Prompt ready");
-    
-    // Select mode if not default
-    if (mode && mode.toLowerCase() !== 'search') {
-      try {
-        const selectedMode = await selectMode(cdp, mode);
-        log(`Mode: ${selectedMode}`);
-      } catch (e) {
-        if (signal?.aborted) throw e;
-        log(`Mode selection failed: ${e.message}`);
-      }
-    }
-    
-    // Select model if specified
-    if (model) {
-      try {
-        const selectedModel = await selectModel(cdp, model);
-        log(`Model: ${selectedModel}`);
-      } catch (e) {
-        if (signal?.aborted) throw e;
-        log(`Model selection failed: ${e.message}`);
-      }
-    }
-    
-    // Type prompt
-    await typePrompt(cdp, inputCdp, prompt);
-    log("Prompt typed");
-    
-    // Submit
-    await submitPrompt(cdp, inputCdp);
-    log("Submitted, waiting for response...");
-    
-    // Wait for response
+
+    // Wait for response — Perplexity auto-submits once the deep-link boots,
+    // and we poll for the .prose response container to fill + stabilize.
     const response = await waitForResponse(cdp, timeout, signal);
+    log(
+      `Response: ${response.text.length} chars${response.partial ? " (partial)" : ""}`,
+    );
+
     log(`Response: ${response.text.length} chars, ${response.sources} sources${response.partial ? ' (partial)' : ''}`);
-    
     return {
       response: response.text,
-      sources: response.sources,
       url: response.url,
-      model: model || 'default',
-      mode: mode || 'search',
+      model: model || "default",
+      mode: mode || "search",
+      focus: focus || null,
+      spaceId: spaceId || null,
       partial: response.partial || false,
       tookMs: Date.now() - startTime,
     };
   } finally {
     try {
-      await closeTab(tabId);
+      await Promise.race([
+        closeTab(tabId),
+        new Promise(resolve => setTimeout(resolve, 5000)),
+      ]);
     } catch (error) {
       log(`Failed to close Perplexity tab ${tabId}: ${error?.message || error}`);
     }
   }
 }
 
-module.exports = { query, PERPLEXITY_URL, waitForResponse, extractPerplexityResponseText };
+module.exports = { query, buildDeepLinkUrl, PERPLEXITY_URL, waitForResponse, extractPerplexityResponseText };

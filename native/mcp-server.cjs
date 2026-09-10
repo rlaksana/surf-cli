@@ -11,28 +11,28 @@ const { prepareRemoteTool, validateLocalToolPaths } = require("./file-transfer.c
 const TOOL_SCHEMAS = {
   navigate: {
     desc: "Navigate browser to URL",
-    schema: { url: z.string().describe("URL to navigate to") }
+    schema: { url: z.string().describe("URL to navigate to") },
   },
   screenshot: {
     desc: "Capture screenshot of current page",
     schema: {
       output: z.string().optional().describe("Save to file path"),
-      selector: z.string().optional().describe("Capture specific element")
-    }
+      selector: z.string().optional().describe("Capture specific element"),
+    },
   },
   "page.read": {
     desc: "Get page accessibility tree for element refs",
     schema: {
-      ref: z.string().optional().describe("Get specific element by ref")
-    }
+      ref: z.string().optional().describe("Get specific element by ref"),
+    },
   },
   "page.text": {
     desc: "Extract all text content from page",
-    schema: {}
+    schema: {},
   },
   "page.state": {
     desc: "Get page state (modals, loading indicators, etc.)",
-    schema: {}
+    schema: {},
   },
   click: {
     desc: "Click element by ref or coordinates",
@@ -41,8 +41,8 @@ const TOOL_SCHEMAS = {
       x: z.number().optional().describe("X coordinate"),
       y: z.number().optional().describe("Y coordinate"),
       button: z.enum(["left", "right", "double", "triple"]).optional().describe("Click type"),
-      selector: z.string().optional().describe("CSS selector (js method)")
-    }
+      selector: z.string().optional().describe("CSS selector (js method)"),
+    },
   },
   type: {
     desc: "Type text into focused element",
@@ -50,132 +50,132 @@ const TOOL_SCHEMAS = {
       text: z.string().describe("Text to type"),
       selector: z.string().optional().describe("CSS selector"),
       submit: z.boolean().optional().describe("Press enter after"),
-      clear: z.boolean().optional().describe("Clear field first")
-    }
+      clear: z.boolean().optional().describe("Clear field first"),
+    },
   },
   key: {
     desc: "Press keyboard key",
     schema: {
-      key: z.string().describe("Key to press (Enter, Escape, cmd+a, ctrl+shift+p, etc.)")
-    }
+      key: z.string().describe("Key to press (Enter, Escape, cmd+a, ctrl+shift+p, etc.)"),
+    },
   },
   hover: {
     desc: "Hover over element",
     schema: {
       ref: z.string().optional().describe("Element ref"),
       x: z.number().optional().describe("X coordinate"),
-      y: z.number().optional().describe("Y coordinate")
-    }
+      y: z.number().optional().describe("Y coordinate"),
+    },
   },
   drag: {
     desc: "Drag between two points",
     schema: {
       from: z.string().optional().describe("Start x,y coordinates"),
-      to: z.string().optional().describe("End x,y coordinates")
-    }
+      to: z.string().optional().describe("End x,y coordinates"),
+    },
   },
   "scroll.top": {
     desc: "Scroll to top of page",
-    schema: { selector: z.string().optional().describe("Target specific container") }
+    schema: { selector: z.string().optional().describe("Target specific container") },
   },
   "scroll.bottom": {
     desc: "Scroll to bottom of page",
-    schema: { selector: z.string().optional().describe("Target specific container") }
+    schema: { selector: z.string().optional().describe("Target specific container") },
   },
   "scroll.to": {
     desc: "Scroll element into view",
-    schema: { ref: z.string().describe("Element ref from page.read") }
+    schema: { ref: z.string().describe("Element ref from page.read") },
   },
   "scroll.info": {
     desc: "Get scroll position info",
-    schema: { selector: z.string().optional().describe("Target specific container") }
+    schema: { selector: z.string().optional().describe("Target specific container") },
   },
   "tab.list": {
     desc: "List all open browser tabs",
-    schema: {}
+    schema: {},
   },
   "tab.new": {
     desc: "Open new tab",
     schema: {
       url: z.string().describe("URL to open"),
-      urls: z.string().optional().describe("Multiple URLs (space-separated)")
-    }
+      urls: z.string().optional().describe("Multiple URLs (space-separated)"),
+    },
   },
   "tab.switch": {
     desc: "Switch to tab by ID or name",
-    schema: { id: z.string().describe("Tab ID or registered name") }
+    schema: { id: z.string().describe("Tab ID or registered name") },
   },
   "tab.close": {
     desc: "Close tab by ID or name",
     schema: {
       id: z.string().optional().describe("Tab ID or name"),
-      ids: z.string().optional().describe("Multiple tab IDs")
-    }
+      ids: z.string().optional().describe("Multiple tab IDs"),
+    },
   },
   "tab.name": {
     desc: "Register current tab with a name",
-    schema: { name: z.string().describe("Name for the tab") }
+    schema: { name: z.string().describe("Name for the tab") },
   },
   "tab.unname": {
     desc: "Unregister a named tab",
-    schema: { name: z.string().describe("Tab name to unregister") }
+    schema: { name: z.string().describe("Tab name to unregister") },
   },
   "tab.named": {
     desc: "List all named tabs",
-    schema: {}
+    schema: {},
   },
   js: {
     desc: "Execute JavaScript in page context",
     schema: {
-      code: z.string().describe("JavaScript code to execute (use 'return' for values)")
-    }
+      code: z.string().describe("JavaScript code to execute (use 'return' for values)"),
+    },
   },
   wait: {
     desc: "Wait for specified duration",
-    schema: { duration: z.number().describe("Seconds to wait (max 30)") }
+    schema: { duration: z.number().describe("Seconds to wait (max 30)") },
   },
   "wait.element": {
     desc: "Wait for element to appear",
     schema: {
       selector: z.string().describe("CSS selector"),
-      timeout: z.number().optional().describe("Timeout in ms")
-    }
+      timeout: z.number().optional().describe("Timeout in ms"),
+    },
   },
   "wait.network": {
     desc: "Wait for network to be idle",
-    schema: { timeout: z.number().optional().describe("Timeout in ms") }
+    schema: { timeout: z.number().optional().describe("Timeout in ms") },
   },
   "wait.url": {
     desc: "Wait for URL to match pattern",
     schema: {
       pattern: z.string().describe("URL pattern to match"),
-      timeout: z.number().optional().describe("Timeout in ms")
-    }
+      timeout: z.number().optional().describe("Timeout in ms"),
+    },
   },
   "wait.dom": {
     desc: "Wait for DOM to stabilize",
     schema: {
       stable: z.number().optional().describe("Stability window in ms"),
-      timeout: z.number().optional().describe("Max wait time in ms")
-    }
+      timeout: z.number().optional().describe("Max wait time in ms"),
+    },
   },
   "wait.load": {
     desc: "Wait for page to fully load",
-    schema: { timeout: z.number().optional().describe("Max wait time in ms") }
+    schema: { timeout: z.number().optional().describe("Max wait time in ms") },
   },
   console: {
     desc: "Read browser console messages",
     schema: {
       clear: z.boolean().optional().describe("Clear after reading"),
-      level: z.string().optional().describe("Filter by level (log,warn,error)")
-    }
+      level: z.string().optional().describe("Filter by level (log,warn,error)"),
+    },
   },
   network: {
     desc: "Read network requests",
     schema: {
       clear: z.boolean().optional().describe("Clear after reading"),
-      filter: z.string().optional().describe("Filter by URL pattern")
-    }
+      filter: z.string().optional().describe("Filter by URL pattern"),
+    },
   },
   health: {
     desc: "Health check - wait for URL response or element",
@@ -183,28 +183,28 @@ const TOOL_SCHEMAS = {
       url: z.string().optional().describe("URL to check (expects 200)"),
       selector: z.string().optional().describe("CSS selector to wait for"),
       expect: z.number().optional().describe("Expected status code"),
-      timeout: z.number().optional().describe("Timeout in ms")
-    }
+      timeout: z.number().optional().describe("Timeout in ms"),
+    },
   },
   "dialog.accept": {
     desc: "Accept current browser dialog",
-    schema: { text: z.string().optional().describe("Text for prompt input") }
+    schema: { text: z.string().optional().describe("Text for prompt input") },
   },
   "dialog.dismiss": {
     desc: "Dismiss current browser dialog",
-    schema: {}
+    schema: {},
   },
   "dialog.info": {
     desc: "Get current dialog info",
-    schema: {}
+    schema: {},
   },
   "emulate.network": {
     desc: "Emulate network conditions",
-    schema: { preset: z.string().describe("Network preset (slow-3g, fast-3g, offline)") }
+    schema: { preset: z.string().describe("Network preset (slow-3g, fast-3g, offline)") },
   },
   "emulate.cpu": {
     desc: "Throttle CPU",
-    schema: { rate: z.number().describe("Throttle rate (>= 1)") }
+    schema: { rate: z.number().describe("Throttle rate (>= 1)") },
   },
   "emulate.geo": {
     desc: "Override geolocation",
@@ -212,42 +212,42 @@ const TOOL_SCHEMAS = {
       lat: z.number().optional().describe("Latitude"),
       lon: z.number().optional().describe("Longitude"),
       accuracy: z.number().optional().describe("Accuracy in meters"),
-      clear: z.boolean().optional().describe("Clear override")
-    }
+      clear: z.boolean().optional().describe("Clear override"),
+    },
   },
   "form.fill": {
     desc: "Batch fill form fields",
-    schema: { data: z.string().describe("JSON array of {ref, value}") }
+    schema: { data: z.string().describe("JSON array of {ref, value}") },
   },
   "perf.start": {
     desc: "Start performance trace",
-    schema: { categories: z.string().optional().describe("Trace categories (comma-separated)") }
+    schema: { categories: z.string().optional().describe("Trace categories (comma-separated)") },
   },
   "perf.stop": {
     desc: "Stop trace and get metrics",
-    schema: {}
+    schema: {},
   },
   "perf.metrics": {
     desc: "Get current performance metrics",
-    schema: {}
+    schema: {},
   },
   upload: {
     desc: "Upload file(s) to input",
     schema: {
       ref: z.string().describe("Element ref (e.g., e5)"),
-      files: z.string().describe("File path(s) comma-separated")
-    }
+      files: z.string().describe("File path(s) comma-separated"),
+    },
   },
   "frame.list": {
     desc: "List all frames in page",
-    schema: {}
+    schema: {},
   },
   "frame.js": {
     desc: "Execute JS in specific frame",
     schema: {
       id: z.string().describe("Frame ID from frame.list"),
-      code: z.string().describe("JavaScript code")
-    }
+      code: z.string().describe("JavaScript code"),
+    },
   },
   smart_type: {
     desc: "Type into specific element with options",
@@ -255,8 +255,8 @@ const TOOL_SCHEMAS = {
       selector: z.string().describe("CSS selector"),
       text: z.string().describe("Text to type"),
       clear: z.boolean().optional().describe("Clear first"),
-      submit: z.boolean().optional().describe("Submit after")
-    }
+      submit: z.boolean().optional().describe("Submit after"),
+    },
   },
   ai: {
     desc: "AI-powered page analysis (requires GOOGLE_API_KEY)",
@@ -332,7 +332,7 @@ function formatResult(resp) {
       formatted.push({
         type: "image",
         data: item.data,
-        mimeType: item.mimeType || "image/png"
+        mimeType: item.mimeType || "image/png",
       });
     }
   }
@@ -349,7 +349,7 @@ class PiChromeMcpServer {
     this.endpoint = endpoint;
     this.server = new McpServer({
       name: "surf",
-      version: "1.0.0"
+      version: "1.0.0",
     });
     this.registerTools();
     this.registerResources();
@@ -500,8 +500,7 @@ async function main() {
 }
 
 if (require.main === module) {
-  main().catch((err) => {
-    console.error("MCP Server error:", err.message);
+  main().catch((_err) => {
     process.exit(1);
   });
 }

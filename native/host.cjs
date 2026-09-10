@@ -9,11 +9,13 @@ const https = require("https");
 const { execSync } = require("child_process");
 const { GoogleGenerativeAI } = require("@google/generative-ai");
 const chatgptClient = require("./chatgpt-client.cjs");
+const claudeClient = require("./claude-client.cjs");
 const geminiClient = require("./gemini-client.cjs");
 const perplexityClient = require("./perplexity-client.cjs");
 const grokClient = require("./grok-client.cjs");
 const aistudioClient = require("./aistudio-client.cjs");
 const aistudioBuild = require("./aistudio-build.cjs");
+const aimodeClient = require("./aimode-client.cjs");
 const { mapToolToMessage, mapComputerAction, formatToolContent, buildProviderUploadMessage } = require("./host-helpers.cjs");
 
 const IS_WIN = process.platform === "win32";
@@ -733,10 +735,110 @@ function handleToolRequest(msg, socket, requestContext = requestStorage.getStore
     }).catch((err) => {
       sendToolResponse(socket, originalId, null, err.message);
     });
-    
+
     return;
   }
-  
+
+  if (extensionMsg.type === "CLAUDE_QUERY") {
+    const { query, model, withPage, timeout } = extensionMsg;
+
+    queueAiRequest(async () => {
+      let pageContext = null;
+      if (withPage) {
+        const pageResult = await new Promise((resolve) => {
+          const pageId = ++requestCounter;
+          pendingToolRequests.set(pageId, {
+            socket: null,
+            originalId: null,
+            tool: "read_page",
+            onComplete: resolve
+          });
+          writeMessage({ type: "GET_PAGE_TEXT", tabId: extensionMsg.tabId, id: pageId });
+        });
+        if (pageResult && pageResult.url) {
+          pageContext = {
+            url: pageResult.url,
+            text: pageResult.text || pageResult.pageContent || ""
+          };
+        }
+      }
+
+      let fullPrompt = query;
+      if (pageContext) {
+        fullPrompt = `Page: ${pageContext.url}\n\n${pageContext.text}\n\n---\n\n${query}`;
+      }
+
+      const result = await claudeClient.query({
+        prompt: fullPrompt,
+        model,
+        timeout,
+        getCookies: () => new Promise((resolve) => {
+          const cookieId = ++requestCounter;
+          pendingToolRequests.set(cookieId, {
+            socket: null,
+            originalId: null,
+            tool: "get_cookies",
+            onComplete: (r) => resolve(r)
+          });
+          writeMessage({ type: "GET_CLAUDE_COOKIES", id: cookieId });
+        }),
+        createTab: () => new Promise((resolve) => {
+          const tabCreateId = ++requestCounter;
+          pendingToolRequests.set(tabCreateId, {
+            socket: null,
+            originalId: null,
+            tool: "create_tab",
+            onComplete: (r) => resolve(r)
+          });
+          writeMessage({ type: "CLAUDE_NEW_TAB", id: tabCreateId });
+        }),
+        closeTab: (tabIdToClose) => new Promise((resolve) => {
+          const tabCloseId = ++requestCounter;
+          pendingToolRequests.set(tabCloseId, {
+            socket: null,
+            originalId: null,
+            tool: "close_tab",
+            onComplete: (r) => resolve(r)
+          });
+          writeMessage({ type: "CLAUDE_CLOSE_TAB", tabId: tabIdToClose, id: tabCloseId });
+        }),
+        cdpEvaluate: (tabId, expression) => new Promise((resolve) => {
+          const evalId = ++requestCounter;
+          pendingToolRequests.set(evalId, {
+            socket: null,
+            originalId: null,
+            tool: "cdp_evaluate",
+            onComplete: (r) => resolve(r)
+          });
+          writeMessage({ type: "CLAUDE_EVALUATE", tabId, expression, id: evalId });
+        }),
+        cdpCommand: (tabId, method, params) => new Promise((resolve) => {
+          const cmdId = ++requestCounter;
+          pendingToolRequests.set(cmdId, {
+            socket: null,
+            originalId: null,
+            tool: "cdp_command",
+            onComplete: (r) => resolve(r)
+          });
+          writeMessage({ type: "CLAUDE_CDP_COMMAND", tabId, method, params, id: cmdId });
+        }),
+        log: (msg) => log(`[claude] ${msg}`)
+      });
+
+      return result;
+    }).then((result) => {
+      sendToolResponse(socket, originalId, {
+        response: result.response,
+        model: result.model,
+        tookMs: result.tookMs
+      }, null);
+    }).catch((err) => {
+      sendToolResponse(socket, originalId, null, err.message);
+    });
+
+    return;
+  }
+
   if (extensionMsg.type === "PERPLEXITY_QUERY") {
     const { query, mode, model, withPage, timeout } = extensionMsg;
     
@@ -1138,7 +1240,77 @@ function handleToolRequest(msg, socket, requestContext = requestStorage.getStore
     }).catch((err) => {
       sendToolResponse(socket, originalId, null, err.message);
     });
-    
+
+    return;
+  }
+
+  if (extensionMsg.type === "AIMODE_QUERY") {
+    const { query, pro, timeout } = extensionMsg;
+
+    queueAiRequest(async () => {
+      const EXT_CALL_TIMEOUT_MS = 30000;
+
+      const callExtension = (toolName, msg, timeoutMs = EXT_CALL_TIMEOUT_MS) => new Promise((resolve, reject) => {
+        const id = ++requestCounter;
+
+        const timeoutId = setTimeout(() => {
+          pendingToolRequests.delete(id);
+          reject(new Error(`Timeout waiting for extension: ${toolName}`));
+        }, timeoutMs);
+
+        pendingToolRequests.set(id, {
+          socket: null,
+          originalId: null,
+          tool: toolName,
+          onComplete: (r) => {
+            clearTimeout(timeoutId);
+            resolve(r);
+          }
+        });
+
+        writeMessage({ ...msg, id });
+      });
+
+      const result = await aimodeClient.query({
+        prompt: query || "",
+        pro: pro !== false, // default pro (nem=143); --auto flag in CLI sets pro=false (udm=50)
+        timeout: timeout || 120000,
+        getCookies: () => callExtension("get_cookies", { type: "GET_GOOGLE_COOKIES" }, 45000),
+        createTab: (url) => callExtension(
+          "create_tab",
+          { type: "AIMODE_NEW_TAB", url },
+          45000
+        ),
+        closeTab: (tabIdToClose) => callExtension(
+          "close_tab",
+          { type: "AIMODE_CLOSE_TAB", tabId: tabIdToClose },
+          45000
+        ),
+        cdpEvaluate: (tabId, expression) => callExtension(
+          "cdp_evaluate",
+          { type: "AIMODE_EVALUATE", tabId, expression }
+        ),
+        cdpCommand: (tabId, method, params) => callExtension(
+          "cdp_command",
+          { type: "AIMODE_CDP_COMMAND", tabId, method, params }
+        ),
+        log: (msg) => log(`[aimode] ${msg}`)
+      });
+
+      return result;
+    }).then((result) => {
+      const payload = {
+        response: result.response,
+        model: pro === false ? "udm=50 (auto)" : "nem=143 (pro)",
+        url: result.url,
+        tookMs: result.tookMs
+      };
+
+      sendToolResponse(socket, originalId, { output: JSON.stringify(payload) }, null);
+    }).catch((err) => {
+      sendToolResponse(socket, originalId, null, err.message);
+    });
+
     return;
   }
 

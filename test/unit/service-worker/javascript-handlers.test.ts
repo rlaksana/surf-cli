@@ -181,7 +181,7 @@ describe("JavaScript command handlers", () => {
     expect(evaluations).toHaveLength(2);
   });
 
-  it("falls back to original script on expression SyntaxError", async () => {
+  it("runs statement-shaped code in an async IIFE without a fallback hop", async () => {
     const handleMessage = await loadHandleMessage();
     const chrome = (globalThis as any).chrome;
     mockRuntimeEvaluate(chrome);
@@ -195,8 +195,11 @@ describe("JavaScript command handlers", () => {
       ([, method]: [unknown, string]) => method === "Runtime.evaluate",
     );
 
+    // The wrapper now chooses IIFE-vs-expression-wrap up front based on a
+    // statement-keyword heuristic, so the script runs in a single evaluation
+    // (piHelpers init + user code) instead of wrap → fallback → success.
     expect(result).toEqual({ output: "undefined" });
-    expect(evaluations).toHaveLength(3);
+    expect(evaluations).toHaveLength(2);
   });
 
   it("preserves multi-statement scripts as-is through SyntaxError fallback", async () => {

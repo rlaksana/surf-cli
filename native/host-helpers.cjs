@@ -553,8 +553,13 @@ function mapComputerAction(args, tabId) {
  * Map tool name and args to extension message
  */
 function mapToolToMessage(tool, args, tabId) {
-  const baseMsg = { tabId };
   const a = args || {};
+  // Pass through tab-isolation flags so the extension can choose auto-bg vs active.
+  const baseMsg = {
+    tabId,
+    _newTab: a.newTab === true || a["new-tab"] === true,
+    _keepTab: a.keepTab === true || a["keep-tab"] === true,
+  };
   
   switch (tool) {
     case "computer":
@@ -1101,6 +1106,16 @@ function mapToolToMessage(tool, args, tabId) {
         timeout: a.timeout ? parseInt(a.timeout, 10) * 1000 : 2700000,
         ...baseMsg 
       };
+    case "claude":
+      if (!a.query) throw new Error("query required");
+      return {
+        type: "CLAUDE_QUERY",
+        query: a.query,
+        model: a.model,
+        withPage: a["with-page"],
+        timeout: a.timeout ? parseInt(a.timeout, 10) * 1000 : 300000,
+        ...baseMsg
+      };
     case "gemini":
       if (!a.query && !a["generate-image"]) throw new Error("query required");
       return {
@@ -1155,6 +1170,17 @@ function mapToolToMessage(tool, args, tabId) {
         model: a.model ? normalizeModelString(a.model) : undefined,
         withPage: a["with-page"],
         timeout: a.timeout ? parseInt(a.timeout, 10) * 1000 : 300000,
+        ...baseMsg
+      };
+    }
+    case "aimode": {
+      if (!a.query) throw new Error("query required");
+
+      return {
+        type: "AIMODE_QUERY",
+        query: a.query,
+        pro: a.auto ? false : true, // --auto flag → udm=50 (auto), default → nem=143 (pro)
+        timeout: a.timeout ? parseInt(a.timeout, 10) * 1000 : 120000,
         ...baseMsg
       };
     }

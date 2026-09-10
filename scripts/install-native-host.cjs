@@ -6,6 +6,8 @@ const { execFileSync, execSync } = require("child_process");
 const { parseListenEndpoint } = require("../native/listener.cjs");
 const { getStateDir, loadHostIdentity, loadRegistry } = require("../native/remote-auth.cjs");
 
+const IS_WIN = process.platform === "win32";
+
 const HOST_NAME = "surf.browser.host";
 
 const BROWSERS = {
@@ -274,6 +276,17 @@ function installWindowsRegistry(browser, extensionId, wrapperPath) {
   }
 }
 
+function getBrowserPathForCli(browser) {
+  if (!IS_WIN) return null;
+  const paths = {
+    edge: "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
+    chrome: "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+    chromium: "C:\\Program Files\\Chromium\\Application\\chrome.exe",
+    brave: "C:\\Program Files\\BraveSoftware\\Brave-Browser\\Application\\brave.exe",
+  };
+  return paths[browser] || null;
+}
+
 function parseArgs() {
   const args = process.argv.slice(2);
   const result = { extensionId: null, browsers: ["chrome"], target: "auto", listen: undefined };
@@ -426,6 +439,30 @@ function main() {
     } else {
       skipped.push(BROWSERS[browser].name);
     }
+  }
+
+  // Save browser config for auto-launch
+  const configPath = path.join(os.homedir(), "surf.json");
+  const fs2 = require("fs");
+  let surfConfig = {};
+  try {
+    if (fs2.existsSync(configPath)) {
+      surfConfig = JSON.parse(fs2.readFileSync(configPath, "utf-8"));
+    }
+  } catch {}
+
+  // Use first installed browser as default
+  const primaryBrowser = browsers[0];
+  const browserPath = getBrowserPathForCli(primaryBrowser);
+
+  surfConfig.browserType = primaryBrowser;
+  surfConfig.browserPath = browserPath;
+
+  try {
+    fs2.writeFileSync(configPath, JSON.stringify(surfConfig, null, 2));
+    console.log(`\nSaved browser config: ${primaryBrowser}`);
+  } catch (e) {
+    console.error(`\nWarning: Could not save browser config: ${e.message}`);
   }
 
   if (installed.length > 0) {

@@ -17,12 +17,15 @@ const MAX_DEADLINE_MS = 50 * 60 * 1000;
 const CLEANUP_GRACE_MS = 60000;
 const PROVIDER_DEFAULT_TIMEOUT_SECONDS = {
   ai: 300,
+  aimode: 120,
   aistudio: 300,
   "aistudio.build": 600,
   chatgpt: 2700,
+  claude: 300,
   gemini: 300,
   grok: 300,
   perplexity: 120,
+  smoke: 300,
 };
 
 function resolveRequestDeadlineMs(tool, args = {}) {

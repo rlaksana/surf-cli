@@ -1,12 +1,3 @@
-declare const process: {
-  cwd(): string;
-  env: Record<string, string | undefined>;
-  execPath: string;
-  pid: number;
-  platform: string;
-};
-declare const require: (moduleName: string) => any;
-
 const { spawn } = require("node:child_process");
 const fs = require("node:fs");
 const net = require("node:net");

@@ -1,6 +1,7 @@
 import { CDPController } from "../cdp/controller";
 import { debugLog } from "../utils/debug";
 import { initNativeMessaging, postToNativeHost } from "../native/port-manager";
+import { resolveTabForCommand } from "./tab-resolver";
 
 debugLog("Service worker loaded");
 
@@ -69,50 +70,6 @@ async function tabClose(tabId: number): Promise<void> {
 // survives service-worker restarts via chrome.storage.session (cleared on
 // browser restart); a closed/stale ID is detected and the tab is recreated
 // on the next command.
-let surfTabIdCache: number | null = null;
-
-const SURF_TAB_URL = 'data:text/html,<html><head><title>Surf</title></head><body></body></html>';
-
-export async function getOrCreateSurfTab(): Promise<{
-  tab: chrome.tabs.Tab;
-  created: boolean;
-} | null> {
-  if (surfTabIdCache !== null) {
-    try {
-      return { tab: await chrome.tabs.get(surfTabIdCache), created: false };
-    } catch {
-      surfTabIdCache = null; // closed manually — recreate below
-    }
-  }
-  try {
-    const stored = await chrome.storage.session.get("surfTabId");
-    const storedId = stored?.surfTabId;
-    if (typeof storedId === "number") {
-      const tab = await chrome.tabs.get(storedId);
-      surfTabIdCache = storedId;
-      return { tab, created: false };
-    }
-  } catch {
-    // storage.session unavailable — fall through to creation
-  }
-
-  const [active] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
-  const created = await createBackgroundTab(
-    active?.windowId !== undefined
-      ? { windowId: active.windowId, url: SURF_TAB_URL }
-      : { url: SURF_TAB_URL },
-  );
-  if (!created.id) return null;
-  surfTabIdCache = created.id;
-  try {
-    await chrome.storage.session.set({ surfTabId: created.id });
-  } catch {
-    // non-fatal: worst case the tab is recreated after a SW restart
-  }
-  // Give the blank page a moment before the first command runs on it
-  await new Promise((r) => setTimeout(r, 100));
-  return { tab: created, created: true };
-}
 
 const STALE_AGENT_TAB_MS = 10 * 60 * 1000; // 10 minutes (retained for reference; unused while disabled)
 
@@ -390,6 +347,19 @@ function base64ToBlob(base64: string, mimeType = "image/png"): Blob {
 }
 
 function codeWithExpressionReturn(code: string): string {
+  // Prefer the expression form `return ( ... );` so that single-expression code
+  // (e.g. `1 + 2`, `document.title`) returns its value to the caller. Fall back
+  // to an async IIFE for code that contains declarations or statements at line
+  // start — those are not valid in expression position. The previous `new Function`
+  // parse-test approach was dropped because interpolating caller code into a
+  // Function body is a code-injection anti-pattern even when the function body
+  // is never executed; a regex heuristic over line starts is sufficient here
+  // because every caller (surf js, gemini-client.cjs) already routes through
+  // CDP Runtime.evaluate with awaitPromise, so the browser is the actual
+  // execution boundary, not this wrapper.
+  if (/^\s*(?:const|let|var|function|class|import|export|return|throw|if|for|while|do|switch|try)\b/m.test(code)) {
+    return `return (async () => { ${code} })()`;
+  }
   return `return (\n${code}\n);`;
 }
 
@@ -2021,9 +1991,9 @@ export async function handleMessage(
         
         const body = codeWithExpressionReturn(message.code);
         const expression = `(async () => { 'use strict'; ${body} })()`;
-        
+
         let result = await cdp.evaluateScript(tabId, expression);
-        
+
         if (result.exceptionDetails && !scriptParses(body)) {
           result = await cdp.evaluateScript(tabId, `(async () => { 'use strict'; ${message.code} })()`);
         }
@@ -3283,6 +3253,11 @@ export async function handleMessage(
       return { cookies: [...cookies, ...openaiCookies] };
     }
 
+    case "GET_CLAUDE_COOKIES": {
+      const cookies = await chrome.cookies.getAll({ domain: ".claude.ai" });
+      return { cookies };
+    }
+
     case "CHATGPT_NEW_TAB": {
       const tab = await createBackgroundTab({ url: "https://chatgpt.com/" });
       if (!tab.id) throw new Error("Failed to create tab");
@@ -3308,6 +3283,33 @@ export async function handleMessage(
       return { tabId: tab.id };
     }
 
+    case "CLAUDE_NEW_TAB": {
+      const tab = await chrome.tabs.create({
+        url: "https://claude.ai/",
+        active: false,
+      });
+      if (!tab.id) throw new Error("Failed to create tab");
+      const currentTab = await chrome.tabs.get(tab.id);
+      if (currentTab.status !== "complete") {
+        await new Promise<void>((resolve) => {
+          const listener = (tabId: number, info: chrome.tabs.OnUpdatedInfo) => {
+            if (tabId === tab.id && info.status === "complete") {
+              chrome.tabs.onUpdated.removeListener(listener);
+              resolve();
+            }
+          };
+          chrome.tabs.onUpdated.addListener(listener);
+          setTimeout(() => {
+            chrome.tabs.onUpdated.removeListener(listener);
+            resolve();
+          }, 30000);
+        });
+      }
+      await cdp.attach(tab.id);
+      await waitForRuntimeReady(tab.id, 10000);
+      return { tabId: tab.id };
+    }
+
     case "CHATGPT_CLOSE_TAB": {
       const chatTabId = message.tabId;
       if (chatTabId) {
@@ -3321,6 +3323,19 @@ export async function handleMessage(
       return { success: true };
     }
 
+    case "CLAUDE_CLOSE_TAB": {
+      const claudeTabId = message.tabId;
+      if (claudeTabId) {
+        try {
+          await cdp.detach(claudeTabId);
+        } catch {}
+        try {
+          await chrome.tabs.remove(claudeTabId);
+        } catch {}
+      }
+      return { success: true };
+    }
+
     case "CHATGPT_CDP_COMMAND": {
       const { method, params } = message;
       const result = await cdp.sendCommand(message.tabId, method, params || {});
@@ -3328,6 +3343,17 @@ export async function handleMessage(
     }
 
     case "CHATGPT_EVALUATE": {
+      const result = await cdp.evaluateScript(message.tabId, message.expression);
+      return result;
+    }
+
+    case "CLAUDE_CDP_COMMAND": {
+      const { method, params } = message;
+      const result = await cdp.sendCommand(message.tabId, method, params || {});
+      return result;
+    }
+
+    case "CLAUDE_EVALUATE": {
       const result = await cdp.evaluateScript(message.tabId, message.expression);
       return result;
     }
@@ -3553,6 +3579,50 @@ export async function handleMessage(
       return await cdp.evaluateScript(message.tabId, message.expression);
     }
 
+    case "AIMODE_NEW_TAB": {
+      // URL is pre-built by the native host (AIMODE_URL_PRO or AIMODE_URL_AUTO).
+      const url = message.url || "https://www.google.com/search?udm=50&q=";
+      const tab = await chrome.tabs.create({ url, active: false });
+      if (!tab.id) throw new Error("Failed to create tab");
+      const currentTab = await chrome.tabs.get(tab.id);
+      if (currentTab.status !== "complete") {
+        await new Promise<void>((resolve) => {
+          const listener = (tabId: number, info: chrome.tabs.OnUpdatedInfo) => {
+            if (tabId === tab.id && info.status === "complete") {
+              chrome.tabs.onUpdated.removeListener(listener);
+              resolve();
+            }
+          };
+          chrome.tabs.onUpdated.addListener(listener);
+          setTimeout(() => {
+            chrome.tabs.onUpdated.removeListener(listener);
+            resolve();
+          }, 30000);
+        });
+      }
+      await cdp.attach(tab.id);
+      await waitForRuntimeReady(tab.id, 10000);
+      return { tabId: tab.id };
+    }
+
+    case "AIMODE_CLOSE_TAB": {
+      const aimodeTabId = message.tabId;
+      if (aimodeTabId) {
+        try { await cdp.detach(aimodeTabId); } catch {}
+        try { await chrome.tabs.remove(aimodeTabId); } catch {}
+      }
+      return { success: true };
+    }
+
+    case "AIMODE_CDP_COMMAND": {
+      const { method, params } = message;
+      return await cdp.sendCommand(message.tabId, method, params || {});
+    }
+
+    case "AIMODE_EVALUATE": {
+      return await cdp.evaluateScript(message.tabId, message.expression);
+    }
+
     case "DOWNLOADS_SEARCH": {
       const results = await chrome.downloads.search(message.searchParams || {});
       return {
@@ -3752,87 +3822,68 @@ const COMMANDS_WITHOUT_TAB = new Set([
   "DELETE_BOOKMARK", "DIALOG_DISMISS", "DIALOG_ACCEPT", "DIALOG_INFO",
   "CHATGPT_NEW_TAB", "CHATGPT_CLOSE_TAB", "CHATGPT_EVALUATE", "CHATGPT_CDP_COMMAND",
   "GET_CHATGPT_COOKIES", "GET_GOOGLE_COOKIES", "GET_TWITTER_COOKIES",
+  "CLAUDE_NEW_TAB", "CLAUDE_CLOSE_TAB", "CLAUDE_EVALUATE", "CLAUDE_CDP_COMMAND", "GET_CLAUDE_COOKIES",
   "PERPLEXITY_NEW_TAB", "PERPLEXITY_CLOSE_TAB", "PERPLEXITY_EVALUATE", "PERPLEXITY_CDP_COMMAND",
   "GROK_NEW_TAB", "GROK_CLOSE_TAB", "GROK_EVALUATE", "GROK_CDP_COMMAND",
   "GEMINI_NEW_TAB", "GEMINI_CLOSE_TAB", "GEMINI_FETCH_URL", "AI_UPLOAD_FILE_TO_TAB", "UPLOAD_FILE_TO_TAB",
   "AISTUDIO_NEW_TAB", "AISTUDIO_CLOSE_TAB", "AISTUDIO_EVALUATE", "AISTUDIO_CDP_COMMAND",
+  "AIMODE_NEW_TAB", "AIMODE_CLOSE_TAB", "AIMODE_EVALUATE", "AIMODE_CDP_COMMAND",
   "DOWNLOADS_SEARCH",
   "WINDOW_NEW", "WINDOW_LIST", "WINDOW_FOCUS", "WINDOW_CLOSE", "WINDOW_RESIZE",
   "EMULATE_DEVICE_LIST"
 ]);
 
 initNativeMessaging(async (msg) => {
-  let tabId = msg.tabId;
-  const windowId = msg.windowId;
-  const isDialogCommand = msg.type?.startsWith("DIALOG_");
-  const needsTab = !COMMANDS_WITHOUT_TAB.has(msg.type);
-  let autoCreatedTab = false;
-  let createdSurfTab = false;
-  
-  if (tabId && !isDialogCommand) {
+  // COMMANDS_WITHOUT_TAB never need a tab — pass through to handleMessage.
+  if (COMMANDS_WITHOUT_TAB.has(msg.type)) {
+    const result = await handleMessage(msg, {} as chrome.runtime.MessageSender);
+    return { ...result, _resolvedTabId: undefined };
+  }
+
+  const explicitTabId =
+    msg.tabId !== undefined && !Number.isNaN(Number(msg.tabId))
+      ? Number(msg.tabId)
+      : undefined;
+
+  const resolved = await resolveTabForCommand(msg, explicitTabId);
+
+  let result;
+  try {
+    result = await handleMessage(
+      { ...msg, tabId: resolved.tabId },
+      {} as chrome.runtime.MessageSender,
+    );
+  } catch (err) {
+    // Keep the auto-created tab open on error so the user can inspect what
+    // happened. The hint tells them how to close it manually.
+    if (resolved.autoCreated) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      return {
+        error: errMsg,
+        _resolvedTabId: resolved.tabId,
+        _hint: `${resolved.hint ?? ""} Tab ${resolved.tabId} kept open for inspection; close with: surf tab.close ${resolved.tabId}`.trim(),
+      };
+    }
+    throw err;
+  }
+
+  // TODO(technical-debt): 250ms stabilization wait is a band-aid over
+  // non-deterministic CDP message flushing. Replace with a deterministic
+  // listener (e.g. wait for chrome.debugger.onDetach / Page.loadEventFired)
+  // when we move to event-driven cleanup. Acceptable for current scale but
+  // will aggregate into overhead for high-frequency batch processing.
+  if (resolved.closeAfter && resolved.autoCreated) {
+    await new Promise((r) => setTimeout(r, 250));
     try {
-      await chrome.tabs.get(tabId);
+      await chrome.tabs.remove(resolved.tabId);
     } catch {
-      throw new Error(`Invalid tab ID: ${tabId}. Use 'surf tab.list' to see available tabs.`);
+      // Tab may have been closed by the user or another action — ignore.
     }
-  } else if (!tabId && needsTab) {
-    let tabs: chrome.tabs.Tab[];
-    let tab: chrome.tabs.Tab | undefined;
-    
-    if (windowId) {
-      // If windowId specified, only look in that window
-      tabs = await chrome.tabs.query({ active: true, windowId });
-      tab = tabs[0];
-      
-      // Check if active tab is usable (not a restricted URL)
-      if (!tab || isRestrictedTabUrl(tab.url)) {
-        // Active tab is restricted, find any usable tab in the window
-        tabs = await chrome.tabs.query({ windowId });
-        tab = tabs.find(t => !isRestrictedTabUrl(t.url));
-      }
-      
-      if (!tab?.id) {
-        // No usable tab - auto-create one with a minimal page
-        const newTab = await createBackgroundTab({
-          windowId,
-          url: 'data:text/html,<html><head><title>Surf</title></head><body></body></html>',
-        });
-        if (!newTab.id) {
-          throw new Error(`Failed to create tab in window ${windowId}`);
-        }
-        // Wait briefly for tab to be ready
-        await new Promise(r => setTimeout(r, 100));
-        tab = newTab;
-        autoCreatedTab = true;
-      }
-    } else {
-      // HARD-CODED POLICY: surf never operates on the user's active tab.
-      // Default commands run in the session-owned background surf tab;
-      // pass --tab-id to target a specific tab.
-      const surfTab = await getOrCreateSurfTab();
-      if (!surfTab?.tab.id) {
-        throw new Error("No active tab found. Use 'surf tab.new <url>' to create one, or 'surf tab.list' to see available tabs.");
-      }
-      tab = surfTab.tab;
-      createdSurfTab = surfTab.created;
-    }
-    tabId = tab.id;
   }
-  
-  const result = await handleMessage({ ...msg, tabId }, {} as chrome.runtime.MessageSender);
-  
-  // Add helpful hints based on what happened
-  const hints: string[] = [];
-  if (autoCreatedTab) {
-    hints.push(`Auto-created tab in window ${windowId} (no usable tabs existed). Navigate to your target URL.`);
-  }
-  if (createdSurfTab) {
-    hints.push(`Dedicated background tab created (id ${tabId}). Surf runs here by default; pass --tab-id to target a specific tab.`);
-  }
-  
-  return { 
-    ...result, 
-    _resolvedTabId: tabId,
-    _hint: hints.length > 0 ? hints.join(' ') : undefined,
+
+  return {
+    ...result,
+    _resolvedTabId: resolved.tabId,
+    _hint: resolved.hint,
   };
 });
