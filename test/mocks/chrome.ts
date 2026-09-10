@@ -22,6 +22,7 @@ type ChromeMock = {
     create: ReturnType<typeof vi.fn>;
     update: ReturnType<typeof vi.fn>;
     move: ReturnType<typeof vi.fn>;
+    group: ReturnType<typeof vi.fn>;
     remove: ReturnType<typeof vi.fn>;
     sendMessage: ReturnType<typeof vi.fn>;
     onUpdated: {
@@ -78,6 +79,7 @@ type ChromeMock = {
     connectNative: ReturnType<typeof vi.fn>;
     lastError: null | { message: string };
     getURL: ReturnType<typeof vi.fn>;
+    getManifest: ReturnType<typeof vi.fn>;
     id: string;
   };
   storage: {
@@ -93,15 +95,15 @@ type ChromeMock = {
       remove: ReturnType<typeof vi.fn>;
       clear: ReturnType<typeof vi.fn>;
     };
-    onChanged: {
-      addListener: ReturnType<typeof vi.fn>;
-      removeListener: ReturnType<typeof vi.fn>;
-    };
     session: {
       get: ReturnType<typeof vi.fn>;
       set: ReturnType<typeof vi.fn>;
       remove: ReturnType<typeof vi.fn>;
       clear: ReturnType<typeof vi.fn>;
+    };
+    onChanged: {
+      addListener: ReturnType<typeof vi.fn>;
+      removeListener: ReturnType<typeof vi.fn>;
     };
   };
   windows: {
@@ -111,6 +113,15 @@ type ChromeMock = {
     get: ReturnType<typeof vi.fn>;
     getAll: ReturnType<typeof vi.fn>;
     getCurrent: ReturnType<typeof vi.fn>;
+    onRemoved: {
+      addListener: ReturnType<typeof vi.fn>;
+      removeListener: ReturnType<typeof vi.fn>;
+    };
+  };
+  tabGroups: {
+    update: ReturnType<typeof vi.fn>;
+    query: ReturnType<typeof vi.fn>;
+    TAB_GROUP_ID_NONE: number;
   };
   scripting: {
     executeScript: ReturnType<typeof vi.fn>;
@@ -132,6 +143,7 @@ export function createChromeMock(): ChromeMock {
       create: vi.fn().mockResolvedValue({ id: 1 }),
       update: vi.fn().mockResolvedValue({}),
       move: vi.fn().mockResolvedValue({}),
+      group: vi.fn().mockResolvedValue(1),
       remove: vi.fn().mockResolvedValue(undefined),
       sendMessage: vi.fn().mockResolvedValue(undefined),
       onUpdated: {
@@ -193,6 +205,7 @@ export function createChromeMock(): ChromeMock {
       }),
       lastError: null,
       getURL: vi.fn((path: string) => `chrome-extension://mock-id/${path}`),
+      getManifest: vi.fn(() => ({ version: "0.0.0-test" })),
       id: "mock-extension-id",
     },
     storage: {
@@ -208,15 +221,15 @@ export function createChromeMock(): ChromeMock {
         remove: vi.fn().mockResolvedValue(undefined),
         clear: vi.fn().mockResolvedValue(undefined),
       },
-      onChanged: {
-        addListener: vi.fn(),
-        removeListener: vi.fn(),
-      },
       session: {
         get: vi.fn().mockResolvedValue({}),
         set: vi.fn().mockResolvedValue(undefined),
         remove: vi.fn().mockResolvedValue(undefined),
         clear: vi.fn().mockResolvedValue(undefined),
+      },
+      onChanged: {
+        addListener: vi.fn(),
+        removeListener: vi.fn(),
       },
     },
     windows: {
@@ -226,6 +239,15 @@ export function createChromeMock(): ChromeMock {
       get: vi.fn().mockResolvedValue(null),
       getAll: vi.fn().mockResolvedValue([]),
       getCurrent: vi.fn().mockResolvedValue({ id: 1 }),
+      onRemoved: {
+        addListener: vi.fn(),
+        removeListener: vi.fn(),
+      },
+    },
+    tabGroups: {
+      update: vi.fn().mockResolvedValue({}),
+      query: vi.fn().mockResolvedValue([]),
+      TAB_GROUP_ID_NONE: -1,
     },
     scripting: {
       executeScript: vi.fn().mockResolvedValue([]),
@@ -282,6 +304,7 @@ export function createMockTab(overrides: Partial<chrome.tabs.Tab> = {}): chrome.
     discarded: false,
     autoDiscardable: true,
     groupId: -1,
+    lastAccessed: 0,
     ...overrides,
   };
 }

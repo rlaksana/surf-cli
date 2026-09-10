@@ -1,6 +1,18 @@
 type Debuggee = chrome.debugger.Debuggee;
 type MouseButton = "left" | "right" | "middle" | "none";
 
+class CDPControllerError extends Error {
+  code: string;
+  details?: Record<string, unknown>;
+
+  constructor(code: string, message: string, details?: Record<string, unknown>) {
+    super(message);
+    this.name = "CDPControllerError";
+    this.code = code;
+    this.details = details;
+  }
+}
+
 interface ConsoleMessage {
   type: string;
   text: string;
@@ -44,7 +56,9 @@ export interface NetworkEntry {
   mimeType?: string;
   responseHeaders?: Record<string, string>;
   responseBody?: string;         // Will be fetched via getResponseBody
+  responseBodyEncoding?: "base64";
   responseBodySize?: number;
+  bodyCapture: { mode: "none" | "text" | "all"; complete: boolean; reason?: string; capturedBytes?: number };
   
   // Metadata
   tabId: number;
@@ -75,6 +89,14 @@ type NetworkEventCallback = (event: {
   duration?: number;
   timestamp: number;
 }) => void;
+
+type ScreencastFrameCallback = (event: {
+  data: string;
+  metadata?: Record<string, unknown>;
+  sessionId: number;
+}) => void;
+
+type ScreencastErrorCallback = (error: Error) => void;
 
 const MODIFIERS = {
   alt: 1,
@@ -132,13 +154,19 @@ export class CDPController {
   private networkEntries: Map<number, Map<string, NetworkEntry>> = new Map(); // tabId -> requestId -> entry
   private consoleCallbacks: Map<number, Map<number, ConsoleEventCallback>> = new Map();
   private networkCallbacks: Map<number, Map<number, NetworkEventCallback>> = new Map();
+  private screencastCallbacks: Map<number, Map<string, { onFrame: ScreencastFrameCallback; onError: ScreencastErrorCallback }>> = new Map();
   private networkRequestStartTimes: Map<string, number> = new Map();
   private pendingDialogs: Map<number, PendingDialog> = new Map();
+  private detachReasons: Map<number, string> = new Map();
   private networkEntrySeq = 0; // Sequence counter for unique IDs
+  private networkBodyBytes: Map<number, number> = new Map();
+  private networkCapture: Map<number, { mode: "none" | "text" | "all"; perBodyBytes: number; totalBytes: number }> = new Map();
+  private networkEventQueue: Map<number, Promise<void>> = new Map();
   private static debuggerListenerRegistered = false;
 
   // Body fetch settings
-  private static readonly MAX_INLINE_BODY_SIZE = 16 * 1024; // 16KB
+  private static readonly DEFAULT_PER_BODY_BYTES = 64 * 1024;
+  private static readonly DEFAULT_TOTAL_BODY_BYTES = 2 * 1024 * 1024;
   private static readonly STATIC_ASSET_TYPES = new Set([
     'image/png', 'image/jpeg', 'image/gif', 'image/webp', 'image/svg+xml', 'image/x-icon',
     'font/woff', 'font/woff2', 'font/ttf', 'font/otf', 'application/font-woff', 'application/font-woff2',
@@ -160,16 +188,24 @@ export class CDPController {
       await chrome.debugger.attach(target, "1.3");
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      if (message.includes("Already attached")) {
-        this.targets.set(tabId, target);
-        return;
+      if (/already attached/i.test(message)) {
+        throw new CDPControllerError(
+          "debugger_busy",
+          `Another debugger already controls tab ${tabId}. Close DevTools or the competing debugger and retry.`,
+          { tabId },
+        );
       }
       if (message.includes("Cannot access") || message.includes("Cannot attach")) {
-        throw new Error(`Cannot control this page. Chrome restricts automation on chrome://, extensions, and web store pages.`);
+        throw new CDPControllerError(
+          "restricted_target",
+          "Cannot control this page. Chrome restricts automation on chrome://, extensions, and web store pages.",
+          { tabId },
+        );
       }
-      throw new Error(`Failed to attach debugger: ${message}`);
+      throw new CDPControllerError("debugger_attach_failed", `Failed to attach debugger: ${message}`, { tabId });
     }
     this.targets.set(tabId, target);
+    this.detachReasons.delete(tabId);
 
     this.setupEventListener();
     this.consoleMessages.set(tabId, []);
@@ -192,9 +228,19 @@ export class CDPController {
       this.consoleMessages.delete(tabId);
       this.networkRequests.delete(tabId);
       this.networkEntries.delete(tabId);
+      this.networkBodyBytes.delete(tabId);
+      this.networkCapture.delete(tabId);
       this.consoleCallbacks.delete(tabId);
       this.networkCallbacks.delete(tabId);
+      this.notifyScreencastError(tabId, new CDPControllerError(
+        "debugger_detached",
+        `Debugger detached from tab ${tabId}`,
+        { tabId },
+      ));
+      this.screencastCallbacks.delete(tabId);
       this.pendingDialogs.delete(tabId);
+      this.clearRequestStartTimes(tabId);
+      this.detachReasons.delete(tabId);
     }
   }
 
@@ -212,23 +258,61 @@ export class CDPController {
       const tabId = source.tabId;
       if (!tabId || !this.targets.has(tabId)) return;
 
-      this.handleCDPEvent(tabId, method, params);
+      this.enqueueCDPEvent(tabId, method, params);
     });
 
     chrome.debugger.onDetach.addListener((source, reason) => {
       const tabId = source.tabId;
       if (tabId && this.targets.has(tabId)) {
+        this.detachReasons.set(tabId, reason || "unknown");
         this.targets.delete(tabId);
         this.consoleMessages.delete(tabId);
         this.networkRequests.delete(tabId);
         this.networkEntries.delete(tabId);
+        this.networkBodyBytes.delete(tabId);
+        this.networkCapture.delete(tabId);
         this.consoleCallbacks.delete(tabId);
         this.networkCallbacks.delete(tabId);
+        this.notifyScreencastError(tabId, new CDPControllerError(
+          "debugger_detached",
+          `Debugger detached from tab ${tabId}: ${reason || "unknown reason"}`,
+          { tabId, reason: reason || "unknown" },
+        ));
+        this.screencastCallbacks.delete(tabId);
+        this.pendingDialogs.delete(tabId);
+        this.clearRequestStartTimes(tabId);
       }
     });
   }
 
-  private handleCDPEvent(tabId: number, method: string, params: any): void {
+  private requestStartKey(tabId: number, requestId: string): string {
+    return `${tabId}:${requestId}`;
+  }
+
+  private clearRequestStartTimes(tabId: number): void {
+    const prefix = `${tabId}:`;
+    for (const key of this.networkRequestStartTimes.keys()) {
+      if (key.startsWith(prefix)) this.networkRequestStartTimes.delete(key);
+    }
+  }
+
+  private enqueueCDPEvent(tabId: number, method: string, params: any): void {
+    const previous = this.networkEventQueue.get(tabId) || Promise.resolve();
+    const next = previous
+      .catch(() => undefined)
+      .then(() => this.handleCDPEvent(tabId, method, params))
+      .catch(() => undefined);
+    this.networkEventQueue.set(tabId, next);
+    next.finally(() => {
+      if (this.networkEventQueue.get(tabId) === next) this.networkEventQueue.delete(tabId);
+    });
+  }
+
+  async drainNetworkEvents(tabId: number): Promise<void> {
+    await this.networkEventQueue.get(tabId);
+  }
+
+  private async handleCDPEvent(tabId: number, method: string, params: any): Promise<void> {
     switch (method) {
       case "Runtime.consoleAPICalled":
         this.handleRuntimeConsole(tabId, params);
@@ -246,7 +330,7 @@ export class CDPController {
         this.handleNetworkFailed(tabId, params);
         break;
       case "Network.loadingFinished":
-        this.handleLoadingFinished(tabId, params);
+        await this.handleLoadingFinished(tabId, params);
         break;
       case "Page.javascriptDialogOpening":
         this.handleDialogOpening(tabId, params);
@@ -254,6 +338,43 @@ export class CDPController {
       case "Page.javascriptDialogClosed":
         this.pendingDialogs.delete(tabId);
         break;
+      case "Page.screencastFrame":
+        await this.handleScreencastFrame(tabId, params);
+        break;
+    }
+  }
+
+  private async handleScreencastFrame(tabId: number, params: any): Promise<void> {
+    const sessionId = Number(params?.sessionId);
+    if (!Number.isInteger(sessionId)) return;
+
+    // ACK before forwarding the JPEG. Chrome stops sending frames when these
+    // acknowledgements are delayed, so the frame path deliberately does not
+    // wait on native messaging or callback work.
+    try {
+      await this.send(tabId, "Page.screencastFrameAck", { sessionId });
+    } catch (error) {
+      this.notifyScreencastError(tabId, error instanceof Error ? error : new Error(String(error)));
+      return;
+    }
+
+    const callbacks = this.screencastCallbacks.get(tabId);
+    if (!callbacks) return;
+    const event = {
+      data: typeof params?.data === "string" ? params.data : "",
+      metadata: params?.metadata,
+      sessionId,
+    };
+    for (const callback of callbacks.values()) {
+      try { callback.onFrame(event); } catch {}
+    }
+  }
+
+  private notifyScreencastError(tabId: number, error: Error): void {
+    const callbacks = this.screencastCallbacks.get(tabId);
+    if (!callbacks) return;
+    for (const callback of callbacks.values()) {
+      try { callback.onError(error); } catch {}
     }
   }
 
@@ -322,7 +443,7 @@ export class CDPController {
     if (!req) return;
 
     const timestamp = params.timestamp ? params.timestamp * 1000 : Date.now();
-    this.networkRequestStartTimes.set(params.requestId, timestamp);
+    this.networkRequestStartTimes.set(this.requestStartKey(tabId, params.requestId), timestamp);
 
     // Legacy format for backward compatibility
     const reqHeaders: Record<string, string> = {};
@@ -380,6 +501,7 @@ export class CDPController {
       tabUrl: params.documentURL,
       type: params.type,
       flags: [],
+      bodyCapture: { mode: this.networkCapture.get(tabId)?.mode || "none", complete: false, reason: "pending" },
       _requestId: params.requestId,
       _responseReceived: false,
       _loadingFinished: false,
@@ -412,11 +534,11 @@ export class CDPController {
 
       const callbacks = this.networkCallbacks.get(tabId);
       if (callbacks) {
-        const startTime = this.networkRequestStartTimes.get(params.requestId);
+        const startTime = this.networkRequestStartTimes.get(this.requestStartKey(tabId, params.requestId));
         const now = Date.now();
         const duration = startTime ? Math.round(now - startTime) : undefined;
         // Don't delete start time yet - we need it for loadingFinished
-        // this.networkRequestStartTimes.delete(params.requestId);
+        // this.networkRequestStartTimes.delete(this.requestStartKey(tabId, params.requestId));
 
         for (const cb of callbacks.values()) {
           cb({
@@ -437,7 +559,7 @@ export class CDPController {
       const response = params.response;
       
       // Calculate TTFB (time to first byte)
-      const startTime = this.networkRequestStartTimes.get(params.requestId);
+      const startTime = this.networkRequestStartTimes.get(this.requestStartKey(tabId, params.requestId));
       const now = params.timestamp ? params.timestamp * 1000 : Date.now();
       if (startTime) {
         entry.ttfb = Math.round(now - startTime);
@@ -480,10 +602,10 @@ export class CDPController {
 
       const callbacks = this.networkCallbacks.get(tabId);
       if (callbacks) {
-        const startTime = this.networkRequestStartTimes.get(params.requestId);
+        const startTime = this.networkRequestStartTimes.get(this.requestStartKey(tabId, params.requestId));
         const now = Date.now();
         const duration = startTime ? Math.round(now - startTime) : undefined;
-        this.networkRequestStartTimes.delete(params.requestId);
+        this.networkRequestStartTimes.delete(this.requestStartKey(tabId, params.requestId));
 
         for (const cb of callbacks.values()) {
           cb({
@@ -501,12 +623,12 @@ export class CDPController {
     const entriesMap = this.networkEntries.get(tabId);
     const entry = entriesMap?.get(params.requestId);
     if (entry) {
-      const startTime = this.networkRequestStartTimes.get(params.requestId);
+      const startTime = this.networkRequestStartTimes.get(this.requestStartKey(tabId, params.requestId));
       const now = params.timestamp ? params.timestamp * 1000 : Date.now();
       if (startTime) {
         entry.duration = Math.round(now - startTime);
       }
-      this.networkRequestStartTimes.delete(params.requestId);
+      this.networkRequestStartTimes.delete(this.requestStartKey(tabId, params.requestId));
       
       entry.status = 0;
       entry.flags.push('failed');
@@ -529,42 +651,12 @@ export class CDPController {
     const existing = requests.find((r) => r.requestId === params.requestId);
     if (existing) {
       // Calculate duration
-      const startTime = this.networkRequestStartTimes.get(params.requestId);
+      const startTime = this.networkRequestStartTimes.get(this.requestStartKey(tabId, params.requestId));
       const now = params.timestamp ? params.timestamp * 1000 : Date.now();
       if (startTime) {
         existing.duration = Math.round(now - startTime);
       }
 
-      // Fetch response body for small non-static responses (< 16KB)
-      const shouldFetchBody = 
-        !this.isStaticAsset(existing.mimeType) &&
-        !this.isBinaryType(existing.mimeType) &&
-        (params.encodedDataLength || 0) <= CDPController.MAX_INLINE_BODY_SIZE;
-
-      if (shouldFetchBody) {
-        try {
-          const result = await this.send(tabId, "Network.getResponseBody", {
-            requestId: params.requestId,
-          });
-          
-          if (result.base64Encoded) {
-            try {
-              existing.responseBody = atob(result.body);
-            } catch {
-              existing.responseBody = result.body;
-            }
-          } else {
-            existing.responseBody = result.body;
-          }
-          
-          // Truncate if too large
-          if (existing.responseBody && existing.responseBody.length > CDPController.MAX_INLINE_BODY_SIZE) {
-            existing.responseBody = existing.responseBody.slice(0, CDPController.MAX_INLINE_BODY_SIZE);
-          }
-        } catch (e) {
-          // Body may not be available (e.g., cached, redirected)
-        }
-      }
     }
 
     // Update full NetworkEntry format
@@ -573,50 +665,48 @@ export class CDPController {
     if (!entry) return;
 
     // Calculate total duration
-    const startTime = this.networkRequestStartTimes.get(params.requestId);
+    const startTime = this.networkRequestStartTimes.get(this.requestStartKey(tabId, params.requestId));
     const now = params.timestamp ? params.timestamp * 1000 : Date.now();
     if (startTime) {
       entry.duration = Math.round(now - startTime);
     }
-    this.networkRequestStartTimes.delete(params.requestId);
+    this.networkRequestStartTimes.delete(this.requestStartKey(tabId, params.requestId));
 
     // Set response body size from encoded data length
     entry.responseBodySize = params.encodedDataLength;
     entry._loadingFinished = true;
-
-    // Decide whether to fetch body inline
-    const shouldFetchBody = 
-      !this.isStaticAsset(entry.mimeType) &&
-      !this.isBinaryType(entry.mimeType) &&
-      (params.encodedDataLength || 0) <= CDPController.MAX_INLINE_BODY_SIZE;
-
-    if (shouldFetchBody) {
-      try {
-        const result = await this.send(tabId, "Network.getResponseBody", {
-          requestId: params.requestId,
-        });
-        
-        if (result.base64Encoded) {
-          // Decode base64 for text content
-          try {
-            entry.responseBody = atob(result.body);
-          } catch {
-            entry.responseBody = result.body;
-            entry.flags.push('binary');
-          }
-        } else {
-          entry.responseBody = result.body;
-        }
-        
-        // Check if truncated
-        if (entry.responseBody && entry.responseBody.length > CDPController.MAX_INLINE_BODY_SIZE) {
-          entry.responseBody = entry.responseBody.slice(0, CDPController.MAX_INLINE_BODY_SIZE);
-          entry.flags.push('truncated');
-        }
-      } catch (e) {
-        // Body may not be available (e.g., cached, redirected)
-        // This is not an error - just means no body to capture
+    const capture = this.networkCapture.get(tabId) || { mode: "none" as const, perBodyBytes: 0, totalBytes: 0 };
+    const encodedBytes = Math.max(0, Number(params.encodedDataLength) || 0);
+    let reason: string | null = null;
+    if (capture.mode === "none") reason = "disabled";
+    else if (capture.mode === "text" && (this.isStaticAsset(entry.mimeType) || this.isBinaryType(entry.mimeType))) reason = "content-mode";
+    else if (encodedBytes > capture.perBodyBytes) reason = "per-body-cap";
+    else if ((this.networkBodyBytes.get(tabId) || 0) + encodedBytes > capture.totalBytes) reason = "session-cap";
+    if (reason) {
+      entry.bodyCapture = { mode: capture.mode, complete: false, reason };
+      if (reason.endsWith("cap")) entry.flags.push("truncated");
+      return;
+    }
+    try {
+      const result = await this.send(tabId, "Network.getResponseBody", { requestId: params.requestId });
+      const body = typeof result.body === "string" ? result.body : "";
+      const capturedBytes = result.base64Encoded ? Math.ceil(body.length * 0.75) : new TextEncoder().encode(body).byteLength;
+      if (capturedBytes > capture.perBodyBytes || (this.networkBodyBytes.get(tabId) || 0) + capturedBytes > capture.totalBytes) {
+        entry.flags.push("truncated");
+        entry.bodyCapture = { mode: capture.mode, complete: false, reason: capturedBytes > capture.perBodyBytes ? "per-body-cap" : "session-cap" };
+        return;
       }
+      if (result.base64Encoded && capture.mode === "all") {
+        entry.responseBody = body;
+        entry.responseBodyEncoding = "base64";
+      } else if (result.base64Encoded) {
+        try { entry.responseBody = atob(body); } catch { entry.bodyCapture = { mode: capture.mode, complete: false, reason: "decode-failed" }; return; }
+      } else entry.responseBody = body;
+      this.networkBodyBytes.set(tabId, (this.networkBodyBytes.get(tabId) || 0) + capturedBytes);
+      entry.bodyCapture = { mode: capture.mode, complete: true, capturedBytes };
+      if (existing) existing.responseBody = entry.responseBody;
+    } catch {
+      entry.bodyCapture = { mode: capture.mode, complete: false, reason: "unavailable" };
     }
   }
 
@@ -649,10 +739,31 @@ export class CDPController {
     } catch (e) {}
   }
 
-  async enableNetworkTracking(tabId: number): Promise<void> {
+  async enableNetworkTracking(
+    tabId: number,
+    options: { bodyMode?: "none" | "text" | "all"; perBodyBytes?: number; totalBytes?: number } = {},
+  ): Promise<void> {
     await this.ensureAttached(tabId);
+    const mode = options.bodyMode || "text";
+    const perBodyBytes = options.perBodyBytes ?? CDPController.DEFAULT_PER_BODY_BYTES;
+    const totalBytes = options.totalBytes ?? CDPController.DEFAULT_TOTAL_BODY_BYTES;
+    if (!Number.isInteger(perBodyBytes) || perBodyBytes < 0 || !Number.isInteger(totalBytes) || totalBytes < 0) {
+      throw new Error("network body caps must be non-negative integers");
+    }
+    this.networkCapture.set(tabId, { mode, perBodyBytes, totalBytes });
+    if (!this.networkBodyBytes.has(tabId)) this.networkBodyBytes.set(tabId, 0);
     try {
       await this.send(tabId, "Network.enable", { maxPostDataSize: 65536 });
+    } catch (e) {}
+  }
+
+  async disableNetworkTracking(tabId: number): Promise<void> {
+    await this.drainNetworkEvents(tabId);
+    this.networkCapture.delete(tabId);
+    this.networkBodyBytes.delete(tabId);
+    if (this.networkCallbacks.get(tabId)?.size) return;
+    try {
+      await this.send(tabId, "Network.disable");
     } catch (e) {}
   }
 
@@ -1011,6 +1122,7 @@ export class CDPController {
   clearNetworkRequests(tabId: number): void {
     this.networkRequests.set(tabId, []);
     this.networkEntries.set(tabId, new Map());
+    this.networkBodyBytes.set(tabId, 0);
   }
 
   /**
@@ -1044,6 +1156,7 @@ export class CDPController {
         type: req.type,
         status: req.status,
         flags: [],
+        bodyCapture: { mode: "none", complete: false, reason: "legacy" },
         _requestId: req.requestId,
         _responseReceived: true,
         _loadingFinished: true,
@@ -1138,6 +1251,38 @@ export class CDPController {
     }
   }
 
+  subscribeToScreencast(
+    tabId: number,
+    recorderId: string,
+    onFrame: ScreencastFrameCallback,
+    onError: ScreencastErrorCallback = () => {},
+  ): void {
+    if (!this.screencastCallbacks.has(tabId)) this.screencastCallbacks.set(tabId, new Map());
+    this.screencastCallbacks.get(tabId)!.set(recorderId, { onFrame, onError });
+  }
+
+  unsubscribeFromScreencast(tabId: number, recorderId: string): void {
+    const callbacks = this.screencastCallbacks.get(tabId);
+    if (!callbacks) return;
+    callbacks.delete(recorderId);
+    if (callbacks.size === 0) this.screencastCallbacks.delete(tabId);
+  }
+
+  async startScreencast(
+    tabId: number,
+    options: { format?: "jpeg" | "png"; quality?: number; everyNthFrame?: number } = {},
+  ): Promise<any> {
+    return this.send(tabId, "Page.startScreencast", {
+      format: options.format || "jpeg",
+      quality: options.quality ?? 80,
+      everyNthFrame: options.everyNthFrame ?? 1,
+    });
+  }
+
+  async stopScreencast(tabId: number): Promise<any> {
+    return this.send(tabId, "Page.stopScreencast");
+  }
+
   async evaluateScript(tabId: number, expression: string): Promise<{
     result?: { value?: any; type?: string; description?: string };
     exceptionDetails?: { text?: string; exception?: { description?: string } };
@@ -1174,9 +1319,16 @@ export class CDPController {
   }
 
   private async ensureAttached(tabId: number): Promise<void> {
-    if (!this.targets.has(tabId)) {
-      await this.attach(tabId);
+    const detachReason = this.detachReasons.get(tabId);
+    if (detachReason) {
+      this.detachReasons.delete(tabId);
+      throw new CDPControllerError(
+        "debugger_detached",
+        `Debugger detached from tab ${tabId}: ${detachReason}. Retry after closing any competing debugger.`,
+        { tabId, reason: detachReason },
+      );
     }
+    if (!this.targets.has(tabId)) await this.attach(tabId);
   }
 
   async getViewportSize(tabId: number): Promise<{ width: number; height: number }> {

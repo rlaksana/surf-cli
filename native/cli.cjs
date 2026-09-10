@@ -1,15 +1,30 @@
 #!/usr/bin/env node
 const fs = require("fs");
 const path = require("path");
-const os = require("os");
 const { execFileSync, execSync } = require("child_process");
 const { loadConfig, getConfigPath, createStarterConfig } = require("./config.cjs");
 const networkFormatters = require("./formatters/network.cjs");
-const networkStore = require("./network-store.cjs");
-const { parseDoCommands } = require("./do-parser.cjs");
+const {
+  applyArgDefaults,
+  formatStep,
+  getWorkflowDirs,
+  getWorkflowInfo,
+  listWorkflows,
+  normalizeWorkflow,
+  parseDoCommands,
+  resolveWorkflow,
+  validateWorkflowArgs,
+  validateWorkflowFile,
+} = require("./workflow-definition.cjs");
 const { executeDoSteps } = require("./do-executor.cjs");
 const { openClientTransport } = require("./client-transport.cjs");
 const { version: VERSION } = require("../package.json");
+const {
+  formatOracleError,
+  formatOracleOutput,
+  handleOracleCli,
+} = require("./oracle-cli.cjs");
+const { formatPlaybookOutput, handlePlaybookCli } = require("./playbook-cli.cjs");
 
 const IS_WIN = process.platform === "win32";
 const { SURF_TMP, formatSocketError } = require("./socket-path.cjs");
@@ -17,6 +32,8 @@ const { acquireBrowserLock } = require("./browser-lock.cjs");
 const { selectEndpoint, connectEndpoint, formatEndpointError } = require("./endpoint.cjs");
 const { createFrameParser, createSocketWriter, writeFrame } = require("./remote-transport.cjs");
 const { resolveRequestDeadlineMs } = require("./host-sessions.cjs");
+const { classifyTool } = require("./tool-scope.cjs");
+const { parseVideoFps, validateVideoOutputPath } = require("./video-recorder.cjs");
 const { AUTO_SCREENSHOT_TOOLS, prepareRemoteTool, validateLocalToolPaths } = require("./file-transfer.cjs");
 const { authorizeClient, listClients, revokeClient, getStateDir } = require("./remote-auth.cjs");
 if (IS_WIN) { try { fs.mkdirSync(SURF_TMP, { recursive: true }); } catch {} }
@@ -32,6 +49,46 @@ function parseBrowserLockOptions(noLockFlag) {
     }
   }
   return { noLock, timeoutMs };
+}
+
+function flagValue(argv, flag) {
+  const index = argv.indexOf(flag);
+  if (index === -1) return undefined;
+  const value = argv[index + 1];
+  if (!value || value.startsWith("--")) {
+    console.error(`Error: ${flag} requires a value`);
+    process.exit(1);
+  }
+  return value;
+}
+
+function positiveIdFlag(argv, flag) {
+  const value = flagValue(argv, flag);
+  if (value === undefined) return undefined;
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    console.error(`Error: ${flag} must be a positive number`);
+    process.exit(1);
+  }
+  return parsed;
+}
+
+function resolveEarlyTargetOptions(argv, { allowWindow = true } = {}) {
+  const explicitSession = flagValue(argv, "--session");
+  const tabId = positiveIdFlag(argv, "--tab-id");
+  const windowId = allowWindow ? positiveIdFlag(argv, "--window-id") : undefined;
+  if (explicitSession && (tabId || windowId)) {
+    console.error("Error: use either --session or --tab-id/--window-id, not both");
+    process.exit(1);
+  }
+  const environmentSession = process.env.SURF_SESSION;
+  const session = explicitSession || (!tabId && !windowId ? environmentSession : undefined);
+  return {
+    ...(session ? { session, sessionSource: explicitSession ? "explicit" : "environment" } : {}),
+    ...(tabId ? { tabId } : {}),
+    ...(windowId ? { windowId } : {}),
+    ...(argv.includes("--no-wait") ? { admission: { wait: false } } : {}),
+  };
 }
 
 function installBrowserLock({ noLock, timeoutMs }, endpoint) {
@@ -61,249 +118,6 @@ function installBrowserLock({ noLock, timeoutMs }, endpoint) {
     release();
     process.exit(143);
   });
-}
-
-// ============================================================================
-// Workflow Resolution and Management
-// ============================================================================
-
-/**
- * Get workflow search directories
- * @returns {Array<{path: string, scope: string}>}
- */
-function getWorkflowDirs() {
-  return [
-    { path: path.join(process.cwd(), '.surf', 'workflows'), scope: 'project' },
-    { path: path.join(os.homedir(), '.surf', 'workflows'), scope: 'user' },
-  ];
-}
-
-/**
- * Resolve a workflow by name or path
- * @param {string} nameOrPath - Workflow name or file path
- * @returns {{ type: 'inline'|'file'|'not_found', content?: string, path?: string, name?: string }}
- */
-function resolveWorkflow(nameOrPath) {
-  // Check if it's an inline workflow (contains pipe)
-  if (nameOrPath.includes('|')) {
-    return { type: 'inline', content: nameOrPath };
-  }
-
-  // Check if it's a direct file path (with extension or path separator)
-  if (nameOrPath.includes('/') || nameOrPath.includes('\\') || nameOrPath.endsWith('.json')) {
-    if (fs.existsSync(nameOrPath)) {
-      return { type: 'file', path: nameOrPath };
-    }
-    return { type: 'not_found', name: nameOrPath };
-  }
-
-  // Look up by name in workflow directories
-  const searchDirs = getWorkflowDirs();
-
-  for (const { path: dir } of searchDirs) {
-    const filePath = path.join(dir, `${nameOrPath}.json`);
-    if (fs.existsSync(filePath)) {
-      return { type: 'file', path: filePath };
-    }
-  }
-
-  return { type: 'not_found', name: nameOrPath };
-}
-
-/**
- * List all available workflows
- * @returns {Array<{name: string, description: string, scope: string, path: string, args?: object}>}
- */
-function listWorkflows() {
-  const workflows = [];
-  const searchDirs = getWorkflowDirs();
-
-  for (const { path: dir, scope } of searchDirs) {
-    if (fs.existsSync(dir)) {
-      try {
-        const files = fs.readdirSync(dir).filter(f => f.endsWith('.json'));
-        for (const file of files) {
-          const filePath = path.join(dir, file);
-          try {
-            const content = JSON.parse(fs.readFileSync(filePath, 'utf8'));
-            workflows.push({
-              name: content.name || file.replace('.json', ''),
-              description: content.description || '',
-              scope,
-              path: filePath,
-              args: content.args,
-              stepCount: content.steps?.length || 0,
-            });
-          } catch {
-            // Skip invalid JSON files
-          }
-        }
-      } catch {
-        // Skip inaccessible directories
-      }
-    }
-  }
-
-  return workflows;
-}
-
-/**
- * Get detailed info about a workflow
- * @param {string} name - Workflow name
- * @returns {{ error?: string, name?: string, description?: string, args?: object, steps?: Array, path?: string }}
- */
-function getWorkflowInfo(name) {
-  const resolved = resolveWorkflow(name);
-
-  if (resolved.type === 'not_found') {
-    return { error: `Workflow not found: ${name}` };
-  }
-
-  if (resolved.type === 'inline') {
-    return { error: 'Cannot get info for inline workflows' };
-  }
-
-  try {
-    const content = JSON.parse(fs.readFileSync(resolved.path, 'utf8'));
-    return {
-      name: content.name || name,
-      description: content.description || '',
-      args: content.args || {},
-      steps: content.steps || [],
-      path: resolved.path,
-    };
-  } catch (e) {
-    return { error: `Failed to parse workflow: ${e.message}` };
-  }
-}
-
-/**
- * Validate workflow args against schema
- * @param {object} workflow - Workflow with args schema
- * @param {object} providedArgs - User-provided args
- * @returns {string[]} - Array of error messages
- */
-function validateWorkflowArgs(workflow, providedArgs) {
-  const errors = [];
-  if (workflow.args) {
-    for (const [name, spec] of Object.entries(workflow.args)) {
-      if (spec.required && providedArgs[name] === undefined) {
-        errors.push(`Missing required argument: --${name}`);
-      }
-    }
-  }
-  return errors;
-}
-
-/**
- * Apply default values to workflow args
- * @param {object} workflow - Workflow with args schema
- * @param {object} providedArgs - User-provided args
- * @returns {object} - Args with defaults applied
- */
-function applyArgDefaults(workflow, providedArgs) {
-  const vars = { ...providedArgs };
-  if (workflow.args) {
-    for (const [name, spec] of Object.entries(workflow.args)) {
-      if (vars[name] === undefined && spec.default !== undefined) {
-        vars[name] = spec.default;
-      }
-    }
-  }
-  return vars;
-}
-
-/**
- * Validate a workflow JSON file
- * @param {string} filePath - Path to workflow file
- * @returns {{ valid: boolean, error?: string, workflow?: object }}
- */
-function validateWorkflowFile(filePath) {
-  if (!fs.existsSync(filePath)) {
-    return { valid: false, error: `File not found: ${filePath}` };
-  }
-
-  try {
-    const content = fs.readFileSync(filePath, 'utf8');
-    const workflow = JSON.parse(content);
-
-    // Basic structure validation
-    if (!workflow.steps || !Array.isArray(workflow.steps)) {
-      return { valid: false, error: "Workflow must have a 'steps' array" };
-    }
-
-    if (workflow.steps.length === 0) {
-      return { valid: false, error: "Workflow has no steps" };
-    }
-
-    // Validate each step
-    for (let i = 0; i < workflow.steps.length; i++) {
-      const step = workflow.steps[i];
-
-      // Check for loops
-      if (step.repeat !== undefined || step.each !== undefined) {
-        if (!step.steps || !Array.isArray(step.steps)) {
-          return { valid: false, error: `Step ${i + 1}: loop must have a 'steps' array` };
-        }
-        continue;
-      }
-
-      // Regular step must have tool/cmd
-      if (!step.tool && !step.cmd) {
-        return { valid: false, error: `Step ${i + 1}: must have 'tool' field` };
-      }
-    }
-
-    // Validate args schema if present
-    if (workflow.args && typeof workflow.args !== 'object') {
-      return { valid: false, error: "'args' must be an object" };
-    }
-
-    return { valid: true, workflow };
-  } catch (e) {
-    return { valid: false, error: `Invalid JSON: ${e.message}` };
-  }
-}
-
-/**
- * Format a step for display
- * @param {object} step - Workflow step
- * @param {number} indent - Indentation level
- * @returns {string}
- */
-function formatStep(step, indent = 0) {
-  const pad = '  '.repeat(indent);
-
-  if (step.repeat !== undefined) {
-    const lines = [`${pad}repeat ${step.repeat} times:`];
-    for (const s of step.steps || []) {
-      lines.push(formatStep(s, indent + 1));
-    }
-    if (step.until) {
-      lines.push(`${pad}  until: ${step.until.tool || step.until.cmd}`);
-    }
-    return lines.join('\n');
-  }
-
-  if (step.each !== undefined) {
-    const lines = [`${pad}each ${step.each} as ${step.as || 'item'}:`];
-    for (const s of step.steps || []) {
-      lines.push(formatStep(s, indent + 1));
-    }
-    return lines.join('\n');
-  }
-
-  const tool = step.tool || step.cmd;
-  const args = step.args || {};
-  const argStr = Object.entries(args)
-    .map(([k, v]) => `${k}=${JSON.stringify(v)}`)
-    .join(' ');
-
-  let line = `${pad}${tool}`;
-  if (argStr) line += ` ${argStr}`;
-  if (step.as) line += ` → ${step.as}`;
-
-  return line;
 }
 
 // Cross-platform image resize (macOS: sips, Linux: ImageMagick)
@@ -386,6 +200,42 @@ try {
   process.exit(1);
 }
 
+if (args[0] === "oracle") {
+  if (args[1] === "ask" || args[1] === "follow") {
+    console.error("[surf] Oracle requires exclusive browser access while dispatching; other sessions will queue.");
+  }
+  handleOracleCli(args, {
+    endpoint,
+    cwd: process.cwd(),
+    withBrowserLock: (operation) => operation(),
+  })
+    .then((result) => {
+      if (!result.handled) throw new Error("Oracle command was not handled");
+      if (result.value !== undefined) console.log(formatOracleOutput(result.value, result.json));
+      process.exit(0);
+    })
+    .catch((error) => {
+      console.error(formatOracleError(error, args.includes("--json")));
+      process.exit(1);
+    });
+  return;
+}
+
+if (["playbook", "pb", "use"].includes(args[0])) {
+  const targetOptions = resolveEarlyTargetOptions(args, { allowWindow: false });
+  handlePlaybookCli(args, { endpoint, cwd: process.cwd(), ...targetOptions })
+    .then((result) => {
+      if (!result.handled) throw new Error("Playbook command was not handled");
+      if (result.value !== undefined) console.log(formatPlaybookOutput(result.value, result.json));
+      process.exit(0);
+    })
+    .catch((error) => {
+      console.error(`Error: ${error.message}`);
+      process.exit(1);
+    });
+  return;
+}
+
 const ALIASES = {
   snap: "screenshot",
   read: "page.read",
@@ -429,6 +279,74 @@ const REMOVED_COMMANDS = {
 };
 
 const TOOLS = {
+  session: {
+    desc: "Durable tab-bound browser sessions",
+    commands: {
+      "session.new": {
+        desc: "Create a named session in a separate unfocused window by default",
+        args: ["name", "url"],
+        opts: {
+          window: "Create a separate window (default)",
+          tab: "Create an inactive tab instead of a window",
+          focused: "Focus the new target",
+          "window-id": "Window for --tab mode",
+        },
+        examples: [
+          { cmd: 'session.new research "https://example.com"', desc: "Create a window session" },
+          { cmd: 'session.new research about:blank --tab', desc: "Create an inactive tab session" },
+        ],
+      },
+      "session.ensure": {
+        desc: "Idempotently create, reuse, or reopen a named session",
+        args: ["name", "url"],
+        opts: {
+          window: "Use a separate window (default)",
+          tab: "Use an inactive tab",
+          focused: "Focus a newly created target",
+          "window-id": "Window for --tab mode",
+        },
+        examples: [
+          { cmd: 'session.ensure research about:blank', desc: "Safe first command for an agent" },
+        ],
+      },
+      "session.list": {
+        desc: "List sessions, status, and queue state",
+        args: [],
+        opts: { refresh: "Validate every binding against Chrome" },
+      },
+      "session.cleanup": {
+        desc: "Remove idle session bindings and close only Surf-created targets",
+        args: [],
+        opts: {
+          "idle-after": "Required threshold such as 30s, 5m, 1h, or 1d",
+          "dry-run": "Report matches without removing bindings or closing targets",
+        },
+      },
+      "session.info": {
+        desc: "Show one session, target, and scheduler queue state",
+        args: ["name"],
+        opts: { refresh: "Validate the binding against Chrome" },
+      },
+      "session.close": {
+        desc: "Remove a session and close Surf-created targets by default",
+        args: ["name"],
+        opts: {
+          "keep-target": "Unbind without closing the target",
+          "close-target": "Close an adopted target too",
+        },
+      },
+      "session.rebind": {
+        desc: "Bind a stale or gone session to an explicit existing tab",
+        args: ["name"],
+        opts: { "tab-id": "Existing tab ID", replace: "Replace a live binding" },
+      },
+      "session.reopen": {
+        desc: "Create a replacement target using the stored or supplied URL",
+        args: ["name", "url"],
+        opts: { replace: "Replace a live target", tab: "Reopen as an inactive tab", window: "Reopen as a window" },
+      },
+    },
+  },
   ai: {
     desc: "AI assistants (ChatGPT, Claude, Gemini)",
     commands: {
@@ -437,7 +355,7 @@ const TOOLS = {
         args: ["query"],
         opts: {
           "with-page": "Include current page context",
-          model: "Model: gpt-4o, o1, etc.",
+          model: "Model: gpt-6-astra, latest, gpt-5.6-sol, gpt-5.5",
           file: "Attach file",
           timeout: "Timeout in seconds (default: 2700 = 45min)"
         },
@@ -445,7 +363,7 @@ const TOOLS = {
           { cmd: 'chatgpt "explain this code"', desc: "Basic query" },
           { cmd: 'chatgpt "summarize" --with-page', desc: "With page context" },
           { cmd: 'chatgpt "review" --file code.ts', desc: "With file" },
-          { cmd: 'chatgpt "analyze" --model gpt-4o', desc: "Specify model" },
+          { cmd: 'chatgpt "analyze" --model gpt-5.5', desc: "Specify model" },
         ]
       },
       "claude": {
@@ -534,6 +452,22 @@ const TOOLS = {
           { cmd: 'aistudio "explain quantum computing"', desc: "Basic query" },
           { cmd: 'aistudio "redteam this" --with-page', desc: "With page context" },
           { cmd: 'aistudio "quick answer" --model gemini-3-flash-preview', desc: "Model selection" },
+        ]
+      },
+      "kimi": {
+        desc: "Query Kimi AI (kimi.com, Moonshot K-series) using your browser session",
+        args: ["query"],
+        opts: {
+          "with-page": "Include current page context",
+          model: "Model: instant (default), thinking, high - or any model label shown in kimi.com's model picker",
+          timeout: "Timeout in seconds (default: 300)",
+          validate: "Check kimi.com UI and available models (no query sent)"
+        },
+        examples: [
+          { cmd: 'kimi "explain quantum computing"', desc: "Basic query" },
+          { cmd: 'kimi "summarize" --with-page', desc: "With page context" },
+          { cmd: 'kimi "deep dive" --model thinking', desc: "Try the Thinking model" },
+          { cmd: 'kimi --validate', desc: "Check UI and list available models" },
         ]
       },
       "aistudio.build": {
@@ -721,13 +655,44 @@ const TOOLS = {
       "snap": { desc: "Alias for screenshot (auto-saves to /tmp)", args: [], alias: "screenshot" },
     }
   },
+  video: {
+    desc: "Local WebM recording",
+    commands: {
+      "video.start": {
+        desc: "Start local WebM recording",
+        args: ["output"],
+        opts: {
+          fps: "Frames per second (default: 30, max: 60)",
+        },
+        examples: [{ cmd: "video start ./demo.webm --fps 30", desc: "Start recording" }],
+      },
+      "video.stop": {
+        desc: "Stop local WebM recording",
+        args: [],
+        examples: [{ cmd: "video stop", desc: "Stop recording" }],
+      },
+      "video.status": {
+        desc: "Show local WebM recording status",
+        args: [],
+        examples: [{ cmd: "video status", desc: "Show status" }],
+      },
+      "video.restart": {
+        desc: "Restart local WebM recording",
+        args: ["output"],
+        opts: {
+          fps: "Frames per second (default: 30, max: 60)",
+        },
+        examples: [{ cmd: "video restart ./take2.webm --fps 60", desc: "Restart recording" }],
+      },
+    },
+  },
   scroll: {
     desc: "Scrolling",
     commands: {
       "scroll": {
         desc: "Scroll in direction",
         args: ["direction", "pixels"],
-        opts: { direction: "up|down|left|right", amount: "Scroll amount (1-10)" },
+        opts: { direction: "up|down|left|right", amount: "Scroll amount in 100 px steps (1-10)" },
         examples: [
           { cmd: "scroll down 800", desc: "Scroll down 800px" },
           { cmd: "scroll --direction down --amount 3", desc: "Scroll down" },
@@ -770,6 +735,18 @@ const TOOLS = {
       },
       "read": { desc: "Alias for page.read", args: [], alias: "page.read" },
       "page.text": { desc: "Extract all text from page", args: [] },
+      "page.html": {
+        desc: "Print rendered document HTML",
+        args: [],
+        opts: { selector: "Export matching CSS selector", "strip-scripts": "Remove script elements" },
+        examples: [{ cmd: "page.html", desc: "Print current document HTML" }],
+      },
+      "page.save": {
+        desc: "Save rendered document HTML",
+        args: [],
+        opts: { output: "File path", selector: "Export matching CSS selector", "strip-scripts": "Remove script elements" },
+        examples: [{ cmd: "page.save --output page.html", desc: "Save current document HTML" }],
+      },
       "page.state": { desc: "Get page state (modals, loading, etc.)", args: [] },
     }
   },
@@ -978,6 +955,9 @@ const TOOLS = {
           all: "Show all (no limit)",
           v: "Verbose output",
           vv: "Very verbose output",
+          "body-mode": "Response bodies: none, text, or all (default: text)",
+          "per-body-bytes": "Maximum captured bytes per response body",
+          "total-body-bytes": "Maximum captured response-body bytes per tab session",
           clear: "Clear after reading",
           stream: "Continuous output"
         },
@@ -1042,9 +1022,17 @@ const TOOLS = {
       "network.export": {
         desc: "Export captured requests",
         args: [],
-        opts: { jsonl: "Export as JSONL", output: "Output file path" },
+        opts: {
+          har: "Export as HAR 1.2",
+          jsonl: "Export as JSONL",
+          output: "Output file path",
+          "body-mode": "Response bodies: none, text, or all (default: text)",
+          "per-body-bytes": "Maximum captured bytes per response body",
+          "total-body-bytes": "Maximum captured response-body bytes per tab session",
+        },
         examples: [
-          { cmd: "network.export --jsonl --output /tmp/requests.jsonl", desc: "Export as JSONL" }
+          { cmd: "network.export --jsonl --output /tmp/requests.jsonl", desc: "Export as JSONL" },
+          { cmd: "network.export --har --output /tmp/requests.har", desc: "Export as HAR" },
         ]
       },
       "network.path": {
@@ -1640,14 +1628,15 @@ Exclude text content:
 };
 
 const ALL_SOCKET_TOOLS = [
-  "ai", "screenshot", "record", "animate-audit", "perf-audit", "navigate",
+  "session.new", "session.ensure", "session.list", "session.cleanup", "session.info", "session.close", "session.rebind", "session.reopen",
+  "ai", "screenshot", "record", "video.start", "video.stop", "video.status", "video.restart", "animate-audit", "perf-audit", "navigate",
   "form_input", "find_and_type", "autocomplete", "set_value", "smart_type",
   "scroll_to_position", "get_scroll_info", "close_dialogs", "page_state",
   "javascript_tool", "health", "smoke",
   "click_type", "click_type_submit", "type", "key", "type_submit",
   "scroll", "scroll_to", "hover", "left_click_drag", "drag", "wait",
   "computer",
-  "page.read", "page.text", "page.state",
+  "page.read", "page.text", "page.html", "page.save", "page.state",
   "locate.role", "locate.text", "locate.label",
   "tab.list", "tab.new", "tab.switch", "tab.close", "tab.move", "tab.name", "tab.unname", "tab.named",
   "tab.group", "tab.ungroup", "tab.groups", "tab.reload",
@@ -1699,6 +1688,10 @@ const SEE_ALSO = {
   "navigate": ["wait.load", "page.read"],
   "screenshot": ["page.read", "scroll.bottom for fullpage"],
   "record": ["screenshot", "animate-audit", "perf-audit"],
+  "video.start": ["video.stop", "video.status"],
+  "video.stop": ["video.status", "video.restart"],
+  "video.status": ["video.start", "video.stop"],
+  "video.restart": ["video.stop", "video.status"],
   "animate-audit": ["screenshot", "record", "perf-audit", "js"],
   "perf-audit": ["record", "animate-audit", "perf.metrics", "console"],
   "search": ["locate.text", "page.read"],
@@ -1708,6 +1701,8 @@ const SEE_ALSO = {
   "scroll.to": ["click", "page.read"],
   "console": ["network", "perf.metrics"],
   "network": ["console", "network.get"],
+  "session.ensure": ["session.info", "session.list"],
+  "session.info": ["session.reopen", "session.rebind", "session.list"],
 };
 
 const showBasicHelp = () => {
@@ -1716,11 +1711,17 @@ const showBasicHelp = () => {
 Usage: surf <command> [args] [options]
 
 Common Commands:
+  session.ensure <name> [url]  Idempotently create or reuse a tab-bound session
+  session.cleanup --idle-after <duration>  Remove idle sessions (opt-in; use --dry-run first)
   navigate <url>     Go to URL (alias: go)
   click <ref>        Click element by ref or selector
   type <text>        Type text at cursor or into element
   screenshot         Capture screenshot (alias: snap)
   record             Capture screenshot frames into an animated GIF
+  video start <path> Start a long-running local WebM recording
+  video stop         Stop the active WebM recording
+  video status       Show WebM recording status
+  video restart <path> Replace the active WebM recording
   animate-audit      JSON timeline of element animation/style samples
   perf-audit         PerformanceObserver snapshot for motion/jank debugging
   page.read          Get page accessibility tree (alias: read)
@@ -1728,9 +1729,12 @@ Common Commands:
   search <term>      Search for text in page (alias: find)
   window.new <url>   Create isolated browser window
   doctor             Diagnose native host/socket setup
+  oracle ask <prompt> Start a durable ChatGPT consult
   wait <seconds>     Wait N seconds
 
 Quick Examples:
+  export SURF_SESSION="$(basename "$PWD" | sed 's/[^A-Za-z0-9._-]/-/g')"
+  surf session.ensure "$SURF_SESSION" about:blank
   surf go "https://example.com"
   surf read
   surf click e5
@@ -1741,6 +1745,8 @@ Quick Examples:
   surf window.new "https://example.com" && surf --window-id 123 go "https://other.com"
 
 More Help:
+  --session <name>          Target a durable named browser session
+  --no-wait                 Return tab_busy/browser_busy instead of queueing
   --remote <host>:<port>    Route requests to a remote native host
   --remote-credential <path>  Use a mode-0600 Ed25519 remote credential file
   surf remote authorize <label> --output <path>
@@ -1768,6 +1774,7 @@ Type: surf type "text" --submit                  # use --ref e5 to target a fiel
 Screenshot: surf screenshot /tmp/shot.png         # auto-saves to /tmp if no path
 Full page screenshot: surf screenshot --full-page /tmp/full.png
 Record animation: surf record --duration 2000 --fps 10 --output /tmp/anim.gif
+Video recording: surf video start ./demo.webm --fps 30; surf video stop
 Animation audit: surf animate-audit --selector ".thing" --duration 2000 --fps 10
 Performance audit: surf perf-audit --duration 3000 --trigger "click:.cta" --output /tmp/perf.json
 JavaScript: surf js "return document.title"
@@ -1775,8 +1782,11 @@ Scroll: surf scroll down 800 | surf scroll up 400 | surf scroll bottom | surf sc
 Find by semantics: surf locate.role button --name "Submit" --action click
 Device/viewport: surf emulate.device "iPhone 14" | surf resize 375 812
 Cookies: surf cookie list | surf cookie get "name" | surf cookie delete "name"
-Window isolation: surf window.new "https://example.com" then pass --window-id <id>
-Concurrency: surf serializes commands per socket; use --no-lock only for intentional bypass
+Session targeting: surf --session research read | SURF_SESSION=research surf read
+Session status/queue: surf session.info research | surf session.list --refresh
+Session cleanup: surf session.cleanup --idle-after 1h [--dry-run]
+Recovery: run the exact command printed after Recovery: on tab_gone, session_epoch_stale, tab_busy, or browser_busy
+Concurrency: commands for different session tabs can overlap; each tab remains FIFO; provider flows are browser-exclusive
 Doctor: surf doctor --browser all              # native host/socket diagnostics
 Workflow: surf do 'go "https://example.com" | wait 2 | read | click e5 | screenshot'
 More help: surf --help-full | surf <command> --help | surf --help-topic refs | surf --find <query>`);
@@ -1786,6 +1796,13 @@ const showFullHelp = () => {
   console.log(`surf v${VERSION} - Browser automation CLI
 
 Usage: surf <command> [args] [options]
+
+Oracle:
+  surf oracle <ask|status|result|follow|list>
+
+Playbooks:
+  surf playbook|pb <list|show|ops|run|record|suggest|save|client|trace|export|import>
+  surf use <playbook> <op> [--arg value]
 
 `);
   for (const [groupName, group] of Object.entries(TOOLS)) {
@@ -1803,12 +1820,14 @@ Usage: surf <command> [args] [options]
 Options:
   --remote <host>:<port>       Route requests to a remote native host
   --remote-credential <path>   Use a mode-0600 Ed25519 remote credential file
+  --session <name>  Target a durable named session (or set SURF_SESSION)
   --tab-id <id>     Target specific tab
-  --window-id <id>  Target specific window (isolate from your browsing)
-  --json            Output raw JSON
+  --window-id <id>  Target specific window
+  --no-wait         Return immediately when the tab/browser is busy
+  --json            Output raw JSON including target metadata
   --auto-capture    On error: capture screenshot + console to /tmp
   --soft-fail       On error: warn and exit 0 (for non-critical commands)
-  --no-lock         Bypass the per-socket browser request lock
+  --no-lock         Bypass the legacy lock for compound client-side commands
 
 Remote Credentials (run on the browser host):
   surf remote authorize <label> --output <credential-file>
@@ -2073,12 +2092,17 @@ Options:
                   On WSL2, auto installs for Windows Chrome. Use linux for WSLg/Linux browsers.
   --listen <tailscale-ip>:<port>
                   Requires surf remote authorize <label> --output <path> first.
+  --socket-mode <600|660>
+                  Persist the local POSIX socket mode (default: 600); 660 requires --socket-group.
+  --socket-group <group-or-gid>
+                  Persist the local POSIX socket group for mode 660.
 
 Examples:
   surf install hnfbepgmaoklhekckbpjnleifhahkcpl
   surf install hnfbepgmaoklhekckbpjnleifhahkcpl --browser brave
   surf install hnfbepgmaoklhekckbpjnleifhahkcpl --browser all
   surf install hnfbepgmaoklhekckbpjnleifhahkcpl --target linux
+  surf install hnfbepgmaoklhekckbpjnleifhahkcpl --socket-mode 660 --socket-group surf
 `);
     process.exit(0);
   }
@@ -2189,8 +2213,7 @@ if (args.includes("--script")) {
   const dryRun = args.includes("--dry-run");
   const stopOnError = args.includes("--stop-on-error");
 
-  const tabIdIdx = args.indexOf("--tab-id");
-  const scriptTabId = tabIdIdx !== -1 ? args[tabIdIdx + 1] : undefined;
+  const scriptTarget = resolveEarlyTargetOptions(args);
 
   if (!scriptPath || scriptPath.startsWith("--")) {
     console.error("Error: --script requires a file path");
@@ -2224,7 +2247,13 @@ if (args.includes("--script")) {
       params: { tool: toolName, args: toolArgs },
       id: "cli-" + Date.now() + "-" + Math.random(),
     };
-    if (scriptTabId) req.tabId = parseInt(scriptTabId, 10);
+    if (scriptTarget.tabId) req.tabId = scriptTarget.tabId;
+    if (scriptTarget.windowId) req.windowId = scriptTarget.windowId;
+    if (scriptTarget.session) {
+      req.session = scriptTarget.session;
+      req.sessionSource = scriptTarget.sessionSource;
+    }
+    if (scriptTarget.admission) req.admission = scriptTarget.admission;
     const prepared = endpoint.kind === "remote" ? prepareRemoteTool(toolName, toolArgs) : (() => { const args = validateLocalToolPaths(toolName, toolArgs); return { args, uploads: [], downloads: [] }; })();
     req.params.args = prepared.args;
     return scriptTransport.request(req, resolveRequestDeadlineMs(toolName, prepared.args), prepared);
@@ -2297,10 +2326,6 @@ if (args.includes("--script")) {
     }
   };
 
-  if (!dryRun) {
-    installBrowserLock(parseBrowserLockOptions(args.includes("--no-lock")), endpoint);
-  }
-
   runScript()
     .then((code) => process.exit(code))
     .catch((error) => {
@@ -2323,9 +2348,11 @@ if (args[0] === "do") {
   let wantJson = false;
   let tabId = undefined;
   let windowId = undefined;
+  let explicitSession = undefined;
+  let noWait = false;
 
   // Reserved flags that aren't workflow args
-  const reservedFlags = ['file', 'f', 'dry-run', 'on-error', 'no-auto-wait', 'step-delay', 'json', 'tab-id', 'window-id', 'no-lock'];
+  const reservedFlags = ['file', 'f', 'dry-run', 'on-error', 'no-auto-wait', 'step-delay', 'json', 'tab-id', 'window-id', 'session', 'no-lock', 'no-wait'];
 
   // Workflow-specific args (collected for variable substitution)
   const workflowArgs = {};
@@ -2355,6 +2382,16 @@ if (args[0] === "do") {
     } else if (arg === "--window-id") {
       windowId = parseInt(doArgs[i + 1], 10);
       i++;
+    } else if (arg === "--session") {
+      const value = doArgs[i + 1];
+      if (!value || value.startsWith("--")) {
+        console.error("Error: --session requires a value");
+        process.exit(1);
+      }
+      explicitSession = value;
+      i++;
+    } else if (arg === "--no-wait") {
+      noWait = true;
     } else if (arg.startsWith("--")) {
       // Workflow-specific arg (e.g., --email, --password)
       const key = arg.slice(2);
@@ -2377,6 +2414,22 @@ if (args[0] === "do") {
       commandsInput = arg;
     }
   }
+
+  if (tabId !== undefined && (!Number.isInteger(tabId) || tabId <= 0)) {
+    console.error("Error: --tab-id must be a positive number");
+    process.exit(1);
+  }
+  if (windowId !== undefined && (!Number.isInteger(windowId) || windowId <= 0)) {
+    console.error("Error: --window-id must be a positive number");
+    process.exit(1);
+  }
+  if (explicitSession && (tabId || windowId)) {
+    console.error("Error: use either --session or --tab-id/--window-id, not both");
+    process.exit(1);
+  }
+  const environmentSession = process.env.SURF_SESSION;
+  const session = explicitSession || (!tabId && !windowId ? environmentSession : undefined);
+  const sessionSource = explicitSession ? "explicit" : session ? "environment" : undefined;
 
   if (!commandsInput && !fileInput) {
     console.error("Error: commands string, workflow name, or --file required");
@@ -2429,9 +2482,7 @@ if (args[0] === "do") {
 
     // Process workflow file if loaded
     if (workflow) {
-      if (!workflow.steps || !Array.isArray(workflow.steps)) {
-        throw new Error("Workflow must have a 'steps' array");
-      }
+      workflow = normalizeWorkflow(workflow);
 
       // Validate required args
       const argErrors = validateWorkflowArgs(workflow, workflowArgs);
@@ -2451,30 +2502,7 @@ if (args[0] === "do") {
         process.exit(1);
       }
 
-      // Convert steps: support both { tool, args } and { cmd, args } formats
-      // Also preserve loop steps as-is
-      steps = workflow.steps.map(s => {
-        if (s.repeat !== undefined || s.each !== undefined) {
-          // Loop step - convert nested steps recursively
-          const convertSteps = (stepsArr) => stepsArr.map(ns => {
-            if (ns.repeat !== undefined || ns.each !== undefined) {
-              // Recursively convert nested loop steps and until condition
-              return {
-                ...ns,
-                steps: convertSteps(ns.steps || []),
-                until: ns.until ? { cmd: ns.until.tool || ns.until.cmd, args: ns.until.args || {} } : undefined
-              };
-            }
-            return { cmd: ns.tool || ns.cmd, args: ns.args || {}, as: ns.as };
-          });
-          return {
-            ...s,
-            steps: convertSteps(s.steps || []),
-            until: s.until ? { cmd: s.until.tool || s.until.cmd, args: s.until.args || {} } : undefined
-          };
-        }
-        return { cmd: s.tool || s.cmd, args: s.args || {}, as: s.as };
-      });
+      steps = workflow.steps;
     }
   } catch (e) {
     console.error(`Error: Failed to parse workflow: ${e.message}`);
@@ -2508,8 +2536,6 @@ if (args[0] === "do") {
     process.exit(0);
   }
 
-  installBrowserLock(parseBrowserLockOptions(doArgs.includes("--no-lock")), endpoint);
-
   if (!wantJson) {
     if (workflowName) {
       console.log(`Running workflow: ${workflowName} (${steps.length} steps)...\n`);
@@ -2531,6 +2557,9 @@ if (args[0] === "do") {
       context: {
         tabId,
         windowId,
+        session,
+        sessionSource,
+        admission: noWait ? { wait: false } : undefined,
         endpoint,
         transport,
       },
@@ -2689,7 +2718,7 @@ if (args[0] === "workflow.validate") {
   }
 }
 
-const BOOLEAN_FLAGS = ["auto-capture", "json", "stream", "dry-run", "stop-on-error", "fail-fast", "clear", "submit", "all", "case-sensitive", "hard", "annotate", "fullpage", "full-page", "reset", "no-screenshot", "full", "soft-fail", "has-body", "exclude-static", "v", "vv", "request", "by-tab", "har", "jsonl", "no-save", "no-auto-wait", "no-lock", "new-tab", "keep-tab"];
+const BOOLEAN_FLAGS = ["auto-capture", "json", "stream", "dry-run", "stop-on-error", "fail-fast", "clear", "submit", "all", "case-sensitive", "hard", "annotate", "fullpage", "full-page", "reset", "no-screenshot", "full", "soft-fail", "has-body", "exclude-static", "v", "vv", "request", "by-tab", "har", "jsonl", "no-save", "no-auto-wait", "no-lock", "new-tab", "keep-tab", "no-wait", "window", "tab", "focused", "unfocused", "keep-target", "close-target", "replace", "refresh"];
 
 const parseArgs = (rawArgs) => {
   const result = { positional: [], options: {} };
@@ -2735,6 +2764,25 @@ let { positional, options } = parseArgs(args);
 let tool = positional[0];
 let firstArg = positional[1];
 
+if (tool === "session" && firstArg) {
+  const sessionSubcommands = {
+    new: "session.new",
+    ensure: "session.ensure",
+    list: "session.list",
+    cleanup: "session.cleanup",
+    info: "session.info",
+    close: "session.close",
+    rebind: "session.rebind",
+    reopen: "session.reopen",
+  };
+  const sessionTool = sessionSubcommands[firstArg];
+  if (sessionTool) {
+    tool = sessionTool;
+    positional = [tool, ...positional.slice(2)];
+    firstArg = positional[1];
+  }
+}
+
 if (tool === "cookie" && firstArg) {
   const cookieSubcommands = {
     list: "cookie.list",
@@ -2746,6 +2794,21 @@ if (tool === "cookie" && firstArg) {
   const cookieTool = cookieSubcommands[firstArg];
   if (cookieTool) {
     tool = cookieTool;
+    positional = [tool, ...positional.slice(2)];
+    firstArg = positional[1];
+  }
+}
+
+if (tool === "video" && firstArg) {
+  const videoSubcommands = {
+    start: "video.start",
+    stop: "video.stop",
+    status: "video.status",
+    restart: "video.restart",
+  };
+  const videoTool = videoSubcommands[firstArg];
+  if (videoTool) {
+    tool = videoTool;
     positional = [tool, ...positional.slice(2)];
     firstArg = positional[1];
   }
@@ -2825,6 +2888,7 @@ const PRIMARY_ARG_MAP = {
   aistudio: "query",
   "aistudio.build": "query",
   aimode: "query",
+  kimi: "query",
   navigate: "url",
   go: "url",
   js: "code",
@@ -2861,6 +2925,12 @@ const PRIMARY_ARG_MAP = {
   "window.new": "url",
   "window.focus": "id",
   "window.close": "id",
+  "session.new": "name",
+  "session.ensure": "name",
+  "session.info": "name",
+  "session.close": "name",
+  "session.rebind": "name",
+  "session.reopen": "name",
   "locate.role": "role",
   "locate.text": "text",
   "locate.label": "label",
@@ -2920,6 +2990,11 @@ if (tool === "record" && firstArg !== undefined && toolArgs.output === undefined
   firstArg = undefined;
 }
 
+if ((tool === "video.start" || tool === "video.restart") && firstArg !== undefined && toolArgs.output === undefined) {
+  toolArgs.output = firstArg;
+  firstArg = undefined;
+}
+
 if (firstArg !== undefined) {
   const primaryKey = PRIMARY_ARG_MAP[tool];
   if (primaryKey && toolArgs[primaryKey] === undefined) {
@@ -2929,6 +3004,10 @@ if (firstArg !== undefined) {
     else if (/^-?\d+$/.test(val)) val = parseInt(val, 10);
     toolArgs[primaryKey] = val;
   }
+}
+
+if (["session.new", "session.ensure", "session.reopen"].includes(tool) && positional[2] !== undefined && toolArgs.url === undefined) {
+  toolArgs.url = positional[2];
 }
 
 if ((tool === "js" || tool === "frame.js") && toolArgs.file) {
@@ -2950,6 +3029,13 @@ if (tool === "batch" && toolArgs.file) {
     console.error(`Error: Failed to read batch file: ${e.message}`);
     process.exit(1);
   }
+} else if (tool === "batch" && typeof toolArgs.actions === "string") {
+  try {
+    toolArgs.actions = JSON.parse(toolArgs.actions);
+  } catch (e) {
+    console.error(`Error: Failed to parse batch actions: ${e.message}`);
+    process.exit(1);
+  }
 }
 
 // Handle select command: capture multiple values after selector
@@ -2969,27 +3055,35 @@ if (toolArgs.into && !toolArgs.selector) {
 }
 
 const globalOpts = {};
+const explicitSession = toolArgs.session;
+delete toolArgs.session;
+const environmentSession = process.env.SURF_SESSION;
+const noWait = toolArgs["no-wait"] === true;
+delete toolArgs["no-wait"];
+
 if (toolArgs["tab-id"] !== undefined) {
   const tid = parseInt(toolArgs["tab-id"], 10);
-  if (isNaN(tid)) {
-    console.error("Error: --tab-id must be a number");
+  if (!Number.isInteger(tid) || tid <= 0) {
+    console.error("Error: --tab-id must be a positive number");
     process.exit(1);
   }
-  globalOpts.tabId = tid;
+  if (tool === "session.rebind") toolArgs.tabId = tid;
+  else globalOpts.tabId = tid;
   delete toolArgs["tab-id"];
 }
 if (toolArgs["window-id"] !== undefined) {
   const wid = parseInt(toolArgs["window-id"], 10);
-  if (isNaN(wid)) {
-    console.error("Error: --window-id must be a number");
+  if (!Number.isInteger(wid) || wid <= 0) {
+    console.error("Error: --window-id must be a positive number");
     process.exit(1);
   }
-  globalOpts.windowId = wid;
+  if (["session.new", "session.ensure", "session.reopen"].includes(tool)) toolArgs.windowId = wid;
+  else globalOpts.windowId = wid;
   delete toolArgs["window-id"];
 }
-if (toolArgs["network-path"] !== undefined) {
-  networkStore.setBasePath(toolArgs["network-path"]);
-  delete toolArgs["network-path"];
+if (toolArgs["network-path"] !== undefined && typeof toolArgs["network-path"] !== "string") {
+  console.error("Error: --network-path requires a directory");
+  process.exit(1);
 }
 const wantJson = toolArgs.json === true;
 delete toolArgs.json;
@@ -3029,10 +3123,28 @@ if (tool === "gemini") {
 if (tool === "network.export" && outputPath !== undefined) {
   toolArgs.output = outputPath;
 }
+if ((tool === "video.start" || tool === "video.restart") && outputPath !== undefined) {
+  toolArgs.output = outputPath;
+}
 
-if ((tool === "screenshot" || tool === "record" || tool === "perf-audit") && outputPath && typeof outputPath !== "string") {
+if ((tool === "screenshot" || tool === "record" || tool === "perf-audit" || tool === "page.save" || tool === "video.start" || tool === "video.restart") && outputPath && typeof outputPath !== "string") {
   console.error("Error: --output requires a file path");
   process.exit(1);
+}
+
+if (tool === "page.save" && !outputPath) {
+  console.error("Error: page.save requires --output <path>");
+  process.exit(1);
+}
+
+if (tool === "video.start" || tool === "video.restart") {
+  try {
+    parseVideoFps(toolArgs.fps);
+    validateVideoOutputPath(toolArgs.output, { createParent: false });
+  } catch (error) {
+    console.error(`Error: ${error.message}`);
+    process.exit(1);
+  }
 }
 
 if (tool === "screenshot" && outputPath) {
@@ -3090,6 +3202,39 @@ if (methodFlag === "js") {
   }
 }
 
+const finalClassification = classifyTool(finalTool, toolArgs);
+if (explicitSession !== undefined) {
+  if (typeof explicitSession !== "string" || !explicitSession) {
+    console.error("Error: --session requires a session name");
+    process.exit(1);
+  }
+  if (finalClassification.targetUse !== "default-tab" || finalTool.startsWith("session.")) {
+    console.error(`Error: --session does not apply to ${finalTool}`);
+    process.exit(1);
+  }
+  if (globalOpts.tabId || globalOpts.windowId) {
+    console.error("Error: use either --session or --tab-id/--window-id, not both");
+    process.exit(1);
+  }
+  globalOpts.session = explicitSession;
+  globalOpts.sessionSource = "explicit";
+} else if (
+  environmentSession &&
+  finalClassification.targetUse === "default-tab" &&
+  !globalOpts.tabId &&
+  !globalOpts.windowId &&
+  !finalTool.startsWith("session.")
+) {
+  globalOpts.session = environmentSession;
+  globalOpts.sessionSource = "environment";
+}
+if (noWait) globalOpts.admission = { wait: false };
+
+if (finalClassification.scope === "provider") {
+  const suffix = globalOpts.session ? ` Session ${globalOpts.session} remains selected for page context.` : "";
+  console.error(`[surf] ${finalTool} requires exclusive browser access; other sessions will queue until it finishes.${suffix}`);
+}
+
 if (streamMode && (tool === "console" || tool === "network")) {
   const streamType = tool === "console" ? "STREAM_CONSOLE" : "STREAM_NETWORK";
   const streamOpts = {
@@ -3145,7 +3290,8 @@ if (streamMode && (tool === "console" || tool === "network")) {
         }
       }
       if (msg.error) {
-        console.error("Error:", msg.error);
+        const text = msg.error?.content?.[0]?.text || msg.error?.message || String(msg.error);
+        console.error("Error:", text);
         sock.end();
         process.exit(1);
       }
@@ -3154,7 +3300,11 @@ if (streamMode && (tool === "console" || tool === "network")) {
         sock.end();
         process.exit(1);
       }
-      if (msg.type === "stream_started") return;
+      if (msg.type === "stream_started") {
+        const context = formatTargetContext(msg.target);
+        if (context) console.error(context);
+        return;
+      }
       if (msg.type === "console_event") {
         const { level, text, timestamp } = msg;
         if (streamLevel && level !== streamLevel) return;
@@ -3405,7 +3555,6 @@ if (finalTool === "record") {
   return;
 }
 
-installBrowserLock(lockOptions, endpoint);
 let socket;
 let timeout;
 
@@ -3432,7 +3581,7 @@ socket = connectEndpoint(endpoint, () => {
   writeFrame(socket, request).catch((error) => socket.destroy(error));
 });
 
-const requestTimeout = resolveRequestDeadlineMs(tool, options);
+const requestTimeout = resolveRequestDeadlineMs(finalTool, toolArgs);
 timeout = setTimeout(() => {
   console.error(`Error: Request timed out (${requestTimeout / 1000}s)`);
   socket.destroy();
@@ -3473,8 +3622,45 @@ socket.on("close", () => {
   clearTimeout(timeout);
 });
 
+function formatTargetContext(target) {
+  if (!target) return null;
+  const fields = [];
+  if (target.session) fields.push(`session=${target.session}`);
+  if (target.tabId !== undefined) fields.push(`tab=${target.tabId}`);
+  if (target.windowId !== undefined) fields.push(`window=${target.windowId}`);
+  if (target.queuedMs > 0) fields.push(`queued=${target.queuedMs}ms`);
+  return fields.length > 0 ? `[surf ${fields.join(" ")}]` : null;
+}
+
+function printResponseContext(response) {
+  const context = formatTargetContext(response.target);
+  if (context) console.error(context);
+  if (response.notice && finalClassification.scope !== "provider") {
+    console.error(`[surf] ${response.notice}`);
+  }
+}
+
+function queueSummary(queue) {
+  if (!queue) return "unknown";
+  const pieces = [
+    `own-tab=${queue.active ? "active" : "idle"}`,
+    `own-queued=${queue.queued || 0}`,
+  ];
+  if (queue.blockedBy) pieces.push(`blocked-by=${queue.blockedBy}`);
+  if (queue.browserWriter) {
+    pieces.push(`writer=${queue.browserWriter.scope}${queue.browserWriter.session ? `:${queue.browserWriter.session}` : ""}`);
+  } else if (queue.queuedBrowserWriters) {
+    pieces.push(`writers-waiting=${queue.queuedBrowserWriters}`);
+  }
+  if (Array.isArray(queue.otherActiveTabLanes) && queue.otherActiveTabLanes.length > 0) {
+    pieces.push(`other-tabs-active=${queue.otherActiveTabLanes.length}`);
+  }
+  return pieces.join(" ");
+}
+
 async function handleResponse(response) {
   clearTimeout(timeout);
+  printResponseContext(response);
 
   if (response.error) {
     const errContent = response.error.content?.[0]?.text || JSON.stringify(response.error);
@@ -3510,6 +3696,21 @@ async function handleResponse(response) {
     data = { response: data };
   }
 
+  if (tool === 'kimi' && typeof data === 'string') {
+    data = { response: data };
+  }
+
+  if (tool === "page.save" && typeof data?.html === "string") {
+    const saveTo = path.resolve(outputPath);
+    fs.mkdirSync(path.dirname(saveTo), { recursive: true });
+    fs.writeFileSync(saveTo, data.html);
+    if (!wantJson) {
+      console.log(`Saved rendered page HTML to ${saveTo}`);
+      socket.end();
+      process.exit(0);
+    }
+  }
+
   if (tool === "perf-audit" && outputPath) {
     const saveTo = path.resolve(outputPath);
     fs.mkdirSync(path.dirname(saveTo), { recursive: true });
@@ -3522,12 +3723,75 @@ async function handleResponse(response) {
   }
 
   if (wantJson) {
-    console.log(JSON.stringify(data ?? null, null, 2));
+    const output = response.target || response.notice
+      ? { result: data ?? null, target: response.target || null, notice: response.notice || null }
+      : data ?? null;
+    console.log(JSON.stringify(output, null, 2));
     socket.end();
     process.exit(0);
   }
 
-  if (tool === "screenshot" && data?.base64 && (outputPath || toolArgs.savePath)) {
+  if (finalTool === "session.list") {
+    const sessions = Array.isArray(data?.sessions) ? data.sessions : [];
+    if (sessions.length === 0) {
+      console.log("No browser sessions. Create one with: surf session.ensure <name> about:blank");
+    } else {
+      for (const entry of sessions) {
+        console.log([
+          entry.name,
+          entry.status,
+          `tab=${entry.tabId ?? "-"}`,
+          `window=${entry.windowId ?? "-"}`,
+          `mode=${entry.mode || "-"}`,
+          queueSummary(entry.queue),
+          entry.lastUrl || "",
+        ].join("\t"));
+      }
+    }
+  } else if (finalTool === "session.cleanup" && data?.success) {
+    const removed = Array.isArray(data.removed) ? data.removed : [];
+    if (removed.length === 0) {
+      console.log("No browser sessions matched the idle cleanup threshold.");
+    } else {
+      const verb = data.dryRun ? "Would remove" : "Removed";
+      for (const entry of removed) {
+        const target = entry.targetAction === "close"
+          ? "target closed"
+          : entry.targetAction === "keep"
+            ? "target kept"
+            : "target already gone";
+        console.log(`${verb} session ${entry.name} tab=${entry.tabId ?? "-"} (${target})`);
+      }
+    }
+  } else if (finalTool === "session.info" && data?.session) {
+    const entry = data.session;
+    console.log(`Session: ${entry.name}`);
+    console.log(`Status: ${entry.status}`);
+    console.log(`Target: tab=${entry.tabId ?? "-"} window=${entry.windowId ?? "-"} mode=${entry.mode || "-"}`);
+    console.log(`Ownership: ${entry.ownership || "unknown"}`);
+    console.log(`URL: ${entry.currentUrl || entry.lastUrl || "(unknown)"}`);
+    console.log(`Queue: ${queueSummary(entry.queue)}`);
+    if (data.sharedProfile) console.log(`Profile: ${data.sharedProfile}`);
+  } else if (["session.new", "session.ensure", "session.rebind", "session.reopen"].includes(finalTool) && data?.session) {
+    const entry = data.session;
+    const action = data.created ? "created" : data.reopened ? "reopened" : data.rebound ? "rebound" : "ready";
+    console.log(`Session ${entry.name} ${action}: tab=${entry.tabId} window=${entry.windowId} mode=${entry.mode} status=${entry.status}`);
+    console.log(`Use: export SURF_SESSION=${entry.name}`);
+  } else if (finalTool === "session.close" && data?.success) {
+    console.log(`Session ${data.name} closed (${data.targetClosed ? "target closed" : "target kept"})`);
+  } else if (finalTool === "video.start" && data?.status === "active") {
+    console.log(`Video recording started: ${data.path} (${data.fps}fps)`);
+  } else if (finalTool === "video.restart" && data?.status === "active") {
+    console.log(`Video recording restarted: ${data.path} (${data.fps}fps)`);
+  } else if (finalTool === "video.stop" && data?.status === "stopped") {
+    console.log(`Saved video recording to ${data.path} (${data.frames} frames, ${data.capturedFrames} captured frames @ ${data.fps}fps)`);
+  } else if (finalTool === "video.status") {
+    if (data?.status === "active") {
+      console.log(`Video recording active: ${data.path} (${data.fps}fps, ${data.frames} frames, ${data.capturedFrames} captured frames)`);
+    } else {
+      console.log("No active video recording");
+    }
+  } else if (tool === "screenshot" && data?.base64 && (outputPath || toolArgs.savePath)) {
     const saveTo = transferPlan.downloads?.[0]?.destination || toolArgs.savePath || outputPath;
     fs.writeFileSync(saveTo, Buffer.from(data.base64, "base64"));
 
@@ -3591,6 +3855,8 @@ async function handleResponse(response) {
     console.log(data.pageContent);
   } else if (tool === "page.text" && data?.text) {
     console.log(data.text);
+  } else if (tool === "page.html" && typeof data?.html === "string") {
+    console.log(data.html);
   } else if (tool === "emulate.device" && data?.devices) {
     console.log("Available devices:\n");
     const devices = data.devices;
@@ -3725,7 +3991,18 @@ async function handleResponse(response) {
     if (meta.length > 0) {
       console.error(`[${meta.join(" | ")}]`);
     }
-  } else if (tool === "perplexity" && data?.response) {
+      } else if (tool === "kimi" && data?.response) {
+        console.log(data.response);
+        const meta = [];
+        if (data.model) meta.push(data.model);
+        if (data.partial) meta.push("partial");
+        if (Number.isFinite(data.tookMs)) meta.push(`${(data.tookMs / 1000).toFixed(1)}s`);
+        if (meta.length > 0) console.error(`\n[${meta.join(' | ')}]`);
+        if (data.url) console.error(`URL: ${data.url}`);
+        if (data.warnings?.length) {
+          for (const w of data.warnings) console.warn(`Warning: ${w}`);
+        }
+      } else if (tool === "perplexity" && data?.response) {
     console.log(data.response);
     const meta = [];
     if (data.sources) meta.push(`${data.sources} sources`);

@@ -10,7 +10,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=for-the-badge)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-macOS%20%7C%20Linux%20%7C%20Windows-blue?style=for-the-badge)]()
 
-> **v2.6.0** — AI Studio support (`surf aistudio`, `surf aistudio.build`), Windows support, Helium browser support, env var overrides. See [CHANGELOG](CHANGELOG.md).
+> See [CHANGELOG](CHANGELOG.md) for current release notes.
 
 ```bash
 surf go "https://example.com"
@@ -142,9 +142,11 @@ surf remote revoke agent-macbook
 surf remote list
 ```
 
-`--remote <host>:<port>` takes precedence over `SURF_REMOTE`; `--remote-credential` takes precedence over `SURF_REMOTE_CREDENTIAL`. A selected remote endpoint overrides `SURF_SOCKET` and the default local socket. Local and remote requests share one bounded FIFO browser lease, so they cannot race each other. Disconnects and timeouts abort queued or in-flight work and hold the lease until request-owned cleanup drains or the hard deadline is reached. Browser side effects that already completed are not rolled back.
+`--remote <host>:<port>` takes precedence over `SURF_REMOTE`; `--remote-credential` takes precedence over `SURF_REMOTE_CREDENTIAL`. A selected remote endpoint overrides `SURF_SOCKET` and the default local socket. Local and remote requests share the same host scheduler: each tab has a FIFO lane, different tabs may execute concurrently, and browser-wide writers are exclusive. Disconnects and timeouts abort queued or in-flight work and retain admission until request-owned cleanup drains or the hard deadline is reached. Browser side effects that already completed are not rolled back.
 
 `surf install --listen` persists the explicit Tailnet address in the native-host wrapper. Re-run `surf install` without `--listen` to remove it. The address must be a Tailscale IPv4 or IPv6 address with a port; Surf does not bind every interface. Remote listeners currently require a POSIX browser host and are not supported by Windows native-host wrappers.
+
+For advanced local-only sharing, `surf install <extension-id> --socket-mode 660 --socket-group <group>` persists an opt-in group-owned socket. The default remains mode `600`; mode `660` gives every account in that group full Surf authority, so use a dedicated narrow group. Re-run `surf install` without these flags to clear persisted socket settings. Remote Surf credentials remain the revocable per-client alternative.
 
 Keep Tailscale policy restrictions as defense in depth. For example:
 
@@ -188,7 +190,7 @@ surf --remote "$SURF_REMOTE" --remote-credential "$SURF_REMOTE_CREDENTIAL" \
 
 Client-local inputs are staged privately on the host and removed after the request. Client-local outputs are downloaded with size/hash verification and atomic destination replacement. `surf js --file` and `perf-audit --output` are handled by the client itself. `network.export` defaults to a generated client-local `.json`, `.jsonl`, or `.har` path. Gemini edits default to client-local `edited.png`. Successful remote actions transfer their automatic screenshot to a generated client-local path; `--auto-capture` on failure remains a separate screenshot and console diagnostic.
 
-The remote single-file boundary supports one `upload` file, one ChatGPT attachment, or one Gemini attachment/edit input, plus one screenshot, network export, or Gemini image output. Transfers are limited to 256 MiB per file, 512 MiB and 32 files per connection, with 256 KiB decoded chunks. Remote `record`, `aistudio.build`, smoke screenshot directories, directory transfer, and multi-file inputs are intentionally rejected. A `remote:` path bypasses transfer and gives the trusted client direct authority over that absolute host path.
+The remote single-file boundary supports one `upload` file, one ChatGPT attachment, or one Gemini attachment/edit input, plus one screenshot, network export, or Gemini image output. Transfers are limited to 256 MiB per file, 512 MiB and 32 files per connection, with 256 KiB decoded chunks. Remote `record`, `video`, `aistudio.build`, smoke screenshot directories, directory transfer, and multi-file inputs are intentionally rejected. A `remote:` path bypasses transfer and gives the trusted client direct authority over that absolute host path.
 
 ### Development Setup
 
@@ -230,8 +232,13 @@ surf read --compact                 # Remove empty structural elements
 surf read --depth 3 --compact       # Both (60% smaller output)
 surf read --max-bytes 2000          # Cap visible text on a UTF-8 byte boundary
 surf page.text                      # Raw text content only
+surf page.html                      # Rendered document HTML
+surf page.html --strip-scripts > artifact.html # Save a safe static Claude artifact
+surf page.save --selector "#artifact" --strip-scripts --output artifact.html # Save one rendered element
 surf page.state                     # Modals, loading state, scroll position
 ```
+
+Use `surf page.html --strip-scripts` after the page loads when you need a static export of a Claude artifact or other rendered DOM. Use `--selector <css>` to export one element. Both commands target the active frame when `frame.switch` is active.
 
 Element refs (`e1`, `e2`, `e3`...) are stable identifiers from the accessibility tree - semantic, predictable, and resilient to DOM changes.
 
@@ -343,43 +350,68 @@ surf tab.switch "dashboard"         # Switch by name
 surf tab.group --name "Work" --color blue
 ```
 
-### Window Isolation
+### Browser Sessions and Concurrent Agents
 
-Keep using your browser while the agent works in a separate window:
+Give every independent agent a durable Surf session before its first browser command. `session.ensure` is idempotent: it creates a missing session, reuses a live one, and reopens a stale or closed binding.
 
 ```bash
-# Create a separate window for agent work
+# First command rule for every independent agent shell
+export SURF_SESSION="$(basename "$PWD" | sed 's/[^A-Za-z0-9._-]/-/g')"
+surf session.ensure "$SURF_SESSION" about:blank
+
+# All later tab-scoped commands use that session automatically
+surf go "https://example.com"
+surf read
+surf click e5
+```
+
+Use a distinct worktree/directory name per agent. When several agents share one directory, append a stable agent identifier instead of reusing the same `SURF_SESSION` value.
+
+A session owns one explicit Chrome tab. New sessions use a separate **unfocused normal window** by default, so Chrome focus changes cannot retarget another agent's commands.
+
+```bash
+surf session.new research "https://example.com"   # separate unfocused window
+surf session.ensure research about:blank           # safe to run repeatedly
+surf session.new scout about:blank --tab            # inactive tab instead
+
+surf --session research read                        # explicit selector
+SURF_SESSION=research surf screenshot               # environment selector
+
+surf session.list --refresh                         # all bindings + queue state
+surf session.info research --refresh                # target and scheduler details
+surf session.close research                         # closes Surf-created target
+surf session.cleanup --idle-after 1h --dry-run      # preview forgotten sessions
+surf session.cleanup --idle-after 1h                 # remove idle bindings
+surf session.rebind research --tab-id 789            # adopt an existing tab
+surf session.reopen research                         # recreate from last URL
+```
+
+`session.cleanup` is an explicit, one-shot cleanup operation; `--idle-after` is required. It inspects current bindings first, removes gone or stale records, and removes live inactive bindings older than the threshold. Only Surf-created targets are closed. Adopted targets remain open while their session binding is removed. Use `--dry-run` to report the exact bindings and target actions without changing the store or browser.
+
+Commands for the same session tab run FIFO. Commands for different session tabs can overlap. Browser-wide mutations—such as creating, moving, closing, or focusing tabs/windows and writing cookies—wait for active tab lanes to drain. Add `--no-wait` to return `tab_busy` or `browser_busy` immediately instead of queueing.
+
+Recovery errors print an exact command that can be copied directly:
+
+```text
+Error: The tab for session research is gone.
+Recovery: surf session.reopen research
+```
+
+`session.info` distinguishes work queued on the session's own tab, activity on other tabs, and an active or waiting browser-wide writer. Browser-login provider commands such as `surf chatgpt`, `surf gemini`, and `surf oracle ask` print a warning before taking exclusive browser access, so a queued provider flow is not mistaken for a hung command.
+
+Sessions share the same Chrome profile. Cookies, authentication, same-origin storage, downloads, history, bookmarks, and other profile state are shared. For hard isolation, use separate browser profiles/instances with separate native hosts and `SURF_SOCKET` values.
+
+### Explicit Tabs and Windows
+
+Session targeting is the recommended coordination mechanism. Explicit IDs and named tabs remain available for one-off work:
+
+```bash
 surf window.new "https://example.com"
-# Returns: Window 123456 (tab 789)
-
-# Target that window or its tab from later commands
-surf click e5 --window-id 123456
 surf read --tab-id 789
-surf tab.new "https://other.com" --window-id 123456
-
-# Name tabs when humans or agents need stable aliases
+surf click e5 --window-id 123456
 surf tab.name dashboard --tab-id 789
 surf tab.switch dashboard
-
-# Or manage windows directly
-surf window.list                    # List all windows
-surf window.list --tabs             # Include tab details
-surf window.focus 123456            # Bring window to front
-surf window.close 123456            # Close window
 ```
-
-`window.new`, `--window-id`, `--tab-id`, and named tabs are Surf's supported coordination tools for parallel workflows. They help agents avoid accidentally driving the same visible tab.
-
-Surf also serializes non-streaming browser CLI requests per socket with a file-based lock, so two agents sharing the same native host wait instead of interleaving browser commands. Use `--no-lock` only when you intentionally want to bypass the guard for a command.
-
-For hard isolation, run separate browser instances/profiles with separate Surf native hosts and socket paths, then point each shell at the matching socket. Each socket has its own independent lock:
-
-```bash
-SURF_SOCKET=/tmp/surf-agent-a.sock surf tab.list
-SURF_SOCKET=/tmp/surf-agent-b.sock surf tab.list
-```
-
-Surf does not yet provide `session.new`, session IDs, or independent per-agent CDP sessions.
 
 ### Device Emulation
 
@@ -413,6 +445,19 @@ surf record --rect 0,200,1440,800 --output /tmp/region.gif
 ```
 
 `record` defaults to 2000ms at 10fps and writes to `/tmp/surf-record-*.gif` when no output is provided. `--duration` is capped at 10000ms and `--fps` is capped at 30. `--trigger` supports `click:<selector>`, `scroll:up|down|left|right|top|bottom`, and `scroll:<selector>` to scroll a container to the bottom before capture. `--rect` crops the GIF using `x,y,width,height`. ImageMagick must be available as `magick` or `convert`.
+
+### Local Video Recording
+
+Capture a local tab as WebM/VP9 with ffmpeg:
+
+```bash
+surf video start ./demo.webm --fps 30
+surf video status
+surf video stop
+surf video restart ./take-2.webm --fps 60
+```
+
+`--fps` defaults to 30 and is capped at 60. Video recording is local-only and requires `ffmpeg` on `PATH`.
 
 ### Animation Audit
 
@@ -453,7 +498,7 @@ Query AI models using your browser's logged-in session:
 # ChatGPT
 surf chatgpt "explain this code"
 surf chatgpt "summarize" --with-page     # Include page context
-surf chatgpt "analyze" --model gpt-4o    # Specify model
+surf chatgpt "analyze" --model gpt-5.5   # Specify model
 surf chatgpt "review" --file code.ts     # Attach file
 
 # Gemini
@@ -485,12 +530,33 @@ surf aistudio "explain quantum computing"
 surf aistudio "redteam this" --with-page                      # Include page context
 surf aistudio "quick answer" --model gemini-3-flash-preview   # Model selection
 
+# Kimi (queries kimi.com - Moonshot K-series - using your browser login)
+surf kimi "explain quantum computing"
+surf kimi "summarize" --with-page                             # Include page context
+surf kimi "quick answer" --model thinking                     # Models: instant (default), thinking, high
+surf kimi --validate                                           # Check kimi.com UI and available models
+
 # AI Studio App Builder (generates full web apps from a prompt)
 surf aistudio.build "build a portfolio site"
 surf aistudio.build "todo app" --model gemini-3.1-pro-preview # Model override
 surf aistudio.build "crm dashboard" --output ./out            # Extract zip to directory
 surf aistudio.build "game" --keep-open --timeout 600          # Keep tab open, 10min timeout
 ```
+
+#### Oracle
+
+Use `surf oracle` for a durable, local ChatGPT consult instead of a quick `surf chatgpt` one-shot. It persists jobs by conversation URL, supports repeatable file-context globs, one direct local attachment with `--file`, and verifies requested model and reasoning effort before submission. Add `--github` when the consult needs the ChatGPT Chat tab and connected GitHub tool. ChatGPT model aliases include `gpt-6-astra`, `latest`, `gpt-5.6-sol`, and `gpt-5.5`; `latest` is an explicit floating choice, while `gpt-6-astra` must read back as model 6 before submission. Accepted efforts are `instant`, `medium`, `high`, `xhigh`/`extra-high`, and `pro`. Use `--model gpt-6-astra --effort pro` for GPT-6 Astra with Pro effort.
+
+ChatGPT can hide the model version at lower effort settings. Use `--model latest` if you want floating model selection there; an explicit `gpt-6-astra` request fails closed when the UI cannot verify model 6.
+
+```bash
+surf oracle ask "review this change" --files "src/**/*.ts" --file ./design.md --model gpt-5.5 --effort pro --github --detach --json
+surf oracle status <job-id> --json
+surf oracle result <job-id> --wait --json
+surf oracle follow <job-id> "challenge that recommendation" --file ./follow-up.md --github --detach --json
+```
+
+Only one oracle job can be in flight. Sensitive filename patterns and gitignored context are blocked unless `--allow-sensitive` is explicit.
 
 Each AI tool uses your existing browser login - no API keys needed. Just be logged into the respective service in Chrome (chatgpt.com, gemini.google.com, perplexity.ai, x.com, or aistudio.google.com).
 
@@ -536,6 +602,7 @@ surf network --type json              # Only JSON responses
 surf network --status 4xx,5xx         # Only errors
 surf network --since 5m               # Last 5 minutes
 surf network --exclude-static         # Skip images/fonts/css/js
+surf network -vv --body-mode text      # Full entries with capped text bodies
 
 # Drill down
 surf network.get r_001                # Full request/response details
@@ -546,10 +613,12 @@ surf network.origins                  # List captured domains
 # Management
 surf network.clear                    # Clear captured data
 surf network.stats                    # Capture statistics
+surf network.export --har --output ./trace.har
 ```
 
-Storage location: `/tmp/surf/` (override with `--network-path` or `SURF_NETWORK_PATH` env).
-Auto-cleanup: 24 hours TTL, 200MB max.
+Response bodies are fetched at `Network.loadingFinished` when capture is enabled. `--body-mode none|text|all`, `--per-body-bytes`, and `--total-body-bytes` control content and caps; exports include completeness metadata.
+
+Storage location: `~/.surf/state/network/` (override with `SURF_NETWORK_PATH` in the native host environment). Surf creates private `0700` directories and `0600` files and rejects symlink targets. Auto-cleanup: 24 hours TTL, 200MB max.
 
 ### Workflows
 
@@ -677,39 +746,104 @@ surf workflow.validate ./my-workflow.json
 
 **Supported commands:** All surf commands work in workflows. Use aliases (`go`, `snap`, `read`) or full names (`navigate`, `screenshot`, `page.read`).
 
+### Playbooks
+
+Use `surf do` for a direct sequence of browser commands. Use a playbook for a reusable site capability that can try a browser-session network request and fall back to a workflow when the endpoint drifts.
+
+```bash
+surf playbook list
+surf pb show page
+surf pb ops page
+surf use page read --json
+
+# Write ops require explicit authorization and a durable duplicate-safety receipt.
+surf use <site> <write-op> --write --resource-id 123
+```
+
+Playbook read ops can also use a trusted `script` strategy when fixed JSON steps are too rigid. Scripts require `--allow-script` at run time. Only run scripts from playbooks you trust. This is not a security sandbox.
+
+The script gets `input`, `tools.run`, `tools.all`, `tools.ref`/`refs`, `emit`, and `console`. Tool calls still use Surf workflow step behavior, including auto-waits unless `autoWait` is `false`.
+
+```json
+{
+  "using": "script",
+  "script": [
+    "const page = await tools.run('page', { tool: 'page.text', args: {} });",
+    "const clicked = await tools.all(input.selectors.map((selector) => ({ key: selector.slice(1), tool: 'click', args: { selector } })));",
+    "return { page: page.output, clicked: clicked.map((link) => link.output) };"
+  ]
+}
+```
+
+Project playbooks in `./.surf/playbooks/` override user playbooks in `~/.surf/playbooks/`; built-ins are the final fallback. `show` reports the selected source. Provider compatibility commands continue to use their validated command paths until provider playbooks have real login-flow validation.
+
+Author a playbook from redacted recent activity or an explicit evidence record:
+
+```bash
+surf pb suggest --since 1h
+surf pb save example --op read --from-recent 1h
+surf pb record start example --op read --network --watch
+surf pb record mark "loaded results"
+surf pb record stop --draft
+surf pb save --from-record <record-id>
+surf pb trace export --from-record <record-id> --har ./trace.har
+surf pb export example --out ./example-playbook
+surf pb import ./example-playbook
+```
+
+Records, traces, receipts, and recent-use journals live under private Surf state. Input values and authentication headers are redacted by default; `--include-input-values` is an explicit recording choice.
+
+Generate a standalone client only from an observed or validated read endpoint:
+
+```bash
+surf pb client derive example --op read --from-record <record-id> --request-id <request-id> --out ./client
+surf pb client export example --op read --out ./client
+surf pb client verify ./client
+```
+
+Generated manifests declare provenance and authentication environment inputs. Surf excludes cookies, bearer tokens, and captured credentials and does not export write-capable clients without explicit review.
+
 ## Global Options
 
 ```bash
---tab-id <id>      # Target specific tab
---window-id <id>   # Target specific window (isolate agent from your browsing)
---json             # Output raw JSON
+--session <name>   # Target a durable browser session (or set SURF_SESSION)
+--tab-id <id>      # Target a specific tab
+--window-id <id>   # Target a specific window
+--no-wait          # Return tab_busy/browser_busy instead of queueing
+--json             # Raw JSON including resolved target metadata
 --soft-fail        # Warn instead of error (exit 0) on restricted pages
---no-lock          # Bypass the per-socket browser request lock
+--no-lock          # Bypass the legacy lock for compound client-side commands
 --no-screenshot    # Skip auto-screenshot after actions
 --full             # Full resolution screenshots (skip resize)
---network-path <path>  # Custom path for network logs (default: /tmp/surf, or SURF_NETWORK_PATH env)
 ```
 
 ## Environment Variables
 
 ```bash
-SURF_NETWORK_PATH         # Path for network capture logs (default: /tmp/surf)
+SURF_NETWORK_PATH         # Native-host network state root (default: ~/.surf/state/network)
+SURF_STATE_DIR            # Private Surf state root, including browser sessions (default: ~/.surf/state)
+SURF_SESSION              # Default named browser session for tab-scoped commands
 SURF_SOCKET               # Socket path or named pipe (default: /tmp/surf.sock, Windows: //./pipe/surf)
 SURF_REMOTE               # Remote Surf endpoint as host:port (overrides SURF_SOCKET)
 SURF_REMOTE_CREDENTIAL    # Client Ed25519 credential for the selected remote endpoint
 SURF_REMOTE_STATE_DIR     # Host identity/authorization directory (default: ~/.surf/remote)
 SURF_LISTEN               # Native-host Tailnet bind address as <tailscale-ip>:<port>
+SURF_SOCKET_MODE          # Advanced POSIX local socket mode: 600 (default) or 660
+SURF_SOCKET_GROUP         # Group name or numeric gid required with mode 660
 SURF_NODE_PATH            # Path to node binary (for native host wrapper)
 SURF_HOST_PATH            # Path to native/host.cjs (for native host wrapper)
 SURF_EXTENSION_PATH       # Path to extension dist/ directory
 ```
 
 **Use cases:**
-- `SURF_SOCKET`: Advanced socket override. Set it for both the native host and CLI if you need a non-default socket, including separate sockets for separate browser/profile instances in hard-isolated multi-agent workflows. Each socket gets an independent request lock.
+- `SURF_SESSION`: Per-shell default session. Give each independent agent a unique value and run `surf session.ensure "$SURF_SESSION" about:blank` before its first browser command.
+- `SURF_STATE_DIR`: Private mode-0700 state root for durable browser-session bindings and other Surf state.
+- `SURF_SOCKET`: Advanced socket override. Set it for both the native host and CLI when separate browser/profile instances need hard isolation.
 - `SURF_REMOTE`: Remote client endpoint. `--remote <host>:<port>` overrides it; both override `SURF_SOCKET`.
 - `SURF_REMOTE_CREDENTIAL`: Credential used for mutual remote authentication. `--remote-credential <path>` overrides it.
 - `SURF_REMOTE_STATE_DIR`: Advanced host-side override for the mode-0700 identity and client registry directory.
 - `SURF_LISTEN`: Native-host listener address on the browser machine. Use `surf install ... --listen <tailscale-ip>:<port>` to persist it in that host's wrapper.
+- `SURF_SOCKET_MODE` / `SURF_SOCKET_GROUP`: Advanced POSIX native-host settings. Use `surf install ... --socket-mode 660 --socket-group <group>` to persist group access; mode `660` grants full Surf authority to every member of that group.
 - `SURF_NODE_PATH` / `SURF_HOST_PATH`: Package manager installs (e.g., Nix) that store binaries in non-standard locations
 - `SURF_EXTENSION_PATH`: Package managers that create stable symlinks instead of changing paths on reinstall
 
@@ -874,6 +1008,23 @@ cp -r skills/surf ~/.pi/agent/skills/
 ```
 
 See [`skills/README.md`](skills/README.md) for details.
+
+### Pi extension
+
+Surf also includes an optional Pi extension. Install or load Surf as a Pi package, or load it from a checkout:
+
+```bash
+pi install npm:surf-cli
+pi -e /path/to/surf-cli/pi-extension/surf.ts
+```
+
+It registers `surf_read`, `surf_screenshot`, `surf_click`, `surf_type`, `surf_tool`, and the `surf_oracle_*` tools. Browser calls use Surf's native-host socket, not shell commands. If `pi-subagents/background-work` is installed, the extension also reports active oracle jobs started by that Pi session. Pi still loads the browser tools when pi-subagents is not installed.
+
+The extension also registers a `surf-oracle` external-job provider when a Pi runtime exposes that provider bridge. The provider implements pi-subagents' external-job contract: `start`, `status`, `result`, and `reattach` operations that return `providerJobId`, a contract state (`queued`, `running`, `completed`, `failed`), the durable conversation URL, the captured result text as `output`, and failure code and message when present. It reads `options.model`, `options.effort`, `options.file`, and `options.github` for starts and follow-ups, so a Pi profile can request `model: gpt-6-astra` plus `effort: pro` and reach ChatGPT GPT-6 Astra with Pro effort through Surf, while `github: true` requires Chat mode and the connected GitHub tool. Capacity stays fail-closed: Surf returns the blocking job id instead of silently queueing a second ChatGPT job.
+
+When Surf is installed as a Pi package, it also exposes an optional `gpt-pro` package agent for `pi-subagents`. That profile uses `runner.type: external-job`, provider `surf-oracle`, `options.model: gpt-6-astra`, and `options.effort: pro`. Surf remains useful without Pi or `pi-subagents`; the package agent only wires Surf's browser-backed model alias into Pi's agent picker.
+
+Shell-based agents should select a unique session with `SURF_SESSION` and call `surf session.ensure` before their first browser command. The optional Pi extension still uses its existing socket-tool interface; callers that coordinate several Pi workers should pass explicit tab targets until session selection is exposed by that integration.
 
 ## Development
 

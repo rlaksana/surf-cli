@@ -24,15 +24,21 @@ const PROVIDER_DEFAULT_TIMEOUT_SECONDS = {
   claude: 300,
   gemini: 300,
   grok: 300,
+  kimi: 300,
   perplexity: 120,
+  "oracle.result": 300,
+  "playbook.run": 600,
   smoke: 300,
 };
 
 function resolveRequestDeadlineMs(tool, args = {}) {
   const defaultSeconds = PROVIDER_DEFAULT_TIMEOUT_SECONDS[tool];
   if (defaultSeconds === undefined) return DEFAULT_DEADLINE_MS;
+  const rawTimeout = tool === "playbook.run" && args && typeof args === "object" && !Array.isArray(args)
+    ? args.timeout ?? args.args?.timeout
+    : args?.timeout;
   const requestedSeconds = Number(
-    args && typeof args === "object" && !Array.isArray(args) ? args.timeout : undefined,
+    rawTimeout,
   );
   const seconds = Number.isFinite(requestedSeconds) && requestedSeconds > 0
     ? requestedSeconds
@@ -120,7 +126,7 @@ class HostSessionManager {
     context.stream = false;
   }
 
-  beginRequest(context, { id, tool, deadlineMs }) {
+  beginRequest(context, { id, tool, deadlineMs, skipLease = false }) {
     if (context.closed) return Promise.reject(new Error("connection is closed"));
     if (context.workTimer) {
       clearTimeout(context.workTimer);
@@ -146,8 +152,15 @@ class HostSessionManager {
       controller,
       signal: controller.signal,
       tombstoned: false,
+      skipLease,
     };
     context.activeRequest = request;
+    if (skipLease) {
+      request.queued = false;
+      request.timer = setTimeout(() => this.onRequestTimeout(context, request), request.deadlineMs);
+      this.audit({ event: "admission", context, request, outcome: "accepted" });
+      return Promise.resolve(request);
+    }
     const grant = () => {
       if (context.closed) return Promise.reject(new Error("connection closed while waiting for browser lease"));
       request.queued = false;

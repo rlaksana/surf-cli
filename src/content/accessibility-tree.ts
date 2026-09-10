@@ -154,16 +154,23 @@ function getResolvedRole(element: Element): string {
 
 if (!window.__piElementMap) window.__piElementMap = {};
 
+interface ElementRef {
+  role: string;
+  name: string;
+  ref: string;
+}
+
+const elementRefs = new WeakMap<Element, ElementRef>();
 let globalRefCounter = 0;
 
 function getOrAssignRef(element: Element, role: string, name: string): string {
-  const existing = (element as any)._piRef as { role: string; name: string; ref: string } | undefined;
+  const existing = elementRefs.get(element);
   if (existing && existing.role === role && existing.name === name) {
     return existing.ref;
   }
   
   const ref = `e${++globalRefCounter}`;
-  (element as any)._piRef = { role, name, ref };
+  elementRefs.set(element, { role, name, ref });
   return ref;
 }
 
@@ -1432,8 +1439,56 @@ function uploadImage(
   }
 }
 
+let playbookWatch: { includeInputValues: boolean } | null = null;
+
+function watchSelector(element: Element): string {
+  if (element.id) return `#${CSS.escape(element.id)}`;
+  for (const name of ["data-testid", "data-test-id", "name", "aria-label"]) {
+    const value = element.getAttribute(name);
+    if (value) return `${element.tagName.toLowerCase()}[${name}=${JSON.stringify(value)}]`;
+  }
+  return element.tagName.toLowerCase();
+}
+
+function postWatchEvent(event: string, element?: Element, value?: string): void {
+  if (!playbookWatch) return;
+  chrome.runtime.sendMessage({
+    type: "PLAYBOOK_WATCH_EVENT",
+    event,
+    selector: element ? watchSelector(element) : undefined,
+    value,
+    url: location.href,
+    timestamp: new Date().toISOString(),
+  }).catch(() => {});
+}
+
+if (typeof document.addEventListener === "function") {
+  document.addEventListener("click", (event) => {
+    if (event.isTrusted && event.target instanceof Element) postWatchEvent("click", event.target);
+  }, true);
+  document.addEventListener("change", (event) => {
+    if (!event.isTrusted || !(event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement || event.target instanceof HTMLSelectElement)) return;
+    const target = event.target;
+    const secret = target instanceof HTMLInputElement && target.type === "password";
+    const value = playbookWatch?.includeInputValues && !secret ? target.value : "<input>";
+    postWatchEvent("input", target, value);
+  }, true);
+}
+if (typeof window.addEventListener === "function") {
+  window.addEventListener("popstate", () => postWatchEvent("navigation"));
+  window.addEventListener("hashchange", () => postWatchEvent("navigation"));
+}
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   switch (message.type) {
+    case "PLAYBOOK_WATCH_START":
+      playbookWatch = { includeInputValues: message.includeInputValues === true };
+      sendResponse({ success: true });
+      break;
+    case "PLAYBOOK_WATCH_STOP":
+      playbookWatch = null;
+      sendResponse({ success: true });
+      break;
     case "SHOW_AGENT_INDICATORS":
     case "HIDE_AGENT_INDICATORS":
     case "HIDE_FOR_TOOL_USE":

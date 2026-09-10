@@ -91,6 +91,14 @@ describe("mapToolToMessage", () => {
       expect(msg.url).toBe("https://example.com");
     });
 
+    it("uses the resolved target for a no-ID tab.close", () => {
+      expect(helpers.mapToolToMessage("tab.close", {}, 42)).toEqual({
+        type: "CLOSE_TAB",
+        tabId: 42,
+        tabIds: undefined,
+      });
+    });
+
     it("maps tab.move to TAB_MOVE", () => {
       const msg = helpers.mapToolToMessage("tab.move", {
         id: "123",
@@ -103,6 +111,40 @@ describe("mapToolToMessage", () => {
         windowId: "456",
         index: "0",
       });
+    });
+  });
+
+  describe("oracle commands", () => {
+    it("maps oracle socket tools to host-owned messages", () => {
+      expect(
+        helpers.mapToolToMessage("oracle.ask", {
+          prompt: "review",
+          model: "pro",
+          file: "/tmp/report.md",
+          github: true,
+        }),
+      ).toEqual({
+        type: "ORACLE_ASK",
+        prompt: "review",
+        model: "pro",
+        file: "/tmp/report.md",
+        github: true,
+      });
+      expect(helpers.mapToolToMessage("oracle.status", { id: "job" })).toEqual({
+        type: "ORACLE_STATUS",
+        id: "job",
+      });
+      expect(helpers.mapToolToMessage("oracle.result", { id: "job", timeout: 5 })).toEqual({
+        type: "ORACLE_RESULT",
+        id: "job",
+        timeout: 5,
+      });
+      expect(helpers.mapToolToMessage("oracle.list", {})).toEqual({ type: "ORACLE_LIST" });
+    });
+
+    it("requires ask prompts and result ids", () => {
+      expect(() => helpers.mapToolToMessage("oracle.ask", {})).toThrow("prompt required");
+      expect(() => helpers.mapToolToMessage("oracle.result", {})).toThrow("id required");
     });
   });
 
@@ -160,6 +202,29 @@ describe("mapToolToMessage", () => {
       const msg = helpers.mapToolToMessage("page.read", { "max-bytes": "1200" });
       expect(msg.options.maxBytes).toBe(1200);
       expect(msg.options.forceFullSnapshot).toBe(true);
+    });
+  });
+
+  describe("page.html command", () => {
+    it("maps page HTML commands and export options to the dedicated message", () => {
+      for (const tool of ["page.html", "page.save"]) {
+        expect(
+          helpers.mapToolToMessage(tool, { selector: "#artifact", "strip-scripts": true }, 123),
+        ).toEqual({
+          type: "GET_PAGE_HTML",
+          selector: "#artifact",
+          stripScripts: true,
+          tabId: 123,
+        });
+      }
+    });
+
+    it("rejects invalid export selectors", () => {
+      for (const selector of ["", false]) {
+        expect(() => helpers.mapToolToMessage("page.html", { selector })).toThrow(
+          "selector must be a non-empty string",
+        );
+      }
     });
   });
 
@@ -348,7 +413,50 @@ describe("mapToolToMessage", () => {
   });
 });
 
+describe("formatToolError", () => {
+  it("preserves structured codes and job ids", () => {
+    const error = Object.assign(new Error("capacity reached"), {
+      code: "capacity",
+      jobId: "job-id",
+    });
+
+    expect(helpers.formatToolError(error)).toEqual({
+      code: "capacity",
+      jobId: "job-id",
+      message: "capacity reached",
+      content: [{ type: "text", text: "capacity reached" }],
+    });
+  });
+
+  it("adds a copy-paste recovery command for stale session targets", () => {
+    const error = Object.assign(new Error("tab is gone"), {
+      code: "tab_gone",
+      session: "research",
+      lastUrl: "https://example.com/",
+    });
+
+    const formatted = helpers.formatToolError(error);
+    expect(formatted.content[0].text).toContain("Recovery: surf session.reopen research");
+    expect(formatted.details).toMatchObject({
+      session: "research",
+      lastUrl: "https://example.com/",
+      recoveryCommand: "surf session.reopen research",
+    });
+  });
+});
+
 describe("formatToolContent", () => {
+  it("preserves browser session results as reviewable JSON", () => {
+    const result = helpers.formatToolContent({
+      session: { name: "research", tabId: 10, queue: { active: false } },
+      created: true,
+    });
+    expect(JSON.parse(result[0].text)).toMatchObject({
+      session: { name: "research", tabId: 10 },
+      created: true,
+    });
+  });
+
   describe("window responses", () => {
     it("formats window.new success", () => {
       const result = helpers.formatToolContent({

@@ -7,10 +7,20 @@ debugLog("Service worker loaded");
 
 const cdp = new CDPController();
 const activeStreamTabs = new Map<number, number>();
+let activeVideoRecorder: { recorderId: string; tabId: number } | null = null;
 
-// Frame context per tab - stores the active frameId for each tab
-// When frame.switch is called, subsequent content script messages go to that frame
-const frameContexts = new Map<number, number>();
+async function cleanupActiveVideoRecorder(): Promise<void> {
+  const active = activeVideoRecorder;
+  if (!active) return;
+  try {
+    await cdp.stopScreencast(active.tabId);
+  } catch (error) {
+    debugLog("Failed to stop video screencast after native host disconnect:", error);
+  } finally {
+    cdp.unsubscribeFromScreencast(active.tabId, active.recorderId);
+    if (activeVideoRecorder?.recorderId === active.recorderId) activeVideoRecorder = null;
+  }
+}
 
 // ============================================================================
 // HARD-CODED POLICY: tab rules (user override — no escape hatch).
@@ -81,14 +91,135 @@ async function runStartupReconciler(): Promise<void> {
   /* startup reconciler disabled — see policy comment above */
 }
 
-// Helper to get the frame ID for content script messaging
-function getFrameIdForTab(tabId: number): number {
-  return frameContexts.get(tabId) ?? 0;
+function getFrameIdForTab(_tabId: number, message?: { frameId?: unknown }): number {
+  const frameId = Number(message?.frameId);
+  return Number.isInteger(frameId) && frameId > 0 ? frameId : 0;
+}
+
+async function validateRequestedFrame(tabId: number, value: unknown): Promise<void> {
+  const frameId = Number(value);
+  if (!Number.isInteger(frameId) || frameId <= 0) return;
+  const frames = await chrome.webNavigation.getAllFrames({ tabId });
+  if (frames?.some((frame) => frame.frameId === frameId)) return;
+  postToNativeHost({
+    type: "TARGET_EVENT",
+    event: "frame-reset",
+    tabId,
+    frameId,
+    reason: "missing-frame",
+  });
+  throw new BrowserCommandError(
+    "frame_context_reset",
+    `Frame context ${frameId} is no longer available in tab ${tabId}`,
+    { tabId, frameId, reason: "missing-frame", recoveryCommand: "surf frame.list" },
+  );
 }
 
 function isRestrictedTabUrl(url?: string): boolean {
   if (!url) return true;
   return /^(?:about|arc|brave|chrome|chrome-extension|devtools|edge|extension|helium|moz-extension):/i.test(url);
+}
+
+class BrowserCommandError extends Error {
+  code: string;
+  details?: Record<string, unknown>;
+
+  constructor(code: string, message: string, details?: Record<string, unknown>) {
+    super(message);
+    this.name = "BrowserCommandError";
+    this.code = code;
+    this.details = details;
+  }
+}
+
+async function inspectTarget(tabId: number): Promise<{
+  tabId: number;
+  windowId: number;
+  url?: string;
+  title?: string;
+  active: boolean;
+  status?: string;
+  restricted: boolean;
+  groupId: number;
+}> {
+  let tab: chrome.tabs.Tab;
+  try {
+    tab = await chrome.tabs.get(tabId);
+  } catch {
+    throw new BrowserCommandError("tab_gone", `Tab ${tabId} no longer exists`, { tabId });
+  }
+  if (!tab.id || tab.windowId === undefined) {
+    throw new BrowserCommandError("tab_gone", `Tab ${tabId} no longer has a browser window`, { tabId });
+  }
+  return {
+    tabId: tab.id,
+    windowId: tab.windowId,
+    url: tab.url,
+    title: tab.title,
+    active: Boolean(tab.active),
+    status: tab.status,
+    restricted: isRestrictedTabUrl(tab.url),
+    groupId: tab.groupId,
+  };
+}
+
+async function resolveDefaultTarget(windowId?: number, allowCreate = true): Promise<{ tab: chrome.tabs.Tab; autoCreated: boolean }> {
+  let tabs: chrome.tabs.Tab[];
+  let tab: chrome.tabs.Tab | undefined;
+  let autoCreated = false;
+
+  if (windowId) {
+    tabs = await chrome.tabs.query({ active: true, windowId });
+    tab = tabs[0];
+    if (!tab || isRestrictedTabUrl(tab.url)) {
+      tabs = await chrome.tabs.query({ windowId });
+      tab = tabs.find((candidate) => !isRestrictedTabUrl(candidate.url));
+    }
+    if (!tab?.id && allowCreate) {
+      const created = await chrome.tabs.create({
+        windowId,
+        url: "data:text/html,<html><head><title>Surf</title></head><body></body></html>",
+        active: true,
+      });
+      if (!created.id) throw new BrowserCommandError("target_create_failed", `Failed to create tab in window ${windowId}`);
+      await sleep(100);
+      tab = created;
+      autoCreated = true;
+    }
+  } else {
+    tabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+    tab = tabs[0];
+    if (!tab || isRestrictedTabUrl(tab.url)) {
+      tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+      tab = tabs[0];
+    }
+    if (!tab || isRestrictedTabUrl(tab.url)) {
+      tabs = await chrome.tabs.query({ active: true });
+      tab = tabs.find((candidate) => !isRestrictedTabUrl(candidate.url));
+    }
+  }
+
+  if (!tab?.id) {
+    throw new BrowserCommandError(
+      "target_required",
+      "No active tab found. Use 'surf session.ensure <name> about:blank' or 'surf tab.new <url>'.",
+    );
+  }
+  return { tab, autoCreated };
+}
+
+async function labelSessionTab(tabId: number, name: string): Promise<number | undefined> {
+  try {
+    const groupId = await chrome.tabs.group({ tabIds: tabId });
+    await chrome.tabGroups.update(groupId, {
+      title: `Surf: ${name}`,
+      color: "blue",
+      collapsed: false,
+    });
+    return groupId;
+  } catch {
+    return undefined;
+  }
 }
 
 const screenshotCache = new Map<string, { base64: string; width: number; height: number }>();
@@ -114,6 +245,26 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+class ProviderUploadError extends Error {
+  code: string;
+
+  constructor(code: string, message: string) {
+    super(message);
+    this.name = "ProviderUploadError";
+    this.code = code;
+  }
+}
+
+function uploadError(provider: string, stage: "selector" | "chooser" | "processing", message: string): ProviderUploadError {
+  const code = stage === "selector"
+    ? "attachment_selector_drift"
+    : stage === "chooser" ? "attachment_chooser_interception" : "attachment_processing";
+  const label = stage === "selector"
+    ? "UI selector drift"
+    : stage === "chooser" ? "chooser interception" : "processing";
+  return new ProviderUploadError(code, `${provider} attachment ${label}: ${message}`);
+}
+
 const providerUploadStrategies = {
   gemini: {
     openerSelector: 'button[aria-label="Upload & tools"], button[aria-label="Open upload file menu"]',
@@ -131,17 +282,29 @@ async function setFileInputFilesBySelector(
   filePaths: string[],
   selector: string,
 ): Promise<boolean> {
-  const result = await cdp.sendCommand(tabId, "Runtime.evaluate", {
-    expression: `(() => {
-      const input = document.querySelector(${JSON.stringify(selector)});
-      if (!input || input.tagName !== 'INPUT' || input.type !== 'file') return null;
-      return input;
-    })()`,
-    userGesture: true,
-  });
+  let result: any;
+  try {
+    result = await cdp.sendCommand(tabId, "Runtime.evaluate", {
+      expression: `(() => {
+        const input = document.querySelector(${JSON.stringify(selector)});
+        if (!input || input.tagName !== 'INPUT' || input.type !== 'file') return null;
+        return input;
+      })()`,
+      userGesture: true,
+    });
+  } catch (error) {
+    throw uploadError("ChatGPT", "selector", error instanceof Error ? error.message : String(error));
+  }
+  if (result?.exceptionDetails) {
+    throw uploadError("ChatGPT", "selector", "file input selector evaluation failed");
+  }
   const objectId = result?.result?.objectId;
   if (!objectId) return false;
-  await cdp.sendCommand(tabId, "DOM.setFileInputFiles", { files: filePaths, objectId });
+  try {
+    await cdp.sendCommand(tabId, "DOM.setFileInputFiles", { files: filePaths, objectId });
+  } catch (error) {
+    throw uploadError("ChatGPT", "processing", error instanceof Error ? error.message : String(error));
+  }
   return true;
 }
 
@@ -150,7 +313,11 @@ async function uploadFilesWithChooser(
   filePaths: string[],
   provider: "gemini" | "chatgpt",
 ): Promise<void> {
-  await cdp.sendCommand(tabId, "Page.setInterceptFileChooserDialog", { enabled: true });
+  try {
+    await cdp.sendCommand(tabId, "Page.setInterceptFileChooserDialog", { enabled: true });
+  } catch (error) {
+    throw uploadError(provider, "chooser", error instanceof Error ? error.message : String(error));
+  }
 
   let timeoutId: ReturnType<typeof setTimeout> | null = null;
   let handler: ((source: chrome.debugger.Debuggee, method: string, params: any) => void) | null = null;
@@ -168,10 +335,18 @@ async function uploadFilesWithChooser(
       handler = (source: chrome.debugger.Debuggee, method: string, params: any) => {
         if (source.tabId === tabId && method === "Page.fileChooserOpened") {
           cleanup();
+          if (!params?.backendNodeId) {
+            reject(uploadError(provider, "chooser", "file chooser did not provide a backend node"));
+            return;
+          }
           cdp.sendCommand(tabId, "DOM.setFileInputFiles", {
             files: filePaths,
             backendNodeId: params.backendNodeId,
-          }).then(() => resolve()).catch(reject);
+          }).then(() => resolve()).catch((error) => reject(uploadError(
+            provider,
+            "processing",
+            error instanceof Error ? error.message : String(error),
+          )));
         }
       };
       chrome.debugger.onEvent.addListener(handler);
@@ -197,10 +372,21 @@ async function uploadFilesWithChooser(
       return;
     }
 
-    await cdp.sendCommand(tabId, "Runtime.evaluate", {
-      expression: `document.querySelector(${JSON.stringify(providerUploadStrategies.chatgpt.openerSelector)})?.click()`,
-      userGesture: true,
-    });
+    let result: any;
+    try {
+      result = await cdp.sendCommand(tabId, "Runtime.evaluate", {
+        expression: `(() => { const button = document.querySelector(${JSON.stringify(providerUploadStrategies.chatgpt.openerSelector)}); if (!button) return false; button.click(); return true; })()`,
+        userGesture: true,
+      });
+    } catch (error) {
+      throw uploadError("ChatGPT", "selector", error instanceof Error ? error.message : String(error));
+    }
+    if (result?.exceptionDetails) {
+      throw uploadError("ChatGPT", "selector", "Add files selector evaluation failed");
+    }
+    if (result?.result?.value === false || result?.result?.value === null) {
+      throw uploadError("ChatGPT", "selector", "Add files control was not found");
+    }
   };
 
   const maxAttempts = 3;
@@ -217,10 +403,12 @@ async function uploadFilesWithChooser(
       } catch (err) {
         lastError = err as Error;
         cleanup();
+        const errorCode = (lastError as Error & { code?: string })?.code;
+        if (errorCode && errorCode !== "attachment_chooser_interception") throw lastError;
         if (attempt < maxAttempts) await sleep(1000);
       }
     }
-    throw new Error(`${provider} file upload failed after ${maxAttempts} attempts: ${lastError?.message}`);
+    throw lastError || uploadError(provider, "chooser", "file chooser did not open");
   } finally {
     cleanup();
     try { await cdp.sendCommand(tabId, "Page.setInterceptFileChooserDialog", { enabled: false }); } catch {}
@@ -232,8 +420,12 @@ async function uploadFilesToProviderTab(
   tabId: number,
   filePaths: string[],
 ): Promise<{ success: true }> {
-  await cdp.attach(tabId);
-  await cdp.sendCommand(tabId, "DOM.enable", {});
+  try {
+    await cdp.attach(tabId);
+    await cdp.sendCommand(tabId, "DOM.enable", {});
+  } catch (error) {
+    throw uploadError(provider === "chatgpt" ? "ChatGPT" : "Gemini", "selector", error instanceof Error ? error.message : String(error));
+  }
 
   if (provider === "chatgpt") {
     const directUpload = await setFileInputFilesBySelector(
@@ -264,32 +456,32 @@ async function annotateScreenshot(
 ): Promise<{ base64: string; width: number; height: number }> {
   const blob = base64ToBlob(screenshot.base64);
   const bitmap = await createImageBitmap(blob);
-  
+
   const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
   const ctx = canvas.getContext("2d");
   if (!ctx) throw new Error("Failed to get canvas context");
-  
+
   ctx.drawImage(bitmap, 0, 0);
   bitmap.close();
-  
+
   const scaleFactor = Math.min(scale.scaleX, scale.scaleY);
-  
+
   for (const element of elements) {
     const color = ELEMENT_COLORS[element.tag] || ELEMENT_COLORS.default;
-    
+
     const x = Math.round(element.bounds.x * scaleFactor);
     const y = Math.round(element.bounds.y * scaleFactor);
     const w = Math.round(element.bounds.width * scaleFactor);
     const h = Math.round(element.bounds.height * scaleFactor);
-    
+
     if (w < 1 || h < 1) continue;
-    
+
     ctx.strokeStyle = color;
     ctx.lineWidth = 2;
     ctx.setLineDash([4, 4]);
     ctx.strokeRect(x, y, w, h);
     ctx.setLineDash([]);
-    
+
     const labelText = element.ref;
     const fontSize = Math.max(10, Math.min(16, Math.round(canvas.width * 0.01)));
     ctx.font = `bold ${fontSize}px sans-serif`;
@@ -297,30 +489,30 @@ async function annotateScreenshot(
     const padding = 4;
     const labelWidth = textWidth + padding * 2;
     const labelHeight = fontSize + padding * 2;
-    
+
     let labelX = x + Math.floor((w - labelWidth) / 2);
     let labelY = y + 2;
     if (w < 60 || h < 30) {
       labelY = y - labelHeight - 2 < 0 ? y + h + 2 : y - labelHeight - 2;
     }
-    
+
     labelX = Math.max(0, Math.min(canvas.width - labelWidth, labelX));
     labelY = Math.max(0, Math.min(canvas.height - labelHeight, labelY));
-    
+
     ctx.fillStyle = color;
     ctx.fillRect(labelX, labelY, labelWidth, labelHeight);
     ctx.strokeStyle = "white";
     ctx.lineWidth = 1;
     ctx.strokeRect(labelX, labelY, labelWidth, labelHeight);
-    
+
     ctx.fillStyle = "white";
     ctx.textBaseline = "top";
     ctx.fillText(labelText, labelX + padding, labelY + padding);
   }
-  
+
   const resultBlob = await canvas.convertToBlob({ type: "image/png" });
   const base64 = await blobToBase64(resultBlob);
-  
+
   return { base64, width: canvas.width, height: canvas.height };
 }
 
@@ -380,33 +572,33 @@ async function captureFullPage(tabId: number, maxHeight: number): Promise<{ base
     devicePixelRatio: window.devicePixelRatio || 1,
     originalScrollY: window.scrollY,
   }))()`);
-  
+
   const dimensions = dimensionsResult.result?.value;
   if (!dimensions) throw new Error("Failed to get page dimensions");
-  
+
   const { viewportHeight, totalHeight, width, devicePixelRatio, originalScrollY } = dimensions;
   const chunks: ImageBitmap[] = [];
   let currentY = 0;
-  
+
   while (currentY < totalHeight) {
     await cdp.evaluateScript(tabId, `window.scrollTo(0, ${currentY})`);
     await new Promise(r => setTimeout(r, 300));
-    
+
     const chunk = await cdp.captureScreenshot(tabId);
     const chunkBlob = base64ToBlob(chunk.base64);
     chunks.push(await createImageBitmap(chunkBlob));
-    
+
     currentY += viewportHeight;
   }
-  
+
   await cdp.evaluateScript(tabId, `window.scrollTo(0, ${originalScrollY})`);
-  
+
   const canvasWidth = Math.round(width * devicePixelRatio);
   const canvasHeight = Math.round(totalHeight * devicePixelRatio);
   const canvas = new OffscreenCanvas(canvasWidth, canvasHeight);
   const ctx = canvas.getContext("2d");
   if (!ctx) throw new Error("Failed to get canvas context");
-  
+
   let y = 0;
   const chunkHeight = Math.round(viewportHeight * devicePixelRatio);
   for (let i = 0; i < chunks.length; i++) {
@@ -417,10 +609,10 @@ async function captureFullPage(tabId: number, maxHeight: number): Promise<{ base
     y += drawHeight;
     chunk.close();
   }
-  
+
   const resultBlob = await canvas.convertToBlob({ type: "image/png" });
   const base64 = await blobToBase64(resultBlob);
-  
+
   return { base64, width: canvasWidth, height: canvasHeight };
 }
 
@@ -430,7 +622,15 @@ const tabNameRegistry = new Map<string, number>();
 chrome.webNavigation.onCompleted.addListener((details) => {
   if (details.frameId === 0) {
     // Clear frame context on main frame navigation (iframes may have changed)
-    frameContexts.delete(details.tabId);
+    chrome.tabs.get(details.tabId)
+      .then((tab) => postToNativeHost({
+        type: "TARGET_EVENT",
+        event: "navigation",
+        tabId: details.tabId,
+        url: details.url,
+        title: tab.title,
+      }))
+      .catch(() => postToNativeHost({ type: "TARGET_EVENT", event: "navigation", tabId: details.tabId, url: details.url }));
     const resolver = navigationResolvers.get(details.tabId);
     if (resolver) {
       resolver();
@@ -452,8 +652,8 @@ chrome.webNavigation.onErrorOccurred.addListener((details) => {
 
 
 chrome.tabs.onRemoved.addListener((tabId) => {
+  postToNativeHost({ type: "TARGET_EVENT", event: "tab-removed", tabId });
   cdp.detach(tabId);
-  frameContexts.delete(tabId);
   for (const [name, id] of tabNameRegistry) {
     if (id === tabId) {
       tabNameRegistry.delete(name);
@@ -464,6 +664,11 @@ chrome.tabs.onRemoved.addListener((tabId) => {
       activeStreamTabs.delete(streamId);
     }
   }
+  if (activeVideoRecorder?.tabId === tabId) activeVideoRecorder = null;
+});
+
+chrome.windows.onRemoved.addListener((windowId) => {
+  postToNativeHost({ type: "TARGET_EVENT", event: "window-removed", windowId });
 });
 
 /**
@@ -473,32 +678,31 @@ chrome.tabs.onRemoved.addListener((tabId) => {
  */
 async function waitForRuntimeReady(tabId: number, timeoutMs = 10000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
-  const delay = (ms: number) => new Promise(r => setTimeout(r, ms));
-  
+
   // Poll until we can successfully evaluate JS
   while (Date.now() < deadline) {
     try {
       const result = await cdp.evaluateScript(tabId, "document.readyState");
       if (result?.result?.value === "complete") {
         // Extra delay for framework hydration (React, Vue, etc.)
-        await delay(1500);
+        await sleep(1500);
         return;
       }
     } catch {
       // CDP not ready yet, continue polling
     }
-    await delay(200);
+    await sleep(200);
   }
-  
+
   // Timeout but proceed anyway - the page might still work
   console.warn(`waitForRuntimeReady timed out for tab ${tabId}`);
 }
 
 // Helper for locate.* commands with actions
 async function performLocateAction(
-  tabId: number, 
-  ref: string, 
-  action: string, 
+  tabId: number,
+  ref: string,
+  action: string,
   value: string | undefined,
   cdp: CDPController,
   frameId: number = 0
@@ -561,19 +765,94 @@ export async function handleMessage(
       return { tabId: tab?.id };
     }
 
+    case "TARGET_INSPECT": {
+      const targetTabId = Number(message.tabId);
+      if (!Number.isInteger(targetTabId) || targetTabId <= 0) {
+        throw new BrowserCommandError("target_required", "TARGET_INSPECT requires a valid tabId");
+      }
+      return inspectTarget(targetTabId);
+    }
+
+    case "TARGET_RESOLVE": {
+      const requestedWindowId = message.windowId === undefined ? undefined : Number(message.windowId);
+      if (requestedWindowId !== undefined && (!Number.isInteger(requestedWindowId) || requestedWindowId <= 0)) {
+        throw new BrowserCommandError("target_invalid", "windowId must be a positive integer");
+      }
+      const { tab, autoCreated } = await resolveDefaultTarget(requestedWindowId, message.allowCreate !== false);
+      const inspected = await inspectTarget(tab.id!);
+      return { ...inspected, autoCreated };
+    }
+
+    case "SESSION_CREATE_TARGET": {
+      const name = String(message.name || "");
+      const url = typeof message.url === "string" && message.url ? message.url : "about:blank";
+      const mode = message.mode === "tab" ? "tab" : "window";
+      const focused = message.focused === true;
+      let createdTab: chrome.tabs.Tab | undefined;
+      let createdWindowId: number | undefined;
+
+      if (mode === "tab") {
+        const createOptions: chrome.tabs.CreateProperties = { url, active: focused };
+        if (message.windowId !== undefined) {
+          const targetWindowId = Number(message.windowId);
+          if (!Number.isInteger(targetWindowId) || targetWindowId <= 0) {
+            throw new BrowserCommandError("target_invalid", "--window-id must be a positive integer");
+          }
+          createOptions.windowId = targetWindowId;
+        }
+        createdTab = await chrome.tabs.create(createOptions);
+        createdWindowId = createdTab.windowId;
+      } else {
+        const createdWindow = await chrome.windows.create({
+          url,
+          focused,
+          type: "normal",
+        });
+        if (!createdWindow) {
+          throw new BrowserCommandError("target_create_failed", `Failed to create target for session ${name}`);
+        }
+        createdWindowId = createdWindow.id;
+        createdTab = createdWindow.tabs?.[0];
+        if (!createdTab && createdWindowId !== undefined) {
+          const tabs = await chrome.tabs.query({ windowId: createdWindowId });
+          createdTab = tabs[0];
+        }
+      }
+
+      if (!createdTab?.id || createdWindowId === undefined) {
+        throw new BrowserCommandError("target_create_failed", `Failed to create target for session ${name}`);
+      }
+      const groupId = await labelSessionTab(createdTab.id, name);
+      const inspected = await inspectTarget(createdTab.id);
+      return { ...inspected, mode, groupId };
+    }
+
+    case "SESSION_CLOSE_TARGET": {
+      const targetTabId = Number(message.tabId);
+      if (!Number.isInteger(targetTabId) || targetTabId <= 0) {
+        throw new BrowserCommandError("target_required", "SESSION_CLOSE_TARGET requires a valid tabId");
+      }
+      try {
+        await chrome.tabs.remove(targetTabId);
+      } catch {
+        return { success: true, tabId: targetTabId, alreadyGone: true };
+      }
+      return { success: true, tabId: targetTabId };
+    }
+
     case "EXECUTE_SCREENSHOT": {
       if (!tabId) throw new Error("No tabId provided");
-      
+
       try {
         await chrome.tabs.sendMessage(tabId, { type: "HIDE_FOR_TOOL_USE" }, { frameId: 0 });
       } catch (e) {}
       await new Promise(resolve => setTimeout(resolve, 50));
-      
+
       try {
         let result: { base64: string; width: number; height: number };
         let scaleInfo = { scaleX: 1, scaleY: 1 };
         let usedFallback = false;
-        
+
         if (message.fullpage) {
           result = await captureFullPage(tabId, message.maxHeight || 4000);
           try {
@@ -595,6 +874,16 @@ export async function handleMessage(
           } catch (cdpError) {
             const tab = await chrome.tabs.get(tabId);
             if (!tab.windowId) throw cdpError;
+            if (message.strictTarget) {
+              const [activeTab] = await chrome.tabs.query({ active: true, windowId: tab.windowId });
+              if (activeTab?.id !== tabId) {
+                throw new BrowserCommandError(
+                  "screenshot_target_not_visible",
+                  `Cannot use screenshot fallback because tab ${tabId} is not visible in window ${tab.windowId}`,
+                  { tabId, windowId: tab.windowId, activeTabId: activeTab?.id },
+                );
+              }
+            }
             const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: "png" });
             const base64 = dataUrl.replace(/^data:image\/png;base64,/, "");
             const binaryString = atob(base64);
@@ -609,19 +898,19 @@ export async function handleMessage(
             usedFallback = true;
           }
         }
-        
+
         if (message.annotate && !usedFallback) {
           try {
             const treeResult = await chrome.tabs.sendMessage(tabId, {
               type: "GET_ELEMENT_BOUNDS_FOR_ANNOTATION",
             }, { frameId: 0 });
-            
+
             if (treeResult?.elements && treeResult.elements.length > 0) {
               result = await annotateScreenshot(result, treeResult.elements, scaleInfo);
             }
           } catch {}
         }
-        
+
         const screenshotId = generateScreenshotId();
         cacheScreenshot(screenshotId, result);
         return { ...result, screenshotId };
@@ -691,7 +980,7 @@ export async function handleMessage(
     case "CLICK_TYPE": {
       if (!tabId) throw new Error("No tabId provided");
       if (!message.text) throw new Error("No text provided");
-      const clickTypeFrameId = getFrameIdForTab(tabId);
+      const clickTypeFrameId = getFrameIdForTab(tabId, message);
       let clicked = false;
       if (message.ref) {
         try {
@@ -723,7 +1012,7 @@ export async function handleMessage(
     case "CLICK_TYPE_SUBMIT": {
       if (!tabId) throw new Error("No tabId provided");
       if (!message.text) throw new Error("No text provided");
-      const clickTypeSubmitFrameId = getFrameIdForTab(tabId);
+      const clickTypeSubmitFrameId = getFrameIdForTab(tabId, message);
       let clicked = false;
       if (message.ref) {
         try {
@@ -790,7 +1079,7 @@ export async function handleMessage(
     case "AUTOCOMPLETE_SELECT": {
       if (!tabId) throw new Error("No tabId provided");
       if (!message.text) throw new Error("No text provided");
-      const autocompleteFrameId = getFrameIdForTab(tabId);
+      const autocompleteFrameId = getFrameIdForTab(tabId, message);
       let clicked = false;
       if (message.ref) {
         try {
@@ -823,10 +1112,10 @@ export async function handleMessage(
       const selector = message.selector;
       const ref = message.ref;
       if (!selector && !ref) throw new Error("selector or ref required");
-      
-      const script = ref 
+
+      const script = ref
         ? `(() => {
-            const el = document.querySelector('[data-pi-ref="${ref}"]') || 
+            const el = document.querySelector('[data-pi-ref="${ref}"]') ||
                        [...document.querySelectorAll('*')].find(e => e.getAttribute?.('data-ref') === '${ref}');
             if (!el) return { error: 'Element not found' };
             el.focus();
@@ -856,7 +1145,7 @@ export async function handleMessage(
             el.dispatchEvent(new Event('change', { bubbles: true }));
             return { success: true, contentEditable: isContentEditable };
           })()`;
-      
+
       const result = await cdp.evaluateScript(tabId, script);
       return result.result?.value || { error: "Script failed" };
     }
@@ -874,7 +1163,7 @@ export async function handleMessage(
           text,
           clear,
           submit,
-        }, { frameId: getFrameIdForTab(tabId) });
+        }, { frameId: getFrameIdForTab(tabId, message) });
       } catch (err) {
         throw new Error(`Could not type into selector: ${err instanceof Error ? err.message : String(err)}`);
       }
@@ -934,22 +1223,22 @@ export async function handleMessage(
       if (!tabId) throw new Error("No tabId provided");
       const deltaX = message.deltaX || 0;
       const deltaY = message.deltaY || 0;
-      
+
       const scrollScript = (dx: number, dy: number) => {
         const before = { x: window.scrollX, y: window.scrollY };
         window.scrollBy(dx, dy);
         const after = { x: window.scrollX, y: window.scrollY };
-        return { 
-          scrollX: after.x, 
+        return {
+          scrollX: after.x,
           scrollY: after.y,
           pageHeight: document.documentElement.scrollHeight,
           viewportHeight: window.innerHeight,
           scrolled: before.x !== after.x || before.y !== after.y
         };
       };
-      
+
       try {
-        const result = await cdp.evaluateScript(tabId, 
+        const result = await cdp.evaluateScript(tabId,
           `(${scrollScript.toString()})(${deltaX}, ${deltaY})`
         );
         return result.result?.value || { error: "Script failed" };
@@ -1014,12 +1303,12 @@ export async function handleMessage(
 
     case "READ_PAGE": {
       if (!tabId) throw new Error("No tabId provided");
-      const readFrameId = getFrameIdForTab(tabId);
+      const readFrameId = getFrameIdForTab(tabId, message);
       try {
         await chrome.tabs.sendMessage(tabId, { type: "HIDE_FOR_TOOL_USE" }, { frameId: 0 });
       } catch (e) {}
       await new Promise(resolve => setTimeout(resolve, 50));
-      
+
       let result;
       try {
         result = await chrome.tabs.sendMessage(tabId, {
@@ -1027,7 +1316,7 @@ export async function handleMessage(
           options: message.options || {},
         }, { frameId: readFrameId });
       } catch (err) {
-        return { 
+        return {
           error: "Content script not loaded. Try refreshing the page.",
           pageContent: "",
           viewport: { width: 0, height: 0 }
@@ -1037,7 +1326,7 @@ export async function handleMessage(
           await chrome.tabs.sendMessage(tabId, { type: "SHOW_AFTER_TOOL_USE" }, { frameId: 0 });
         } catch (e) {}
       }
-      
+
       // Include visible text content if requested
       if (message.options?.includeText) {
         try {
@@ -1055,7 +1344,7 @@ export async function handleMessage(
           // Ignore text extraction errors
         }
       }
-      
+
       if (message.options?.includeScreenshot) {
         try {
           const screenshot = await cdp.captureScreenshot(tabId);
@@ -1073,7 +1362,7 @@ export async function handleMessage(
         return await chrome.tabs.sendMessage(tabId, {
           type: "GET_ELEMENT_COORDINATES",
           ref: message.ref,
-        }, { frameId: getFrameIdForTab(tabId) });
+        }, { frameId: getFrameIdForTab(tabId, message) });
       } catch (err) {
         return { error: "Content script not loaded. Try refreshing the page." };
       }
@@ -1086,7 +1375,7 @@ export async function handleMessage(
           type: "FORM_INPUT",
           ref: message.ref,
           value: message.value,
-        }, { frameId: getFrameIdForTab(tabId) });
+        }, { frameId: getFrameIdForTab(tabId, message) });
       } catch (err) {
         return { error: "Content script not loaded. Try refreshing the page." };
       }
@@ -1099,7 +1388,7 @@ export async function handleMessage(
         return await chrome.tabs.sendMessage(tabId, {
           type: "EVAL_IN_PAGE",
           code: message.code,
-        }, { frameId: getFrameIdForTab(tabId) });
+        }, { frameId: getFrameIdForTab(tabId, message) });
       } catch (err) {
         return { error: "Content script not loaded. Try refreshing the page." };
       }
@@ -1111,7 +1400,7 @@ export async function handleMessage(
         return await chrome.tabs.sendMessage(tabId, {
           type: "SCROLL_TO_ELEMENT",
           ref: message.ref,
-        }, { frameId: getFrameIdForTab(tabId) });
+        }, { frameId: getFrameIdForTab(tabId, message) });
       } catch (err) {
         return { error: "Content script not loaded. Try refreshing the page." };
       }
@@ -1122,18 +1411,18 @@ export async function handleMessage(
       const position = message.position;
       if (position === undefined) throw new Error("position required (\"top\", \"bottom\", or number)");
       const selector = message.selector;
-      
+
       const scrollScript = (pos: string | number, sel: string | null) => {
         const findScrollable = (): Element => {
-          const candidates = [...document.querySelectorAll("*")].filter(el => 
+          const candidates = [...document.querySelectorAll("*")].filter(el =>
             el.scrollHeight > el.clientHeight && el.clientHeight > 200
           ).sort((a,b) => b.scrollHeight - a.scrollHeight);
           return candidates[0] || document.documentElement;
         };
-        
+
         const container = sel ? document.querySelector(sel) || findScrollable() : findScrollable();
         if (!container) return { error: "No scrollable container found" };
-        
+
         if (pos === "bottom") {
           container.scrollTop = container.scrollHeight;
         } else if (pos === "top") {
@@ -1141,8 +1430,8 @@ export async function handleMessage(
         } else if (typeof pos === "number") {
           container.scrollTop = pos;
         }
-        
-        return { 
+
+        return {
           scrollTop: container.scrollTop,
           scrollHeight: container.scrollHeight,
           clientHeight: container.clientHeight,
@@ -1150,7 +1439,7 @@ export async function handleMessage(
           atTop: container.scrollTop < 10
         };
       };
-      
+
       try {
         const script = `(${scrollScript.toString()})(${JSON.stringify(position)}, ${JSON.stringify(selector)})`;
         const result = await cdp.evaluateScript(tabId, script);
@@ -1172,20 +1461,20 @@ export async function handleMessage(
     case "GET_SCROLL_INFO": {
       if (!tabId) throw new Error("No tabId provided");
       const selector = message.selector;
-      
+
       const scrollInfoScript = (sel: string | null) => {
         const findScrollable = (): Element => {
-          const candidates = [...document.querySelectorAll("*")].filter(el => 
+          const candidates = [...document.querySelectorAll("*")].filter(el =>
             el.scrollHeight > el.clientHeight && el.clientHeight > 200
           ).sort((a,b) => b.scrollHeight - a.scrollHeight);
           return candidates[0] || document.documentElement;
         };
-        
+
         const container = sel ? document.querySelector(sel) || findScrollable() : findScrollable();
         if (!container) return { error: "No scrollable container found" };
-        
+
         const maxScroll = container.scrollHeight - container.clientHeight;
-        return { 
+        return {
           scrollTop: container.scrollTop,
           scrollHeight: container.scrollHeight,
           clientHeight: container.clientHeight,
@@ -1194,7 +1483,7 @@ export async function handleMessage(
           scrollPercentage: maxScroll > 0 ? Math.round((container.scrollTop / maxScroll) * 100) : 100
         };
       };
-      
+
       try {
         const script = `(${scrollInfoScript.toString()})(${JSON.stringify(selector)})`;
         const result = await cdp.evaluateScript(tabId, script);
@@ -1216,17 +1505,42 @@ export async function handleMessage(
     case "GET_PAGE_TEXT": {
       if (!tabId) throw new Error("No tabId provided");
       try {
-        return await chrome.tabs.sendMessage(tabId, { type: "GET_PAGE_TEXT" }, { frameId: getFrameIdForTab(tabId) });
+        return await chrome.tabs.sendMessage(tabId, { type: "GET_PAGE_TEXT" }, { frameId: getFrameIdForTab(tabId, message) });
       } catch (err) {
         return { error: "Content script not loaded. Try refreshing the page." };
       }
     }
 
+    case "GET_PAGE_HTML": {
+      if (!tabId) throw new Error("No tabId provided");
+      const results = await chrome.scripting.executeScript({
+        target: { tabId, frameIds: [getFrameIdForTab(tabId, message)] },
+        func: (selector?: unknown, stripScripts?: boolean) => {
+          if (selector !== undefined && (typeof selector !== "string" || selector.length === 0)) {
+            throw new Error("selector must be a non-empty string");
+          }
+          const root = selector === undefined ? document.documentElement : document.querySelector(selector);
+          if (!root) throw new Error(`No element matches selector "${selector}"`);
+          const exportRoot = stripScripts ? root.cloneNode(true) as Element : root;
+          if (stripScripts) {
+            if (exportRoot.matches("script")) return "";
+            exportRoot.querySelectorAll("script").forEach((script) => script.remove());
+          }
+          const doctype = selector === undefined && document.doctype ? `<!doctype ${document.doctype.name}>\n` : "";
+          return doctype + exportRoot.outerHTML;
+        },
+        args: [message.selector, message.stripScripts],
+      });
+      const html = results[0]?.result;
+      if (typeof html !== "string") throw new Error("Page HTML extraction returned an invalid result");
+      return { html };
+    }
+
     case "LOCATE_ROLE": {
       if (!tabId) throw new Error("No tabId provided");
       if (!message.role) throw new Error("role required");
-      const locateFrameId = getFrameIdForTab(tabId);
-      
+      const locateFrameId = getFrameIdForTab(tabId, message);
+
       try {
         const result = await chrome.tabs.sendMessage(tabId, {
           type: "LOCATE_ROLE",
@@ -1234,14 +1548,14 @@ export async function handleMessage(
           name: message.name,
           all: message.all,
         }, { frameId: locateFrameId });
-        
+
         if (result.error) return result;
-        
+
         // Perform action if specified
         if (message.action && result.ref) {
           return await performLocateAction(tabId, result.ref, message.action, message.value, cdp, locateFrameId);
         }
-        
+
         return result;
       } catch (err) {
         return { error: "Content script not loaded. Try refreshing the page." };
@@ -1251,22 +1565,22 @@ export async function handleMessage(
     case "LOCATE_TEXT": {
       if (!tabId) throw new Error("No tabId provided");
       if (!message.text) throw new Error("text required");
-      const textFrameId = getFrameIdForTab(tabId);
-      
+      const textFrameId = getFrameIdForTab(tabId, message);
+
       try {
         const result = await chrome.tabs.sendMessage(tabId, {
           type: "LOCATE_TEXT",
           text: message.text,
           exact: message.exact,
         }, { frameId: textFrameId });
-        
+
         if (result.error) return result;
-        
+
         // Perform action if specified
         if (message.action && result.ref) {
           return await performLocateAction(tabId, result.ref, message.action, message.value, cdp, textFrameId);
         }
-        
+
         return result;
       } catch (err) {
         return { error: "Content script not loaded. Try refreshing the page." };
@@ -1276,21 +1590,21 @@ export async function handleMessage(
     case "LOCATE_LABEL": {
       if (!tabId) throw new Error("No tabId provided");
       if (!message.label) throw new Error("label required");
-      const labelFrameId = getFrameIdForTab(tabId);
-      
+      const labelFrameId = getFrameIdForTab(tabId, message);
+
       try {
         const result = await chrome.tabs.sendMessage(tabId, {
           type: "LOCATE_LABEL",
           label: message.label,
         }, { frameId: labelFrameId });
-        
+
         if (result.error) return result;
-        
+
         // Perform action if specified
         if (message.action && result.ref) {
           return await performLocateAction(tabId, result.ref, message.action, message.value, cdp, labelFrameId);
         }
-        
+
         return result;
       } catch (err) {
         return { error: "Content script not loaded. Try refreshing the page." };
@@ -1300,14 +1614,14 @@ export async function handleMessage(
     case "GET_ELEMENT_STYLES": {
       if (!tabId) throw new Error("No tabId provided");
       if (!message.selector) throw new Error("selector required");
-      const stylesFrameId = getFrameIdForTab(tabId);
-      
+      const stylesFrameId = getFrameIdForTab(tabId, message);
+
       try {
         const result = await chrome.tabs.sendMessage(tabId, {
           type: "GET_ELEMENT_STYLES",
           selector: message.selector,
         }, { frameId: stylesFrameId });
-        
+
         return result;
       } catch (err) {
         return { error: "Content script not loaded. Try refreshing the page." };
@@ -1318,8 +1632,8 @@ export async function handleMessage(
       if (!tabId) throw new Error("No tabId provided");
       if (!message.selector) throw new Error("selector required");
       if (!message.values) throw new Error("values required");
-      const selectFrameId = getFrameIdForTab(tabId);
-      
+      const selectFrameId = getFrameIdForTab(tabId, message);
+
       try {
         const result = await chrome.tabs.sendMessage(tabId, {
           type: "SELECT_OPTION",
@@ -1327,7 +1641,7 @@ export async function handleMessage(
           values: message.values,
           by: message.by || "value",
         }, { frameId: selectFrameId });
-        
+
         return result;
       } catch (err) {
         return { error: "Content script not loaded. Try refreshing the page." };
@@ -1349,13 +1663,13 @@ export async function handleMessage(
     case "STOP_AGENT": {
       const fromTabId = message.fromTabId;
       let targetTabId: number | undefined;
-      
+
       if (fromTabId === "CURRENT_TAB" && sender.tab?.id) {
         targetTabId = sender.tab.id;
       } else if (typeof fromTabId === "number") {
         targetTabId = fromTabId;
       }
-      
+
       if (targetTabId) {
         chrome.runtime.sendMessage({ type: "STOP_AGENT", targetTabId });
       }
@@ -1377,7 +1691,7 @@ export async function handleMessage(
           type: "CLICK_ELEMENT",
           ref: message.ref,
           button: message.button || "left",
-        }, { frameId: getFrameIdForTab(tabId) });
+        }, { frameId: getFrameIdForTab(tabId, message) });
         if (result.error) return { error: result.error };
         return { success: true };
       } catch (err) {
@@ -1391,7 +1705,7 @@ export async function handleMessage(
         const coords = await chrome.tabs.sendMessage(tabId, {
           type: "GET_ELEMENT_COORDINATES",
           ref: message.ref,
-        }, { frameId: getFrameIdForTab(tabId) });
+        }, { frameId: getFrameIdForTab(tabId, message) });
         if (coords.error) return { error: coords.error };
         await cdp.hover(tabId, coords.x, coords.y);
         return { success: true };
@@ -1425,10 +1739,10 @@ export async function handleMessage(
         }
         await new Promise((r) => setTimeout(r, pollInterval));
       }
-      return { 
-        error: `Timeout waiting for ${message.url} to return ${expect}`, 
+      return {
+        error: `Timeout waiting for ${message.url} to return ${expect}`,
         lastError,
-        time: Date.now() - startTime 
+        time: Date.now() - startTime
       };
     }
 
@@ -1436,7 +1750,7 @@ export async function handleMessage(
       const urls: string[] = message.urls || [];
       const captureScreenshots: boolean = message.savePath !== undefined;
       const failFast: boolean = message.failFast || false;
-      
+
       if (urls.length === 0) {
         return { error: "No URLs provided for smoke test" };
       }
@@ -1545,13 +1859,13 @@ export async function handleMessage(
     case "WAIT_FOR_ELEMENT": {
       if (!tabId) throw new Error("No tabId provided");
       if (!message.selector) throw new Error("No selector provided");
-      const waitFrameId = getFrameIdForTab(tabId);
-      
+      const waitFrameId = getFrameIdForTab(tabId, message);
+
       try {
         await chrome.tabs.sendMessage(tabId, { type: "HIDE_FOR_TOOL_USE" }, { frameId: 0 });
       } catch (e) {}
       await new Promise(resolve => setTimeout(resolve, 50));
-      
+
       try {
         const result = await chrome.tabs.sendMessage(tabId, {
           type: "WAIT_FOR_ELEMENT",
@@ -1561,7 +1875,7 @@ export async function handleMessage(
         }, { frameId: waitFrameId });
         return result;
       } catch (err) {
-        return { 
+        return {
           error: "Content script not loaded. Try refreshing the page.",
           pageContent: "",
           viewport: { width: 0, height: 0 }
@@ -1576,12 +1890,12 @@ export async function handleMessage(
     case "WAIT_FOR_URL": {
       if (!tabId) throw new Error("No tabId provided");
       if (!message.pattern) throw new Error("No URL pattern provided");
-      
+
       try {
         await chrome.tabs.sendMessage(tabId, { type: "HIDE_FOR_TOOL_USE" }, { frameId: 0 });
       } catch (e) {}
       await new Promise(resolve => setTimeout(resolve, 50));
-      
+
       try {
         const result = await chrome.tabs.sendMessage(tabId, {
           type: "WAIT_FOR_URL",
@@ -1590,7 +1904,7 @@ export async function handleMessage(
         }, { frameId: 0 });
         return result;
       } catch (err) {
-        return { 
+        return {
           error: "Content script not loaded. Try refreshing the page.",
           pageContent: "",
           viewport: { width: 0, height: 0 }
@@ -1604,12 +1918,12 @@ export async function handleMessage(
 
     case "WAIT_FOR_NETWORK_IDLE": {
       if (!tabId) throw new Error("No tabId provided");
-      
+
       try {
         await chrome.tabs.sendMessage(tabId, { type: "HIDE_FOR_TOOL_USE" }, { frameId: 0 });
       } catch (e) {}
       await new Promise(resolve => setTimeout(resolve, 50));
-      
+
       try {
         const result = await chrome.tabs.sendMessage(tabId, {
           type: "WAIT_FOR_NETWORK_IDLE",
@@ -1617,7 +1931,7 @@ export async function handleMessage(
         }, { frameId: 0 });
         return result;
       } catch (err) {
-        return { 
+        return {
           error: "Content script not loaded. Try refreshing the page.",
           pageContent: "",
           viewport: { width: 0, height: 0 }
@@ -1631,12 +1945,12 @@ export async function handleMessage(
 
     case "WAIT_FOR_DOM_STABLE": {
       if (!tabId) throw new Error("No tabId provided");
-      
+
       try {
         await chrome.tabs.sendMessage(tabId, { type: "HIDE_FOR_TOOL_USE" }, { frameId: 0 });
       } catch (e) {}
       await new Promise(resolve => setTimeout(resolve, 50));
-      
+
       try {
         const result = await chrome.tabs.sendMessage(tabId, {
           type: "WAIT_FOR_DOM_STABLE",
@@ -1645,7 +1959,7 @@ export async function handleMessage(
         }, { frameId: 0 });
         return result;
       } catch (err) {
-        return { 
+        return {
           error: "Content script not loaded. Try refreshing the page.",
           pageContent: "",
           viewport: { width: 0, height: 0 }
@@ -1729,14 +2043,14 @@ export async function handleMessage(
     case "EMULATE_DEVICE": {
       if (!tabId) throw new Error("No tabId provided");
       const deviceName = message.device;
-      
+
       // Handle reset
       if (deviceName.toLowerCase() === "reset") {
         const result = await cdp.clearDeviceEmulation(tabId);
         if (!result.success) throw new Error(result.error);
         return { success: true, message: "Device emulation reset" };
       }
-      
+
       // Device presets (synced with device-presets.cjs)
       const presets: Record<string, { width: number; height: number; deviceScaleFactor: number; mobile: boolean; touch: boolean; userAgent: string }> = {
         // Apple devices
@@ -1763,18 +2077,36 @@ export async function handleMessage(
         "Nest Hub": { width: 1024, height: 600, deviceScaleFactor: 2, mobile: false, touch: true, userAgent: "Mozilla/5.0 (Linux; Android) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/88.0.4324.109 Safari/537.36 CrKey/1.54.248666" },
         "Nest Hub Max": { width: 1280, height: 800, deviceScaleFactor: 2, mobile: false, touch: true, userAgent: "Mozilla/5.0 (Linux; Android) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/88.0.4324.109 Safari/537.36 CrKey/1.54.248666" },
       };
-      
+
       // Find matching device (case-insensitive partial match, prefer longest match)
       type DevicePreset = { width: number; height: number; deviceScaleFactor: number; mobile: boolean; touch: boolean; userAgent: string };
+      const aliases: Record<string, string> = {
+        iphone: "iPhone 14",
+        iphone14: "iPhone 14",
+        iphone13: "iPhone 13",
+        iphone12: "iPhone 12",
+        iphonese: "iPhone SE",
+        pixel: "Pixel 7",
+        pixel7: "Pixel 7",
+        pixel6: "Pixel 6",
+        galaxy: "Galaxy S23",
+        galaxys23: "Galaxy S23",
+        ipad: "iPad",
+        ipadpro: "iPad Pro",
+      };
       let device: DevicePreset | undefined = presets[deviceName];
       if (!device) {
         const lowerName = deviceName.toLowerCase();
+        device = presets[aliases[lowerName.replace(/\s+/g, "")]];
+      }
+      if (!device) {
+        const lowerName = deviceName.toLowerCase();
         let bestMatch: { name: string; preset: DevicePreset } | null = null;
-        
+
         for (const [name, preset] of Object.entries(presets)) {
           const presetLower = name.toLowerCase();
           const presetNoSpaces = presetLower.replace(/\s+/g, "");
-          
+
           // Check if it's a match
           if (presetLower.includes(lowerName) || lowerName.includes(presetNoSpaces)) {
             // Prefer longer matches (more specific devices)
@@ -1783,16 +2115,16 @@ export async function handleMessage(
             }
           }
         }
-        
+
         if (bestMatch) {
           device = bestMatch.preset;
         }
       }
-      
+
       if (!device) {
         throw new Error(`Unknown device: ${deviceName}. Use --list to see available devices.`);
       }
-      
+
       const result = await cdp.emulateDevice(tabId, device);
       if (!result.success) throw new Error(result.error);
       return { success: true, device: deviceName };
@@ -1826,7 +2158,7 @@ export async function handleMessage(
       const response = await chrome.tabs.sendMessage(tabId, {
         type: "FORM_FILL",
         data: message.data,
-      }, { frameId: getFrameIdForTab(tabId) });
+      }, { frameId: getFrameIdForTab(tabId, message) });
       return response;
     }
 
@@ -1858,7 +2190,7 @@ export async function handleMessage(
       const selectorResult = await chrome.tabs.sendMessage(tabId, {
         type: "GET_FILE_INPUT_SELECTOR",
         ref: message.ref,
-      }, { frameId: getFrameIdForTab(tabId) });
+      }, { frameId: getFrameIdForTab(tabId, message) });
       if (selectorResult.error) throw new Error(selectorResult.error);
       const setResult = await cdp.setFileInputBySelector(tabId, selectorResult.selector, message.files);
       if (!setResult.success) throw new Error(setResult.error);
@@ -1882,26 +2214,26 @@ export async function handleMessage(
     case "FRAME_SWITCH": {
       if (!tabId) throw new Error("No tabId provided");
       const { selector, name, index } = message;
-      
+
       if (!selector && !name && index === undefined) {
         throw new Error("--selector, --name, or --index required");
       }
-      
+
       // Get all frames using Chrome's webNavigation API (gives us correct frameIds for messaging)
       const chromeFrames = await chrome.webNavigation.getAllFrames({ tabId });
       if (!chromeFrames || chromeFrames.length === 0) {
         throw new Error("No frames found in tab");
       }
-      
+
       // Filter to child frames only (frameId !== 0)
       const childFrames = chromeFrames.filter(f => f.frameId !== 0);
-      
+
       if (childFrames.length === 0) {
         throw new Error("No iframes found on this page");
       }
-      
+
       let targetFrame: chrome.webNavigation.GetAllFrameResultDetails | null = null;
-      
+
       if (index !== undefined) {
         if (index < 0 || index >= childFrames.length) {
           throw new Error(`Frame index ${index} out of range. Found ${childFrames.length} frame(s).`);
@@ -1932,14 +2264,14 @@ export async function handleMessage(
             type: "GET_FRAME_BY_SELECTOR",
             selector,
           }, { frameId: 0 });
-          
+
           if (selectorResult?.error) throw new Error(selectorResult.error);
-          
+
           // Match by URL since that's what we can reliably get
           if (selectorResult?.url) {
             targetFrame = childFrames.find(f => f.url === selectorResult.url) || null;
           }
-          
+
           // If no URL match and only one child frame, use it
           if (!targetFrame && childFrames.length === 1) {
             targetFrame = childFrames[0];
@@ -1948,16 +2280,13 @@ export async function handleMessage(
           throw new Error(`Could not find frame with selector "${selector}"`);
         }
       }
-      
+
       if (!targetFrame) {
         throw new Error("Frame not found");
       }
-      
-      // Store the Chrome extension frameId (integer) for this tab
-      frameContexts.set(tabId, targetFrame.frameId);
-      
-      return { 
-        success: true, 
+
+      return {
+        success: true,
         frameId: targetFrame.frameId,
         url: targetFrame.url,
       };
@@ -1965,10 +2294,9 @@ export async function handleMessage(
 
     case "FRAME_MAIN": {
       if (!tabId) throw new Error("No tabId provided");
-      
+
       // Clear frame context - go back to main frame (frameId 0)
-      frameContexts.delete(tabId);
-      
+
       return { success: true, message: "Returned to main frame" };
     }
 
@@ -1988,7 +2316,7 @@ export async function handleMessage(
       try {
         const piHelpersCode = `if(!window.piHelpers){const piHelpers={wait(ms){return new Promise(r=>setTimeout(r,ms))},async waitForSelector(sel,opts={}){const{state='visible',timeout=20000}=opts;const isVis=el=>el&&getComputedStyle(el).display!=='none'&&getComputedStyle(el).visibility!=='hidden'&&getComputedStyle(el).opacity!=='0'&&el.offsetWidth>0&&el.offsetHeight>0;const chk=()=>{const el=document.querySelector(sel);switch(state){case'attached':return el;case'detached':return el?null:document.body;case'hidden':return(!el||!isVis(el))?(el||document.body):null;default:return isVis(el)?el:null}};return new Promise((res,rej)=>{const r=chk();if(r){res(state==='detached'||state==='hidden'?null:r);return}const obs=new MutationObserver(()=>{const r=chk();if(r){obs.disconnect();clearTimeout(tid);res(state==='detached'||state==='hidden'?null:r)}});const tid=setTimeout(()=>{obs.disconnect();rej(new Error('Timeout'))},timeout);obs.observe(document.documentElement,{childList:true,subtree:true,attributes:true,attributeFilter:['style','class','hidden']})})},async waitForText(text,opts={}){const{selector,timeout=20000}=opts;const chk=()=>{const root=selector?document.querySelector(selector):document.body;if(!root)return null;const w=document.createTreeWalker(root,NodeFilter.SHOW_TEXT);while(w.nextNode())if(w.currentNode.textContent?.includes(text))return w.currentNode.parentElement;return null};return new Promise((res,rej)=>{const r=chk();if(r){res(r);return}const obs=new MutationObserver(()=>{const r=chk();if(r){obs.disconnect();clearTimeout(tid);res(r)}});const tid=setTimeout(()=>{obs.disconnect();rej(new Error('Timeout'))},timeout);obs.observe(document.documentElement,{childList:true,subtree:true,characterData:true})})},async waitForHidden(sel,t=20000){await piHelpers.waitForSelector(sel,{state:'hidden',timeout:t})},getByRole(role,opts={}){const{name}=opts;const roles={button:['button','input[type=button]','input[type=submit]','input[type=reset]'],link:['a[href]'],textbox:['input:not([type])','input[type=text]','input[type=email]','input[type=password]','textarea'],checkbox:['input[type=checkbox]'],radio:['input[type=radio]'],combobox:['select'],heading:['h1','h2','h3','h4','h5','h6']};const cands=[...document.querySelectorAll('[role='+role+']')];if(roles[role])roles[role].forEach(s=>cands.push(...document.querySelectorAll(s+':not([role])')));if(!name)return cands[0]||null;const n=name.toLowerCase().trim();for(const el of cands){const l=el.getAttribute('aria-label')?.toLowerCase().trim();const t=el.textContent?.toLowerCase().trim();if(l===n||t===n||l?.includes(n)||t?.includes(n))return el}return null}};window.__piHelpers=piHelpers;window.piHelpers=piHelpers}`;
         await cdp.evaluateScript(tabId, piHelpersCode);
-        
+
         const body = codeWithExpressionReturn(message.code);
         const expression = `(async () => { 'use strict'; ${body} })()`;
 
@@ -1999,12 +2327,12 @@ export async function handleMessage(
         }
 
         if (result.exceptionDetails) {
-          const err = result.exceptionDetails.exception?.description || 
-                      result.exceptionDetails.text || 
+          const err = result.exceptionDetails.exception?.description ||
+                      result.exceptionDetails.text ||
                       "Script execution failed";
           return { error: err };
         }
-        
+
         const value = result.result?.value;
         const output = value === undefined ? "undefined" : JSON.stringify(value, null, 2);
         return { output: output?.substring(0, 50000) || "undefined" };
@@ -2348,19 +2676,134 @@ export async function handleMessage(
       return { success: true };
     }
 
+    case "START_NETWORK_CAPTURE": {
+      if (!tabId) throw new Error("No tabId provided");
+      cdp.clearNetworkRequests(tabId);
+      await cdp.enableNetworkTracking(tabId, {
+        bodyMode: message.bodyMode || "text",
+        perBodyBytes: message.perBodyBytes,
+        totalBytes: message.totalBodyBytes,
+      });
+      return { success: true };
+    }
+
+    case "STOP_NETWORK_CAPTURE": {
+      if (!tabId) throw new Error("No tabId provided");
+      await cdp.disableNetworkTracking(tabId);
+      return { success: true };
+    }
+
+    case "VIDEO_START": {
+      if (!tabId) throw new Error("No tabId provided");
+      const recorderId = String(message.recorderId || "");
+      if (!recorderId) throw new Error("VIDEO_START requires recorderId");
+      if (activeVideoRecorder) throw new Error("A video recording is already active");
+      const fps = Number(message.fps);
+      if (!Number.isFinite(fps) || fps <= 0 || fps > 60) throw new Error("fps must be a number between 1 and 60");
+
+      const onError = (error: Error) => {
+        // Keep the active recorder until native fail-closed cleanup sends
+        // VIDEO_STOP, so Page.stopScreencast can still reach Chrome.
+        postToNativeHost({
+          type: "VIDEO_ERROR",
+          recorderId,
+          tabId,
+          errorCode: (error as Error & { code?: string }).code || "video_screencast_failed",
+          error: error.message,
+        });
+      };
+      cdp.subscribeToScreencast(tabId, recorderId, (event) => {
+        postToNativeHost({
+          type: "VIDEO_FRAME",
+          recorderId,
+          tabId,
+          data: event.data,
+          metadata: event.metadata,
+          sessionId: event.sessionId,
+          receivedAt: Date.now(),
+        });
+      }, onError);
+      activeVideoRecorder = { recorderId, tabId };
+      try {
+        await cdp.startScreencast(tabId, {
+          format: "jpeg",
+          quality: Number.isFinite(Number(message.quality)) ? Number(message.quality) : 80,
+          everyNthFrame: Number.isFinite(Number(message.everyNthFrame)) ? Number(message.everyNthFrame) : 1,
+        });
+        if (activeVideoRecorder?.recorderId !== recorderId) throw new Error("Video screencast stopped while starting");
+        return { success: true, recording: true, recorderId, tabId, fps };
+      } catch (error) {
+        if (activeVideoRecorder?.recorderId === recorderId) activeVideoRecorder = null;
+        cdp.unsubscribeFromScreencast(tabId, recorderId);
+        throw error;
+      }
+    }
+
+    case "VIDEO_STOP": {
+      const recorderId = message.recorderId ? String(message.recorderId) : undefined;
+      let active = activeVideoRecorder;
+      if (recorderId && active?.recorderId !== recorderId) active = null;
+      if (!recorderId && active?.tabId !== tabId) active = null;
+      if (!active) return { success: true, stopped: false };
+      let stopError: unknown;
+      try {
+        await cdp.stopScreencast(active.tabId);
+      } catch (error) {
+        stopError = error;
+      } finally {
+        if (activeVideoRecorder?.recorderId === active.recorderId) activeVideoRecorder = null;
+        cdp.unsubscribeFromScreencast(active.tabId, active.recorderId);
+      }
+      if (stopError) throw stopError;
+      return { success: true, stopped: true, recorderId: active.recorderId, tabId: active.tabId };
+    }
+
+    case "GET_PLAYBOOK_RECORD_CONTEXT": {
+      if (!tabId) throw new Error("No tabId provided");
+      const tab = await chrome.tabs.get(tabId);
+      let origin: string | undefined;
+      try {
+        if (tab.url) {
+          const parsed = new URL(tab.url);
+          if (parsed.protocol === "http:" || parsed.protocol === "https:") origin = parsed.origin;
+        }
+      } catch {}
+      return { success: true, origin, url: tab.url };
+    }
+
+    case "START_PLAYBOOK_WATCH": {
+      if (!tabId) throw new Error("No tabId provided");
+      await chrome.tabs.sendMessage(tabId, { type: "PLAYBOOK_WATCH_START", includeInputValues: message.includeInputValues === true }, { frameId: 0 });
+      return { success: true };
+    }
+
+    case "STOP_PLAYBOOK_WATCH": {
+      if (!tabId) throw new Error("No tabId provided");
+      await chrome.tabs.sendMessage(tabId, { type: "PLAYBOOK_WATCH_STOP" }, { frameId: 0 }).catch(() => {});
+      return { success: true };
+    }
+
+    case "PLAYBOOK_WATCH_EVENT": {
+      postToNativeHost({ ...message, tabId: sender.tab?.id, type: "PLAYBOOK_WATCH_EVENT" });
+      return { success: true };
+    }
+
     case "READ_NETWORK_REQUESTS": {
       if (!tabId) throw new Error("No tabId provided");
 
       try {
-        await cdp.enableNetworkTracking(tabId);
+        if (message.bodyMode !== undefined || message.perBodyBytes !== undefined || message.totalBodyBytes !== undefined) {
+          await cdp.enableNetworkTracking(tabId, { bodyMode: message.bodyMode, perBodyBytes: message.perBodyBytes, totalBytes: message.totalBodyBytes });
+        } else await cdp.enableNetworkTracking(tabId);
       } catch (e) {}
+      await cdp.drainNetworkEvents(tabId);
 
       // If full flag is passed, use getNetworkEntries for rich data
       if (message.full) {
         let entries = cdp.getNetworkEntries(tabId, {
           urlPattern: message.urlPattern,
         });
-        
+
         // Apply filters
         if (message.method) {
           entries = entries.filter(e => e.method === message.method);
@@ -2371,14 +2814,14 @@ export async function handleMessage(
         if (message.contentType) {
           entries = entries.filter(e => e.type === message.contentType);
         }
-        
+
         if (message.clear) {
           cdp.clearNetworkRequests(tabId);
         }
-        
+
         // Return entries sliced to limit
         const limit = message.limit || 100;
-        return { 
+        return {
           entries: entries.slice(0, limit),
           format: message.format,
           verbose: message.verbose
@@ -2405,7 +2848,7 @@ export async function handleMessage(
         cdp.clearNetworkRequests(tabId);
       }
 
-      return { 
+      return {
         requests,
         format: message.format,
         verbose: message.verbose
@@ -2416,8 +2859,11 @@ export async function handleMessage(
       if (!tabId) throw new Error("No tabId provided");
       if (message.har && message.jsonl) throw new Error("network export cannot combine HAR and JSONL");
       try {
-        await cdp.enableNetworkTracking(tabId);
+        if (message.bodyMode !== undefined || message.perBodyBytes !== undefined || message.totalBodyBytes !== undefined) {
+          await cdp.enableNetworkTracking(tabId, { bodyMode: message.bodyMode, perBodyBytes: message.perBodyBytes, totalBytes: message.totalBodyBytes });
+        } else await cdp.enableNetworkTracking(tabId);
       } catch (e) {}
+      await cdp.drainNetworkEvents(tabId);
       const entries = cdp.getNetworkEntries(tabId, {});
       const serializedSize = new TextEncoder().encode(JSON.stringify(entries)).byteLength;
       if (serializedSize > 16 * 1024 * 1024) {
@@ -2434,16 +2880,17 @@ export async function handleMessage(
 
     case "GET_NETWORK_ENTRIES": {
       if (!tabId) throw new Error("No tabId provided");
-      
+
       try {
         await cdp.enableNetworkTracking(tabId);
       } catch (e) {}
-      
+      await cdp.drainNetworkEvents(tabId);
+
       let entries = cdp.getNetworkEntries(tabId, {
         urlPattern: message.urlPattern,
         includeStatic: !message.excludeStatic,
       });
-      
+
       // Apply additional filters
       if (message.origin) {
         entries = entries.filter(e => e.origin === message.origin);
@@ -2466,33 +2913,34 @@ export async function handleMessage(
       if (message.last) {
         entries = entries.slice(-message.last);
       }
-      
+
       if (message.clear) {
         cdp.clearNetworkRequests(tabId);
       }
-      
+
       return { entries };
     }
 
     case "GET_NETWORK_ENTRY": {
       if (!tabId) throw new Error("No tabId provided");
       if (!message.requestId) throw new Error("No requestId provided");
-      
+      await cdp.drainNetworkEvents(tabId);
+
       // First try direct lookup by CDP requestId
       let entry = cdp.getNetworkEntry(tabId, message.requestId);
-      
+
       // If not found, try lookup by entry.id (r_xxx format)
       if (!entry) {
         const entries = cdp.getNetworkEntries(tabId, {});
         entry = entries.find(e => e.id === message.requestId) || null;
       }
-      
+
       // Also try lookup by _requestId for entries that use the generated id
       if (!entry) {
         const entries = cdp.getNetworkEntries(tabId, {});
         entry = entries.find(e => e._requestId === message.requestId) || null;
       }
-      
+
       if (!entry) {
         return { error: `Entry not found: ${message.requestId}` };
       }
@@ -2502,7 +2950,8 @@ export async function handleMessage(
     case "GET_RESPONSE_BODY": {
       if (!tabId) throw new Error("No tabId provided");
       if (!message.requestId) throw new Error("No requestId provided");
-      
+      await cdp.drainNetworkEvents(tabId);
+
       // If requestId looks like entry.id format (r_xxx), look up the CDP requestId
       let cdpRequestId = message.requestId;
       if (message.requestId.startsWith('r_')) {
@@ -2512,17 +2961,18 @@ export async function handleMessage(
           cdpRequestId = entry._requestId;
         }
       }
-      
+
       const result = await cdp.getResponseBody(tabId, cdpRequestId);
       return result;
     }
 
     case "GET_NETWORK_ORIGINS": {
       if (!tabId) throw new Error("No tabId provided");
-      
+      await cdp.drainNetworkEvents(tabId);
+
       const entries = cdp.getNetworkEntries(tabId, {});
       const origins: Record<string, { count: number; lastSeen: number; size: number }> = {};
-      
+
       for (const entry of entries) {
         if (!origins[entry.origin]) {
           origins[entry.origin] = { count: 0, lastSeen: 0, size: 0 };
@@ -2531,13 +2981,14 @@ export async function handleMessage(
         origins[entry.origin].lastSeen = Math.max(origins[entry.origin].lastSeen, entry.ts);
         origins[entry.origin].size += (entry.responseBodySize || 0);
       }
-      
+
       return { origins };
     }
 
     case "GET_NETWORK_STATS": {
       if (!tabId) throw new Error("No tabId provided");
-      
+      await cdp.drainNetworkEvents(tabId);
+
       const entries = cdp.getNetworkEntries(tabId, {});
       const origins: Record<string, number> = {};
       const byMethod: Record<string, number> = {};
@@ -2545,32 +2996,32 @@ export async function handleMessage(
       let totalSize = 0;
       let oldestEntry = Infinity;
       let newestEntry = 0;
-      
+
       for (const entry of entries) {
         // Count by origin
         if (!origins[entry.origin]) {
           origins[entry.origin] = 0;
         }
         origins[entry.origin]++;
-        
+
         // Count by method
         const method = entry.method || 'GET';
         byMethod[method] = (byMethod[method] || 0) + 1;
-        
+
         // Count by status
         if (entry.status) {
           const statusGroup = `${Math.floor(entry.status / 100)}xx`;
           byStatus[statusGroup] = (byStatus[statusGroup] || 0) + 1;
         }
-        
+
         // Sum size
         totalSize += (entry.responseBodySize || 0);
-        
+
         // Track time range
         if (entry.ts < oldestEntry) oldestEntry = entry.ts;
         if (entry.ts > newestEntry) newestEntry = entry.ts;
       }
-      
+
       return {
         stats: {
           totalRequests: entries.length,
@@ -2624,10 +3075,10 @@ export async function handleMessage(
         await chrome.tabs.group({ tabIds: newTab.id, groupId: activeTab.groupId });
       }
 
-      return { 
-        success: true, 
-        tabId: newTab.id, 
-        url: newTab.url || message.url || "about:blank" 
+      return {
+        success: true,
+        tabId: newTab.id,
+        url: newTab.url || message.url || "about:blank"
       };
     }
 
@@ -2646,7 +3097,7 @@ export async function handleMessage(
           ref: message.ref,
           coordinate: message.coordinate,
           filename: message.filename || "screenshot.png",
-        }, { frameId: getFrameIdForTab(tabId) });
+        }, { frameId: getFrameIdForTab(tabId, message) });
 
         return result;
       } catch (err) {
@@ -2850,9 +3301,9 @@ export async function handleMessage(
         const result = await sendToNativeHost({ type: "GET_AUTH" });
         return result;
       } catch (err) {
-        return { 
-          auth: null, 
-          hint: "Native host not connected. Make sure surf native host is installed." 
+        return {
+          auth: null,
+          hint: "Native host not connected. Make sure surf native host is installed."
         };
       }
     }
@@ -2945,7 +3396,7 @@ export async function handleMessage(
     case "STREAM_STOP": {
       const streamId = message.streamId;
       const streamTabId = activeStreamTabs.get(streamId);
-      
+
       if (streamTabId !== undefined) {
         cdp.unsubscribeFromConsole(streamTabId, streamId);
         cdp.unsubscribeFromNetwork(streamTabId, streamId);
@@ -2964,7 +3415,7 @@ export async function handleMessage(
           term: message.term,
           caseSensitive: message.caseSensitive || false,
           limit: message.limit || 10,
-        }, { frameId: getFrameIdForTab(tabId) });
+        }, { frameId: getFrameIdForTab(tabId, message) });
         return result;
       } catch {
         return { error: "Content script not loaded. Try refreshing the page." };
@@ -2976,17 +3427,17 @@ export async function handleMessage(
       const name = message.name || "Surf";
       const validColors = ["grey", "blue", "red", "yellow", "green", "pink", "purple", "cyan", "orange"];
       const color = validColors.includes(message.color) ? message.color : "blue";
-      
+
       if (tabIds.length === 0 && tabId) {
         tabIds.push(tabId);
       }
-      
+
       if (tabIds.length === 0) throw new Error("No tabs specified");
       const groupTabIds = tabIds.length === 1 ? tabIds[0] : (tabIds as [number, ...number[]]);
-      
+
       const existingGroups = await chrome.tabGroups.query({ title: name });
       let groupId: number;
-      
+
       if (existingGroups.length > 0) {
         groupId = existingGroups[0].id;
         await chrome.tabs.group({ tabIds: groupTabIds, groupId });
@@ -2998,7 +3449,7 @@ export async function handleMessage(
           collapsed: false,
         });
       }
-      
+
       return { success: true, groupId, name, tabIds };
     }
 
@@ -3007,10 +3458,10 @@ export async function handleMessage(
       if (tabIds.length === 0 && tabId) {
         tabIds.push(tabId);
       }
-      
+
       if (tabIds.length === 0) throw new Error("No tabs specified");
       const ungroupTabIds = tabIds.length === 1 ? tabIds[0] : (tabIds as [number, ...number[]]);
-      
+
       await chrome.tabs.ungroup(ungroupTabIds);
       return { success: true, ungrouped: tabIds };
     }
@@ -3018,7 +3469,7 @@ export async function handleMessage(
     case "TAB_GROUPS_LIST": {
       const groups = await chrome.tabGroups.query({});
       const result = [];
-      
+
       for (const group of groups) {
         const tabs = await chrome.tabs.query({ groupId: group.id });
         result.push({
@@ -3029,7 +3480,7 @@ export async function handleMessage(
           tabs: tabs.map(t => ({ id: t.id, title: t.title, url: t.url })),
         });
       }
-      
+
       return { groups: result };
     }
 
@@ -3037,27 +3488,44 @@ export async function handleMessage(
       if (!tabId) throw new Error("No tabId provided");
       const selector = message.selector;
       const index = message.index || 0;
-      
+      const frameId = getFrameIdForTab(tabId, message);
+
+      if (frameId > 0) {
+        const [result] = await chrome.scripting.executeScript({
+          target: { tabId, frameIds: [frameId] },
+          func: (selector: string, index: number) => {
+            const elements = document.querySelectorAll(selector);
+            if (elements.length === 0) return { error: "No elements match selector" };
+            if (index >= elements.length) return { error: `Index ${index} out of range (found ${elements.length} elements)` };
+
+            (elements[index] as HTMLElement).click();
+            return { success: true, selector, index, matchCount: elements.length };
+          },
+          args: [selector, index],
+        });
+        return result?.result || { error: "Failed to click element" };
+      }
+
       const script = `(() => {
         const elements = document.querySelectorAll(${JSON.stringify(selector)});
         if (elements.length === 0) return { error: "No elements match selector" };
         if (${index} >= elements.length) return { error: "Index " + ${index} + " out of range (found " + elements.length + " elements)" };
-        
+
         const el = elements[${index}];
         const rect = el.getBoundingClientRect();
-        return { 
-          x: rect.left + rect.width / 2, 
+        return {
+          x: rect.left + rect.width / 2,
           y: rect.top + rect.height / 2,
           count: elements.length
         };
       })()`;
-      
+
       const result = await cdp.evaluateScript(tabId, script);
       const coords = result.result?.value;
-      
+
       if (coords?.error) return { error: coords.error };
       if (!coords) return { error: "Failed to get element coordinates" };
-      
+
       await cdp.click(tabId, coords.x, coords.y, "left", 1, 0);
       return { success: true, selector, index, matchCount: coords.count };
     }
@@ -3089,13 +3557,13 @@ export async function handleMessage(
       if (!url) throw new Error("Tab has no URL");
       if (!message.name) throw new Error("Cookie name required");
       if (message.value === undefined) throw new Error("Cookie value required");
-      
+
       const cookieDetails: chrome.cookies.SetDetails = {
         url,
         name: message.name,
         value: message.value,
       };
-      
+
       if (message.expires) {
         const expirationDate = new Date(message.expires).getTime() / 1000;
         if (isNaN(expirationDate)) {
@@ -3103,7 +3571,7 @@ export async function handleMessage(
         }
         cookieDetails.expirationDate = expirationDate;
       }
-      
+
       const result = await chrome.cookies.set(cookieDetails);
       return { success: true, cookie: result };
     }
@@ -3114,7 +3582,7 @@ export async function handleMessage(
       const url = tab.url;
       if (!url) throw new Error("Tab has no URL");
       if (!message.name) throw new Error("Cookie name required");
-      
+
       await chrome.cookies.remove({ url, name: message.name });
       return { success: true, cleared: message.name };
     }
@@ -3124,7 +3592,7 @@ export async function handleMessage(
       const tab = await chrome.tabs.get(tabId);
       const url = tab.url;
       if (!url) throw new Error("Tab has no URL");
-      
+
       const cookies = await chrome.cookies.getAll({ url });
       for (const cookie of cookies) {
         await chrome.cookies.remove({ url, name: cookie.name });
@@ -3189,7 +3657,7 @@ export async function handleMessage(
     case "BOOKMARK_LIST": {
       const limit = typeof message.limit === 'number' ? message.limit : 50;
       let bookmarks: chrome.bookmarks.BookmarkTreeNode[] = [];
-      
+
       if (message.folder) {
         const search = await chrome.bookmarks.search({ title: message.folder });
         const folder = search.find(b => !b.url);
@@ -3201,11 +3669,11 @@ export async function handleMessage(
         const recent = await chrome.bookmarks.getRecent(limit);
         bookmarks = recent;
       }
-      
-      return { 
-        bookmarks: bookmarks.map(b => ({ 
-          id: b.id, 
-          title: b.title, 
+
+      return {
+        bookmarks: bookmarks.map(b => ({
+          id: b.id,
+          title: b.title,
           url: b.url,
           dateAdded: b.dateAdded
         }))
@@ -3214,15 +3682,15 @@ export async function handleMessage(
 
     case "HISTORY_LIST": {
       const limit = typeof message.limit === 'number' ? message.limit : 20;
-      const items = await chrome.history.search({ 
-        text: "", 
+      const items = await chrome.history.search({
+        text: "",
         maxResults: limit,
-        startTime: 0 
+        startTime: 0
       });
-      return { 
-        history: items.map(h => ({ 
-          url: h.url, 
-          title: h.title, 
+      return {
+        history: items.map(h => ({
+          url: h.url,
+          title: h.title,
           lastVisitTime: h.lastVisitTime,
           visitCount: h.visitCount
         }))
@@ -3232,15 +3700,15 @@ export async function handleMessage(
     case "HISTORY_SEARCH": {
       const query = message.query;
       const limit = typeof message.limit === 'number' ? message.limit : 20;
-      const items = await chrome.history.search({ 
-        text: query, 
+      const items = await chrome.history.search({
+        text: query,
         maxResults: limit,
-        startTime: 0 
+        startTime: 0
       });
-      return { 
-        history: items.map(h => ({ 
-          url: h.url, 
-          title: h.title, 
+      return {
+        history: items.map(h => ({
+          url: h.url,
+          title: h.title,
           lastVisitTime: h.lastVisitTime,
           visitCount: h.visitCount
         }))
@@ -3411,14 +3879,14 @@ export async function handleMessage(
       // Grok requires X.com cookies for authentication
       const domains = [".x.com", ".twitter.com", "x.com", "twitter.com"];
       const allCookies: chrome.cookies.Cookie[] = [];
-      
+
       for (const domain of domains) {
         try {
           const cookies = await chrome.cookies.getAll({ domain });
           allCookies.push(...cookies);
         } catch {}
       }
-      
+
       // Also try by URL
       const urls = ["https://x.com", "https://twitter.com"];
       for (const url of urls) {
@@ -3427,7 +3895,7 @@ export async function handleMessage(
           allCookies.push(...cookies);
         } catch {}
       }
-      
+
       // Dedupe by name
       const seen = new Map<string, chrome.cookies.Cookie>();
       for (const cookie of allCookies) {
@@ -3436,7 +3904,7 @@ export async function handleMessage(
           seen.set(cookie.name, cookie);
         }
       }
-      
+
       return { cookies: Array.from(seen.values()) };
     }
 
@@ -3639,14 +4107,14 @@ export async function handleMessage(
       // Gemini requires cookies from multiple Google domains
       const domains = [".google.com", ".gemini.google.com", "accounts.google.com", "www.google.com"];
       const allCookies: chrome.cookies.Cookie[] = [];
-      
+
       for (const domain of domains) {
         try {
           const cookies = await chrome.cookies.getAll({ domain });
           allCookies.push(...cookies);
         } catch {}
       }
-      
+
       // Also try by URL for better coverage
       const urls = ["https://gemini.google.com", "https://aistudio.google.com", "https://accounts.google.com", "https://www.google.com"];
       for (const url of urls) {
@@ -3655,25 +4123,24 @@ export async function handleMessage(
           allCookies.push(...cookies);
         } catch {}
       }
-      
+
       // Dedupe by name, preferring google.com domain with root path
       const seen = new Map<string, chrome.cookies.Cookie>();
       for (const cookie of allCookies) {
         const existing = seen.get(cookie.name);
-        if (!existing || 
+        if (!existing ||
             (cookie.domain === ".google.com" && cookie.path === "/") ||
             (!existing.domain?.includes("google.com") && cookie.domain?.includes("google.com"))) {
           seen.set(cookie.name, cookie);
         }
       }
-      
+
       return { cookies: Array.from(seen.values()) };
     }
 
     case "WINDOW_NEW": {
       // Default to a usable blank page if no URL provided
       const url = message.url || 'data:text/html,<html><head><title>Surf Agent</title></head><body style="font-family:system-ui;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;color:%23666"><div style="text-align:center"><h2>Agent Window</h2><p>Ready for automation</p></div></body></html>';
-      
       // HARD-CODED POLICY: surf never takes focus. New windows are always
       // created in the background; message.focused is ignored.
       const createOptions: chrome.windows.CreateData = {
@@ -3681,32 +4148,32 @@ export async function handleMessage(
         type: "normal",
         url,
       };
-      
+
       if (message.width && message.height) {
         createOptions.width = message.width;
         createOptions.height = message.height;
       }
-      
+
       if (message.incognito) {
         createOptions.incognito = true;
       }
-      
+
       const window = (await chrome.windows.create(createOptions)) as chrome.windows.Window;
-      
+
       if (!window.id) throw new Error("Failed to create window");
-      
+
       // Get the tab that was created with the window
       const tabs = await chrome.tabs.query({ windowId: window.id });
       const firstTab = tabs[0];
-      
+
       // Wait for tab to be ready
       if (firstTab?.id) {
         await new Promise(r => setTimeout(r, 150));
       }
-      
-      return { 
-        success: true, 
-        windowId: window.id, 
+
+      return {
+        success: true,
+        windowId: window.id,
         tabId: firstTab?.id,
         hint: `Use --window-id ${window.id} to target this window`,
       };
@@ -3714,7 +4181,7 @@ export async function handleMessage(
 
     case "WINDOW_LIST": {
       const windows = await chrome.windows.getAll({ populate: true });
-      
+
       return {
         windows: windows.map(w => ({
           id: w.id,
@@ -3746,24 +4213,24 @@ export async function handleMessage(
 
     case "WINDOW_CLOSE": {
       if (!message.windowId) throw new Error("No windowId provided");
-      
+
       await chrome.windows.remove(message.windowId);
       return { success: true, windowId: message.windowId };
     }
 
     case "WINDOW_RESIZE": {
       if (!message.windowId) throw new Error("No windowId provided");
-      
+
       const updateInfo: chrome.windows.UpdateInfo = {};
       if (message.width) updateInfo.width = message.width;
       if (message.height) updateInfo.height = message.height;
       if (message.left !== undefined) updateInfo.left = message.left;
       if (message.top !== undefined) updateInfo.top = message.top;
       if (message.state) updateInfo.state = message.state as `${chrome.windows.WindowState}`;
-      
+
       const window = (await chrome.windows.update(message.windowId, updateInfo)) as chrome.windows.Window;
-      return { 
-        success: true, 
+      return {
+        success: true,
         windowId: message.windowId,
         width: window.width,
         height: window.height,
@@ -3815,10 +4282,10 @@ async function tabCloseOnDone(tabId: number): Promise<void> {
 }
 
 const COMMANDS_WITHOUT_TAB = new Set([
-  "LIST_TABS", "NEW_TAB", "TABS_NEW", "TAB_GC", "CLOSE_TABS", "TAB_MOVE", "SWITCH_TAB", "TABS_SWITCH",
+  "LIST_TABS", "NEW_TAB", "TABS_NEW", "CLOSE_TAB", "CLOSE_TABS", "TAB_GC", "TAB_MOVE", "SWITCH_TAB", "TABS_SWITCH",
   "TABS_REGISTER", "TABS_UNREGISTER", "TABS_LIST_NAMED", "TABS_GET_BY_NAME",
   "CREATE_TAB_GROUP", "UNGROUP_TABS", "LIST_TAB_GROUPS", "GET_HISTORY", "SEARCH_HISTORY",
-  "GET_COOKIES", "SET_COOKIE", "DELETE_COOKIES", "GET_BOOKMARKS", "ADD_BOOKMARK", 
+  "GET_COOKIES", "SET_COOKIE", "DELETE_COOKIES", "GET_BOOKMARKS", "ADD_BOOKMARK",
   "DELETE_BOOKMARK", "DIALOG_DISMISS", "DIALOG_ACCEPT", "DIALOG_INFO",
   "CHATGPT_NEW_TAB", "CHATGPT_CLOSE_TAB", "CHATGPT_EVALUATE", "CHATGPT_CDP_COMMAND",
   "GET_CHATGPT_COOKIES", "GET_GOOGLE_COOKIES", "GET_TWITTER_COOKIES",
@@ -3830,6 +4297,7 @@ const COMMANDS_WITHOUT_TAB = new Set([
   "AIMODE_NEW_TAB", "AIMODE_CLOSE_TAB", "AIMODE_EVALUATE", "AIMODE_CDP_COMMAND",
   "DOWNLOADS_SEARCH",
   "WINDOW_NEW", "WINDOW_LIST", "WINDOW_FOCUS", "WINDOW_CLOSE", "WINDOW_RESIZE",
+  "TARGET_INSPECT", "TARGET_RESOLVE", "SESSION_CREATE_TARGET", "SESSION_CLOSE_TARGET",
   "EMULATE_DEVICE_LIST"
 ]);
 
@@ -3846,6 +4314,10 @@ initNativeMessaging(async (msg) => {
       : undefined;
 
   const resolved = await resolveTabForCommand(msg, explicitTabId);
+
+  if (resolved.tabId && msg.frameId !== undefined) {
+    await validateRequestedFrame(resolved.tabId, msg.frameId);
+  }
 
   let result;
   try {
@@ -3881,9 +4353,17 @@ initNativeMessaging(async (msg) => {
     }
   }
 
+  let resolvedWindowId: number | undefined;
+  if (resolved.tabId) {
+    try {
+      resolvedWindowId = (await chrome.tabs.get(resolved.tabId)).windowId;
+    } catch {}
+  }
+
   return {
     ...result,
     _resolvedTabId: resolved.tabId,
+    _resolvedWindowId: resolvedWindowId,
     _hint: resolved.hint,
   };
-});
+}, cleanupActiveVideoRecorder);

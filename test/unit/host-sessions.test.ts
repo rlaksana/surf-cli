@@ -79,6 +79,30 @@ describe("host session manager", () => {
     sessions.close(second);
   });
 
+  it("admits independent requests without the legacy lease when browser scheduling is external", async () => {
+    const sessions = manager();
+    const first = connection(sessions);
+    const second = connection(sessions);
+
+    const one = await sessions.beginRequest(first, {
+      id: "one",
+      tool: "page.read",
+      skipLease: true,
+    } as any);
+    const two = await sessions.beginRequest(second, {
+      id: "two",
+      tool: "page.read",
+      skipLease: true,
+    } as any);
+
+    expect(one.queued).toBe(false);
+    expect(two.queued).toBe(false);
+    sessions.complete(first, "one");
+    sessions.complete(second, "two");
+    sessions.close(first);
+    sessions.close(second);
+  });
+
   it("retains an abandoned lease until the active request settles", async () => {
     const sessions = manager();
     const first = connection(sessions);
@@ -228,7 +252,14 @@ describe("host session manager", () => {
     expect(resolveRequestDeadlineMs("click")).toBe(60000);
     expect(resolveRequestDeadlineMs("chatgpt")).toBe(2700000 + 60000);
     expect(resolveRequestDeadlineMs("gemini", { timeout: 10 })).toBe(10000 + 60000);
+    expect(resolveRequestDeadlineMs("kimi")).toBe(300000 + 60000);
+    expect(resolveRequestDeadlineMs("kimi", { timeout: 10 })).toBe(10000 + 60000);
+    expect(resolveRequestDeadlineMs("oracle.result")).toBe(300000 + 60000);
+    expect(resolveRequestDeadlineMs("oracle.result", { timeout: 10 })).toBe(10000 + 60000);
     expect(resolveRequestDeadlineMs("aistudio.build")).toBe(600000 + 60000);
+    expect(resolveRequestDeadlineMs("playbook.run", { args: { timeout: 2700 } })).toBe(
+      2700000 + 60000,
+    );
     expect(resolveRequestDeadlineMs("chatgpt", { timeout: 999999 })).toBe(50 * 60 * 1000);
   });
 

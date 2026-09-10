@@ -2,6 +2,173 @@
 
 ## [Unreleased]
 
+## [2.18.0] - 2026-09-04
+
+### Highlights
+- Record long-running browser sessions as local WebM videos.
+- Use GPT-6 Astra with Pro effort through Surf Oracle and Pi's `gpt-pro` integration.
+- Clean up stale or idle Surf sessions with an optional dry run.
+- Share local Surf access with a dedicated user group while keeping private access as the default.
+
+### Added
+- **Local WebM video recording** - Record browser sessions with `surf video start|stop|status|restart`. Requires ffmpeg with VP9 support and runs locally only. Existing GIF recording is unchanged.
+- **Session cleanup** - `surf session.cleanup --idle-after <duration> [--dry-run]` removes stale or idle session bindings and closes only inactive Surf-created tabs or windows. Thanks to [@marcoatpaladin](https://github.com/marcoatpaladin) for #233.
+- **Optional local socket sharing** - `surf install` can grant a configured POSIX group access with socket mode `660`. Private mode `0600` remains the default. Thanks to [@marcoatpaladin](https://github.com/marcoatpaladin) for #225.
+
+### Changed
+- **GPT Pro default** - Pi's packaged `gpt-pro` integration now uses GPT-6 Astra with Pro effort.
+- **ChatGPT selection options** - Model choices include `gpt-6-astra`, `latest`, `gpt-5.6-sol`, and `gpt-5.5`. Effort options are now `instant`, `medium`, `high`, `xhigh`/`extra-high`, and `pro`, replacing the previous effort names. Explicit GPT-6 Astra requests fail rather than silently switching models when ChatGPT hides the model version; use `latest` only when floating model selection is intended.
+- **Development dependencies** - Updated development tooling dependencies.
+
+### Fixed
+- **ChatGPT model and effort selection** - Surf works with ChatGPT's current model menu and effort slider, checks the selected values, and closes the menu between operations. The requested model is checked again before the prompt is sent.
+
+## [2.17.0] - 2026-08-28
+
+### Highlights
+- GPT Pro Oracle runs can now include one local file as context.
+- GPT Pro follow-ups can attach a file without losing the current conversation.
+- Repository-aware GPT Pro runs can require ChatGPT's Chat mode and GitHub tool before Surf submits the prompt.
+
+### Added
+- **GPT Pro Oracle attachments** - `surf oracle ask` and `surf oracle follow` now accept `--file <path>` to attach one local file to ChatGPT GPT Pro runs.
+- **GPT Pro GitHub context** - `surf oracle ask` and `surf oracle follow` now accept `--github` to require ChatGPT's Chat tab and connected GitHub tool before submission.
+- **Pi Oracle options** - Surf's Pi tool and external-job provider now forward explicit file and GitHub context options.
+
+### Fixed
+- **Attachment error reporting** - Oracle attachment failures now preserve clearer file access, selector, file chooser, and ChatGPT processing error details.
+
+## [2.16.1] - 2026-08-23
+
+### Highlights
+- GPT Pro jobs now clear stale composer text before submitting a prompt.
+- Pro effort verification now waits until ChatGPT has the real prompt in the composer.
+- Text-only GPT Pro runs and follow-ups are less fragile in reused ChatGPT tabs.
+
+### Fixed
+- **ChatGPT Pro effort verification** - Surf now clears stale composer text, types the prompt, and verifies the Pro effort from the composer picker before submitting.
+
+## [2.16.0] - 2026-08-23
+
+### Highlights
+- Pi integrations can now continue GPT Pro conversations through Surf Oracle follow-up jobs.
+- GPT Pro job polling is more reliable because status checks can observe finished jobs directly.
+- Cancelled GPT Pro jobs now stay cancelled instead of being reported as failed.
+
+### Added
+- **GPT Pro follow-ups** - Surf Oracle now records repeat-safe request IDs and follow-up lineage so Pi integrations can continue GPT Pro conversations.
+
+### Fixed
+- **Pi GPT Pro polling** - The `surf-oracle` provider now checks for completed jobs during status and reattach calls, so Pi can observe finished GPT Pro jobs without an extra result request.
+- **Pi GPT Pro cancellation** - Cancelled Surf Oracle requests now keep their cancellation state instead of being reported as failed jobs.
+
+## [2.15.2] - 2026-08-22
+
+### Highlights
+- Pi users can run the packaged `gpt-pro` agent against ChatGPT's current GPT-5.6 Sol Pro controls.
+- `Pro` is now selected as an effort setting instead of being treated like a model name.
+- GPT Pro jobs are less fragile when ChatGPT separates model and effort choices in the picker.
+
+### Fixed
+- **GPT Pro package agent** - The packaged `gpt-pro` Pi agent now requests ChatGPT `GPT-5.6 Sol` with `Pro` effort, matching the current ChatGPT model and effort controls.
+
+## [2.15.1] - 2026-08-20
+
+### Highlights
+- Pi users can run the packaged `gpt-pro` agent through Surf when ChatGPT is open and logged in.
+- Device aliases such as `iphone`, `pixel`, and `ipadpro` now resolve to the same presets everywhere.
+- Help text and release notes now point users at the right commands and current release details.
+
+### Changed
+- **Dependency maintenance** - Updated Puppeteer to 25.6.0 and aligned the real-Chrome CI pin to 151.0.7922.77.
+- **Docs and help text** - The README now links to the changelog for current release notes, and the packaged Surf skill labels `surf --help` as basic help while keeping `surf --help-full` as the full command list.
+
+### Fixed
+- **Pi GPT Pro jobs** - Surf now registers `surf-oracle` with pi-subagents' external-job contract, so Pi can run packaged `gpt-pro` jobs through Surf against ChatGPT web mode when the browser is logged in. Capacity errors now include the blocking job id.
+- **Device aliases** - Extension-side device emulation now resolves aliases before fuzzy matching, so `iphone`, `pixel`, `galaxy`, and similar names match the native preset list.
+- **AI Studio parse errors** - Invalid GenerateContent responses now keep the original parse error as the cause.
+- **Extension cleanup** - Removed unused extension transport and debug exports.
+
+## [2.15.0] - 2026-08-19
+
+### Highlights
+- Named browser sessions: bind work to a specific tab with `session.new`, `--session`, or `SURF_SESSION`, and manage it with list/info/close/rebind/reopen commands.
+- Multiple sessions can now run commands at the same time, each tab keeping its own order.
+- Clearer errors: session and scheduler failures include a copy-paste recovery command.
+- Optional GPT Pro agent for Pi users: ask ChatGPT GPT-5.6 Sol Pro web mode through the packaged `gpt-pro` agent.
+
+### Added
+- **Durable browser sessions** - Added `session.new`, idempotent `session.ensure`, list/info/close/rebind/reopen commands, `--session`, and `SURF_SESSION` for explicit tab-bound work.
+- **Concurrent tab lanes** - Different session tabs can execute concurrently while each tab remains FIFO; browser-wide mutations and browser-login provider flows remain exclusive.
+- **GPT Pro package agent** - Surf now ships an optional `gpt-pro` agent for `pi-subagents` users, backed by ChatGPT GPT-5.6 Sol Pro web mode.
+
+### Changed
+- **Recovery guidance** - Session and scheduler errors now include copy-paste recovery commands, `session.info` reports queue blockers, and provider tools warn before taking exclusive browser access.
+- **Strict target safety** - Session commands never fall back to the active tab, and screenshot fallback refuses to capture a different visible tab.
+- **Surf skill guidance** - Updated iframe and batch examples for session-based workflows.
+- **Pi external-job options** - The `surf-oracle` provider now honors `options.model` and `options.effort`, so Pi agent profiles can request ChatGPT GPT-5.6 Sol with Pro effort via `model: gpt-5.6-sol` and `effort: pro`.
+- **Dependency maintenance** - Updated dev dependencies: `@types/node` 26.2.0, `@biomejs/biome` 2.5.8, and `typebox` 1.3.14.
+
+### Fixed
+- **Batch iframe targeting** - Selector clicks in a batch now use the selected session frame after `frame.switch`.
+
+## [2.14.0] - 2026-08-18
+
+### Added
+- **Surf Oracle provider for Pi** - Added a stable `surf-oracle` provider so Pi integrations can start, check, resume, follow, and collect Surf Oracle jobs through durable job state.
+
+### Fixed
+- **ChatGPT Pro model alias** - Fixed `surf oracle --model pro` so it selects and verifies the current GPT-5.6 Sol model. Explicit GPT-5.5 and GPT-5.6 Sol selection still work, and the Pro effort selector is unchanged.
+
+## [2.13.1] - 2026-08-09
+
+### Changed
+- **Dependency maintenance** - Updated Vite to 8.2.1, Biome to 2.5.7, Puppeteer to 25.5.0, and Chrome types to 0.2.5.
+- **Real Chrome E2E** - Updated the pinned Chrome for Testing version to 151.0.7922.71 for Puppeteer 25.5.0.
+
+### Fixed
+- **Windows private state** - Skip unsupported POSIX permission-bit checks when reading private state files on Windows. Thanks to Andrey Oz (@ozand) for #181.
+- **Chrome test mocks** - Add the required tab `lastAccessed` value for the updated Chrome type definitions.
+
+## [2.13.0] - 2026-08-08
+
+### Added
+- **Kimi AI integration** - Added `surf kimi` for Kimi browser-session queries and validation. Thanks to @jagaliano for #178.
+
+### Changed
+- **Pi extension background bridge** - Prefer the official `pi-subagents/background-work` helper when Pi loads Surf with pi-subagents available, while keeping the global fallback for Claude Code, Codex, Cursor, direct CLI use, and other non-Pi harnesses.
+
+### Fixed
+- **Pi skill discovery** - Added frontmatter to the packaged `skills/README.md` index so Pi no longer reports it as a root skill with a missing description. Thanks to @jagaliano for #177.
+- **Pi oracle wake channel** - Emit `surf-oracle:finished` when Surf observes a terminal oracle result so pi-subagents can wake without waiting for the next snapshot poll.
+
+## [2.12.0] - 2026-08-07
+
+### Added
+- **Pi extension** - Added optional Pi browser tools backed by Surf's native-host socket, plus optional pi-subagents background reporting for session-owned oracle jobs.
+- **Rendered page HTML** - Added `surf page.html` to print and `surf page.save --output <path>` to save the current rendered document HTML, with `--selector <css>` and `--strip-scripts` for bounded static exports of Claude artifacts or other rendered pages.
+- **Playbook script strategies** - Added opt-in trusted read-op scripts with dynamic `tools.run`/`tools.all` Surf tool orchestration and workflow auto-waits.
+
+### Changed
+- **TypeScript boundary cleanup** - Replaced content element ref expandos with a WeakMap and validated native API stream response frames before dispatch.
+
+## [2.11.0] - 2026-07-29
+
+### Added
+- **Durable ChatGPT oracle jobs** - Added `surf oracle ask|status|result|follow|list` with recoverable conversation-backed jobs, repeatable context globs, and fail-closed context, model, and effort gates.
+
+### Changed
+- **Extension icon** - Replaced the placeholder teal glyph with on-brand artwork matching the project banner: a cartoon wave curl with the surfing robot mascot, tuned to stay legible at 16px in the browser toolbar.
+- **ChatGPT model selection** - `surf chatgpt --model` now fails closed with `model_verification_failed` when the requested model cannot be verified as selected instead of continuing with the current model.
+
+## [2.10.0] - 2026-07-29
+
+### Added
+- **Surf Playbooks** - Added durable browser-session playbooks with `surf playbook`/`surf pb` management, `surf use` execution, workflow and network strategies, host-owned write receipts, private activity/record state, record drafting, trace export, and standalone client projection.
+
+### Dependencies
+- **Routine toolchain refresh** - Updated Biome to 2.5.5, Vite to 8.1.5, and the setup-node Action to v7.
+
 ## [2.9.0] - 2026-07-17
 
 ### Added
@@ -34,7 +201,7 @@
 - **Animation recording** - Added `surf record --duration ... --fps ... --output ...` to capture screenshot bursts and assemble animated GIFs with ImageMagick. (@SeMmyT)
 - **Browser request lock** - Added per-socket CLI request serialization for multi-agent workflows, with `--no-lock` for intentional bypasses. (@SeMmyT)
 - **Animation audit** - Added `surf animate-audit --selector ... --duration ... --fps ...` for bounded JSON timelines of element rect/style samples. (@SeMmyT)
-- **Concurrency docs** - Documented the current multi-agent isolation contract: window/tab targeting, named tabs, `SURF_SOCKET` for separate browser/profile instances, and the absence of built-in session IDs or independent per-agent CDP sessions.
+- **Concurrency docs** - Documented the pre-session isolation contract available in 2.8.0: window/tab targeting, named tabs, and separate `SURF_SOCKET` instances.
 - **LLM context flag** - Added `surf --llm-context` as a compact, deterministic quick reference for AI agents. (@SeMmyT)
 - **CLI/native socket integration coverage** - Added CI-safe integration tests for Surf CLI request framing, fake native-host responses, host errors, and missing-socket diagnostics.
 - **Native host protocol integration coverage** - Added CI-safe tests for `native/host.cjs` native-messaging framing, CLI request forwarding, extension responses, and extension error propagation without real Chrome.

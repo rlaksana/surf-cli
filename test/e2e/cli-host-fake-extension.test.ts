@@ -41,7 +41,7 @@ type ChildProcessLike = EventEmitterLike & {
   kill(signal: string): void;
 };
 
-type NativeMessage = {
+type NativeMessage = Record<string, unknown> & {
   id?: number;
   type?: string;
   url?: string;
@@ -55,6 +55,10 @@ type NativeMessage = {
   savePath?: string;
   annotate?: boolean;
   fullpage?: boolean;
+};
+
+type FakeHostOptions = {
+  targetActive?: boolean;
 };
 
 type CliResult = {
@@ -74,8 +78,11 @@ const { spawn } = require("node:child_process") as {
   spawn: (command: string, args: string[], options: Record<string, unknown>) => ChildProcessLike;
 };
 const fs = require("node:fs") as {
+  mkdirSync(targetPath: string, options: { recursive: boolean }): void;
   mkdtempSync(prefix: string): string;
+  readFileSync(targetPath: string, encoding: "utf8"): string;
   rmSync(targetPath: string, options: { recursive: boolean; force: boolean }): void;
+  writeFileSync(targetPath: string, content: string, options?: { mode?: number }): void;
 };
 const os = require("node:os") as { tmpdir(): string };
 const path = require("node:path") as { join(...paths: string[]): string };
@@ -111,8 +118,21 @@ function writeNativeMessage(stdin: WritableLike, message: NativeMessage) {
   stdin.write(BufferCtor.concat([header, BufferCtor.from(json, "utf8")]));
 }
 
-function buildExtensionResponse(message: NativeMessage, currentUrl: string) {
+function buildExtensionResponse(message: NativeMessage, currentUrl: string, targetActive: boolean) {
   switch (message.type) {
+    case "TARGET_RESOLVE":
+    case "TARGET_INSPECT":
+      return {
+        id: message.id,
+        tabId: message.tabId || 42,
+        windowId: 7,
+        title: "Contract Fixture",
+        url: currentUrl,
+        active: targetActive,
+        restricted: false,
+      };
+    case "SESSION_CLOSE_TARGET":
+      return { id: message.id, success: true, tabId: message.tabId };
     case "LIST_TABS":
       return {
         id: message.id,
@@ -146,22 +166,36 @@ function buildExtensionResponse(message: NativeMessage, currentUrl: string) {
         width: 1,
         height: 1,
       };
+    case "EXECUTE_JAVASCRIPT":
+      return {
+        id: message.id,
+        output: JSON.stringify({
+          status: 200,
+          ok: true,
+          url: "https://fixture.test/api",
+          body: '{"ok":true}',
+          bodyJson: { ok: true },
+        }),
+      };
     default:
       return { id: message.id, error: `Unhandled fake extension message: ${message.type}` };
   }
 }
 
-function startHost(socketPath: string) {
+function startHost(socketPath: string, options: FakeHostOptions = {}) {
   const hostPath = path.join(process.cwd(), "native", "host.cjs");
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "surf-e2e-state-"));
+  tempDirs.push(stateDir);
   const child = spawn(process.execPath, [hostPath], {
     cwd: process.cwd(),
-    env: { ...process.env, SURF_SOCKET: socketPath },
+    env: { ...process.env, SURF_SOCKET: socketPath, SURF_STATE_DIR: stateDir },
     stdio: ["pipe", "pipe", "pipe"],
   });
   const messages: NativeMessage[] = [];
   const waiters: MessageWaiter[] = [];
   let stdoutBuffer = BufferCtor.alloc(0);
   let currentUrl = "about:blank";
+  const targetActive = options.targetActive !== false;
   let stderr = "";
   let closed = false;
 
@@ -203,12 +237,21 @@ function startHost(socketPath: string) {
       messages.push(message);
       notifyWaiters(message);
 
+      if (message.type === "HOST_READY") {
+        writeNativeMessage(child.stdin, {
+          type: "EXTENSION_HELLO",
+          protocolVersion: 2,
+          extensionVersion: "test",
+          browserInstanceId: "contract-browser",
+          browserEpoch: `contract-epoch-${process.pid}`,
+          capabilities: ["browser-sessions", "strict-targets", "keyed-lanes"],
+        });
+        continue;
+      }
       if (message.type === "EXECUTE_NAVIGATE" && message.url) {
         currentUrl = message.url;
       }
-      if (message.type !== "HOST_READY") {
-        writeNativeMessage(child.stdin, buildExtensionResponse(message, currentUrl));
-      }
+      writeNativeMessage(child.stdin, buildExtensionResponse(message, currentUrl, targetActive));
     }
   });
 
@@ -226,6 +269,7 @@ function startHost(socketPath: string) {
 
   return {
     child,
+    stateDir,
     messages,
     waitForMessage(
       predicate: (message: NativeMessage) => boolean,
@@ -277,12 +321,12 @@ function startHost(socketPath: string) {
   };
 }
 
-async function runCli(socketPath: string, args: string[]) {
+async function runCli(socketPath: string, args: string[], cwd = process.cwd()) {
   const cliPath = path.join(process.cwd(), "native", "cli.cjs");
 
   return await new Promise<CliResult>((resolve, reject) => {
     const child = spawn(process.execPath, [cliPath, ...args], {
-      cwd: process.cwd(),
+      cwd,
       env: { ...process.env, SURF_SOCKET: socketPath },
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -316,6 +360,48 @@ afterEach(() => {
   }
 });
 
+function seedOldSession(stateDir: string, ownership = "surf-created") {
+  const browserEpoch = `contract-epoch-${process.pid}`;
+  fs.writeFileSync(
+    path.join(stateDir, "browser-sessions.json"),
+    JSON.stringify({
+      version: 1,
+      browsers: {
+        "contract-browser": {
+          sessions: {
+            old: {
+              bindingId: "old-binding",
+              name: "old",
+              browserInstanceId: "contract-browser",
+              browserEpoch,
+              tabId: 42,
+              windowId: 7,
+              mode: "window",
+              ownership,
+              lastUrl: "https://fixture.test/old",
+              createdAt: "2000-01-01T00:00:00.000Z",
+              updatedAt: "2000-01-01T00:00:00.000Z",
+              lastAccessedAt: "2000-01-01T00:00:00.000Z",
+              lastValidatedAt: "2000-01-01T00:00:00.000Z",
+            },
+          },
+          namedTabs: {},
+        },
+      },
+    }),
+    { mode: 0o600 },
+  );
+}
+
+function sessionAccessTime(stateDir: string) {
+  const state = JSON.parse(
+    fs.readFileSync(path.join(stateDir, "browser-sessions.json"), "utf8"),
+  ) as {
+    browsers: { "contract-browser": { sessions: { old: { lastAccessedAt?: string } } } };
+  };
+  return state.browsers["contract-browser"].sessions.old.lastAccessedAt;
+}
+
 describe("CLI/native-host/fake-extension E2E contract", () => {
   it("runs browser-like navigation, page text, and screenshot flows without Chrome", async () => {
     const socketPath = createSocketPath();
@@ -333,21 +419,25 @@ describe("CLI/native-host/fake-extension E2E contract", () => {
         "https://fixture.test/page",
         "--no-screenshot",
       ]);
-      expect(navigation).toMatchObject({ code: 0, stderr: "", stdout: "OK\n" });
+      expect(navigation).toMatchObject({ code: 0, stdout: "OK\n" });
+      expect(navigation.stderr).toMatch(/\[surf tab=42 window=7(?: queued=\d+ms)?\]/);
 
       const pageText = await runCli(socketPath, ["page.text"]);
-      expect(pageText).toMatchObject({ code: 0, stderr: "" });
+      expect(pageText.code).toBe(0);
+      expect(pageText.stderr).toMatch(/\[surf tab=42 window=7(?: queued=\d+ms)?\]/);
       expect(pageText.stdout).toContain("Title: Contract Fixture");
       expect(pageText.stdout).toContain("URL: https://fixture.test/page");
       expect(pageText.stdout).toContain("Contract fixture page text from the fake extension.");
 
       const pageRead = await runCli(socketPath, ["read", "--depth", "2", "--compact"]);
-      expect(pageRead).toMatchObject({ code: 0, stderr: "" });
+      expect(pageRead.code).toBe(0);
+      expect(pageRead.stderr).toMatch(/\[surf tab=42 window=7(?: queued=\d+ms)?\]/);
       expect(pageRead.stdout).toContain('[e1] heading "Contract Fixture"');
       expect(pageRead.stdout).toContain('[e2] button "Continue"');
 
       const screenshot = await runCli(socketPath, ["screenshot", "--no-save"]);
-      expect(screenshot).toMatchObject({ code: 0, stderr: "" });
+      expect(screenshot.code).toBe(0);
+      expect(screenshot.stderr).toMatch(/\[surf tab=42 window=7(?: queued=\d+ms)?\]/);
       expect(screenshot.stdout).toContain("Screenshot captured (1x1) - ID: fake-screenshot-1");
 
       expect(host.messages).toEqual(
@@ -363,6 +453,178 @@ describe("CLI/native-host/fake-extension E2E contract", () => {
           expect.objectContaining({ type: "EXECUTE_SCREENSHOT" }),
         ]),
       );
+    } finally {
+      await host.dispose();
+    }
+  });
+
+  it("runs a playbook under one host lease and blocks a duplicate semantic write", async () => {
+    const socketPath = createSocketPath();
+    const project = fs.mkdtempSync(path.join(os.tmpdir(), "surf-playbook-project-"));
+    tempDirs.push(project);
+    const playbookDir = path.join(project, ".surf", "playbooks", "mutation", "ops");
+    fs.mkdirSync(playbookDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(project, ".surf", "playbooks", "mutation", "playbook.json"),
+      JSON.stringify({ id: "mutation", version: "1.0.0", origins: ["https://fixture.test"] }),
+    );
+    fs.writeFileSync(
+      path.join(playbookDir, "submit.json"),
+      JSON.stringify({
+        id: "submit",
+        effect: "write",
+        args: { action: { required: true } },
+        safety: { authorization: "explicit", duplicate: "transactional", key: ["action"] },
+        run: [
+          {
+            using: "network",
+            request: {
+              method: "POST",
+              url: "https://fixture.test/api",
+              body: { action: "{{action}}" },
+            },
+            extract: { jsonPath: "$.ok" },
+            expect: { truthy: true },
+          },
+        ],
+      }),
+    );
+    const host = startHost(socketPath);
+
+    try {
+      await host.waitForMessage((message) => message.type === "HOST_READY");
+      const read = await runCli(socketPath, ["use", "page", "read", "--json"]);
+      expect(read).toMatchObject({ code: 0, stderr: "" });
+      expect(JSON.parse(read.stdout)).toMatchObject({
+        status: "completed",
+        strategy: "network",
+        provenance: { scope: "built-in" },
+      });
+
+      const results = await Promise.all([
+        runCli(
+          socketPath,
+          ["use", "mutation", "submit", "--action", "same", "--write", "--no-lock"],
+          project,
+        ),
+        runCli(
+          socketPath,
+          ["use", "mutation", "submit", "--action", "same", "--write", "--no-lock"],
+          project,
+        ),
+      ]);
+      expect(results.filter((result) => result.code === 0)).toHaveLength(1);
+      expect(results.filter((result) => result.code === 1)[0]?.stderr).toMatch(
+        /write blocked by verified receipt/,
+      );
+      expect(host.messages.filter((message) => message.type === "EXECUTE_JAVASCRIPT")).toHaveLength(
+        2,
+      );
+    } finally {
+      await host.dispose();
+    }
+  });
+
+  it("removes an old live Surf-created session and its target", async () => {
+    const socketPath = createSocketPath();
+    const host = startHost(socketPath, { targetActive: false });
+
+    try {
+      await host.waitForMessage((message) => message.type === "HOST_READY");
+      seedOldSession(host.stateDir);
+
+      const cleanup = await runCli(socketPath, ["session.cleanup", "--idle-after", "1s", "--json"]);
+      expect(cleanup).toMatchObject({ code: 0, stderr: "" });
+      expect(JSON.parse(cleanup.stdout)).toMatchObject({
+        dryRun: false,
+        removed: [{ name: "old", targetAction: "close", targetClosed: true }],
+      });
+      expect(host.messages).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ type: "SESSION_CLOSE_TARGET", tabId: 42 }),
+        ]),
+      );
+
+      const listed = await runCli(socketPath, ["session.list", "--json"]);
+      expect(JSON.parse(listed.stdout).sessions).toEqual([]);
+    } finally {
+      await host.dispose();
+    }
+  });
+
+  it("keeps an old session and target during cleanup dry-run", async () => {
+    const socketPath = createSocketPath();
+    const host = startHost(socketPath, { targetActive: false });
+
+    try {
+      await host.waitForMessage((message) => message.type === "HOST_READY");
+      seedOldSession(host.stateDir);
+
+      const cleanup = await runCli(socketPath, [
+        "session.cleanup",
+        "--idle-after",
+        "1s",
+        "--dry-run",
+        "--json",
+      ]);
+      expect(cleanup).toMatchObject({ code: 0, stderr: "" });
+      expect(JSON.parse(cleanup.stdout)).toMatchObject({
+        dryRun: true,
+        removed: [{ name: "old", targetAction: "close", targetClosed: true }],
+      });
+      expect(host.messages.some((message) => message.type === "SESSION_CLOSE_TARGET")).toBe(false);
+
+      const listed = await runCli(socketPath, ["session.list", "--json"]);
+      expect(JSON.parse(listed.stdout).sessions).toHaveLength(1);
+    } finally {
+      await host.dispose();
+    }
+  });
+
+  it("removes an idle adopted binding without closing its target", async () => {
+    const socketPath = createSocketPath();
+    const host = startHost(socketPath, { targetActive: false });
+
+    try {
+      await host.waitForMessage((message) => message.type === "HOST_READY");
+      seedOldSession(host.stateDir, "adopted");
+
+      const cleanup = await runCli(socketPath, ["session.cleanup", "--idle-after", "1s", "--json"]);
+      expect(cleanup).toMatchObject({ code: 0, stderr: "" });
+      expect(JSON.parse(cleanup.stdout)).toMatchObject({
+        removed: [{ name: "old", ownership: "adopted", targetAction: "keep", targetClosed: false }],
+      });
+      expect(host.messages.some((message) => message.type === "SESSION_CLOSE_TARGET")).toBe(false);
+
+      const listed = await runCli(socketPath, ["session.list", "--json"]);
+      expect(JSON.parse(listed.stdout).sessions).toEqual([]);
+    } finally {
+      await host.dispose();
+    }
+  });
+
+  it("does not refresh idle activity during list/info validation", async () => {
+    const socketPath = createSocketPath();
+    const host = startHost(socketPath, { targetActive: false });
+
+    try {
+      await host.waitForMessage((message) => message.type === "HOST_READY");
+      seedOldSession(host.stateDir);
+      const originalAccessTime = sessionAccessTime(host.stateDir);
+
+      const listed = await runCli(socketPath, ["session.list", "--refresh", "--json"]);
+      expect(listed.code).toBe(0);
+      expect(sessionAccessTime(host.stateDir)).toBe(originalAccessTime);
+
+      const info = await runCli(socketPath, ["session.info", "old", "--refresh", "--json"]);
+      expect(info.code).toBe(0);
+      expect(sessionAccessTime(host.stateDir)).toBe(originalAccessTime);
+
+      const cleanup = await runCli(socketPath, ["session.cleanup", "--idle-after", "1s", "--json"]);
+      expect(cleanup.code).toBe(0);
+      expect(JSON.parse(cleanup.stdout).removed).toMatchObject([
+        { name: "old", reason: "idle", targetAction: "close" },
+      ]);
     } finally {
       await host.dispose();
     }

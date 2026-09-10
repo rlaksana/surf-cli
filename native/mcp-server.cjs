@@ -269,7 +269,7 @@ const TOOL_SCHEMAS = {
     desc: "Ask ChatGPT through the browser session",
     schema: {
       query: z.string().describe("Question or prompt"),
-      model: z.string().optional().describe("ChatGPT model"),
+      model: z.string().optional().describe("ChatGPT model: gpt-6-astra, latest, gpt-5.6-sol, gpt-5.5"),
       "with-page": z.boolean().optional().describe("Include current page context"),
       file: z.string().optional().describe("One attachment path"),
       timeout: z.number().optional().describe("Timeout in seconds")
@@ -288,6 +288,16 @@ const TOOL_SCHEMAS = {
       youtube: z.string().optional().describe("YouTube URL"),
       "aspect-ratio": z.string().optional().describe("Image aspect ratio"),
       timeout: z.number().optional().describe("Timeout in seconds")
+    }
+  },
+  kimi: {
+    desc: "Ask Kimi AI (kimi.com, Moonshot K-series) through the browser session",
+    schema: {
+      query: z.string().optional().describe("Question or prompt"),
+      model: z.string().optional().describe("Model: instant (default), thinking, high, or any label in kimi.com's picker"),
+      "with-page": z.boolean().optional().describe("Include current page context"),
+      timeout: z.number().optional().describe("Timeout in seconds"),
+      validate: z.boolean().optional().describe("Check kimi.com UI and list available models")
     }
   },
   "network.export": {

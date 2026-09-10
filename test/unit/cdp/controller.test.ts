@@ -171,6 +171,16 @@ describe("CDPController", () => {
       expect(mockChrome.debugger.attach).toHaveBeenCalledTimes(1);
     });
 
+    it("reports debugger_busy instead of assuming ownership of an existing attachment", async () => {
+      mockChrome.debugger.attach.mockRejectedValue(
+        new Error("Another debugger is already attached to the tab"),
+      );
+
+      await expect(controller.attach(tabId)).rejects.toMatchObject({
+        code: "debugger_busy",
+      });
+    });
+
     it("throws descriptive error for restricted pages", async () => {
       mockChrome.debugger.attach.mockRejectedValue(new Error("Cannot access a chrome:// URL"));
 
@@ -880,6 +890,64 @@ describe("CDPController", () => {
     });
   });
 
+  describe("screencast", () => {
+    it("ACKs frames and forwards JPEG data to subscribers", async () => {
+      const controller = new CDPController();
+      const frame = vi.fn();
+      mockChrome.debugger.attach.mockResolvedValue(undefined);
+      mockChrome.debugger.sendCommand.mockResolvedValue({});
+
+      await controller.attach(3100);
+      controller.subscribeToScreencast(3100, "video-1", frame);
+      await (
+        controller as unknown as {
+          handleCDPEvent: (tabId: number, method: string, params: unknown) => Promise<void>;
+        }
+      ).handleCDPEvent(3100, "Page.screencastFrame", {
+        data: "jpeg-base64",
+        metadata: { deviceWidth: 800 },
+        sessionId: 9,
+      });
+
+      expect(mockChrome.debugger.sendCommand).toHaveBeenLastCalledWith(
+        { tabId: 3100 },
+        "Page.screencastFrameAck",
+        { sessionId: 9 },
+      );
+      expect(frame).toHaveBeenCalledWith({
+        data: "jpeg-base64",
+        metadata: { deviceWidth: 800 },
+        sessionId: 9,
+      });
+    });
+
+    it("reports a frame ACK failure without forwarding the frame", async () => {
+      const controller = new CDPController();
+      const frame = vi.fn();
+      const onError = vi.fn();
+      mockChrome.debugger.attach.mockResolvedValue(undefined);
+      mockChrome.debugger.sendCommand
+        .mockResolvedValueOnce({})
+        .mockRejectedValueOnce(new Error("screencast ACK failed"));
+
+      await controller.attach(3101);
+      controller.subscribeToScreencast(3101, "video-1", frame, onError);
+      await (
+        controller as unknown as {
+          handleCDPEvent: (tabId: number, method: string, params: unknown) => Promise<void>;
+        }
+      ).handleCDPEvent(3101, "Page.screencastFrame", {
+        data: "jpeg-base64",
+        sessionId: 10,
+      });
+
+      expect(onError).toHaveBeenCalledWith(
+        expect.objectContaining({ message: "screencast ACK failed" }),
+      );
+      expect(frame).not.toHaveBeenCalled();
+    });
+  });
+
   describe("unsubscribeFromNetwork", () => {
     let controller: CDPController;
     const tabId = 2400;
@@ -933,6 +1001,63 @@ describe("CDPController", () => {
 
       expect(mockChrome.debugger.sendCommand).toHaveBeenCalledWith({ tabId }, "Network.enable", {
         maxPostDataSize: 65536,
+      });
+    });
+
+    it("captures response bodies at loadingFinished and respects disabled mode", async () => {
+      mockChrome.debugger.sendCommand.mockImplementation(
+        async (_target: unknown, method: string) =>
+          method === "Network.getResponseBody"
+            ? { body: '{"items":[1]}', base64Encoded: false }
+            : {},
+      );
+      await controller.enableNetworkTracking(tabId, {
+        bodyMode: "text",
+        perBodyBytes: 1024,
+        totalBytes: 2048,
+      });
+      const dispatch = (method: string, params: Record<string, unknown>) =>
+        (
+          controller as unknown as {
+            handleCDPEvent: (tab: number, event: string, value: unknown) => Promise<void> | void;
+          }
+        ).handleCDPEvent(tabId, method, params);
+      const emitRequest = async (requestId: string, encodedDataLength: number) => {
+        await dispatch("Network.requestWillBeSent", {
+          requestId,
+          timestamp: 1,
+          request: { url: `https://example.test/${requestId}`, method: "GET", headers: {} },
+        });
+        await dispatch("Network.responseReceived", {
+          requestId,
+          timestamp: 1.01,
+          response: {
+            status: 200,
+            statusText: "OK",
+            mimeType: "application/json",
+            headers: { "content-type": "application/json" },
+          },
+        });
+        await dispatch("Network.loadingFinished", {
+          requestId,
+          timestamp: 1.02,
+          encodedDataLength,
+        });
+      };
+
+      await emitRequest("req-1", 13);
+      expect(controller.getNetworkEntries(tabId)[0]).toMatchObject({
+        responseBody: '{"items":[1]}',
+        bodyCapture: { mode: "text", complete: true, capturedBytes: 13 },
+      });
+
+      controller.clearNetworkRequests(tabId);
+      await controller.enableNetworkTracking(tabId, { bodyMode: "none" });
+      await emitRequest("req-2", 10);
+      expect(controller.getNetworkEntries(tabId)[0].bodyCapture).toEqual({
+        mode: "none",
+        complete: false,
+        reason: "disabled",
       });
     });
   });
