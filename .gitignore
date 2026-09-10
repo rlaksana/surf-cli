@@ -25,3 +25,9 @@ FEATURE_COMPARISON.md
 # Experimental
 openspec/
 *.png
+
+# Local tool caches (codegraph, grepai, serena)
+.codegraph/
+.grepai/
+.serena/
+dist-firefox/
