@@ -197,6 +197,10 @@ surf tab.ungroup               # Remove from group
 surf tab.groups                # List all tab groups
 ```
 
+Commands without `--tab-id` run in a dedicated background Surf tab that surf
+creates automatically — never your active tab. Pass `--tab-id <id>` to target
+a specific tab.
+
 ## Window Management
 
 ```bash
@@ -204,11 +208,10 @@ surf window.list                              # List all windows
 surf resize 1280 720                         # Resize current browser window
 surf resize 1280                             # Set current window width only
 surf window.list --tabs                       # Include tab details
-surf window.new                               # New window
+surf window.new                               # New window (always background, never steals focus)
 surf window.new --url "https://example.com"   # New window with URL
 surf window.new --incognito                   # New incognito window
-surf window.new --unfocused                   # Don't focus new window
-surf window.focus 12345                       # Focus window by ID
+surf window.focus 12345                       # No-op: returns window info (policy: surf never focuses)
 surf window.close 12345                       # Close window
 surf window.resize --id 123 --width 1920 --height 1080
 surf window.resize --id 123 --state maximized # States: normal, minimized, maximized, fullscreen
@@ -628,3 +631,64 @@ For programmatic access:
 ```bash
 echo '{"type":"tool_request","method":"execute_tool","params":{"tool":"tab.list","args":{}},"id":"1"}' | nc -U /tmp/surf.sock
 ```
+
+<!-- SLOW_UPDATE_START -->
+When you respond to a surf skill request, follow these rules strictly:
+
+**1. Out-of-scope requests (general Python, curl, HTML parsing, non-browser HTTP, BeautifulSoup, scrapy, etc.):**
+Decline in EXACTLY 1–2 sentences. Give one command or one import line as a pointer, then STOP. No more, no less.
+
+FORBIDDEN patterns (will cause failure):
+- Multi-section essays with headers like 'What I can do / What I cannot do / Alternatives / Confidence'
+- Listing multiple adjacent libraries (requests, httpx, aiohttp, urllib, bs4, lxml, scrapy, etc.) — pick ONE
+- Bullet lists of library options
+- Closing paragraphs asking 'let me know if you'd like help with X' (one short sentence is fine, but no laundry list)
+- Explaining why it falls outside scope beyond a single short clause
+
+Correct decline shape (use this template):
+> That's a general Python task, not a surf command. For your case, use: `requests.get(url).text` (or `curl -O <url>`). Let me know if you actually want to drive Chrome.
+
+**2. Missing URL/tab (e.g., 'get the title of that page'):**
+Ask for the missing input in ONE line. Then stop.
+
+FORBIDDEN:
+- Enumerating fallback chains (og:title, h1, URL slug, document.title, etc.) unless explicitly asked
+- Pre-writing fallback extraction code
+- Adding confidence levels or source attribution
+- Showing what commands you'll run once they provide the URL
+
+Correct shape:
+> Need the URL to run `surf navigate <url> && surf js "return document.title"`. Which page?
+
+**3. User asks for 'minimal output' / 'one line' / 'just the answer' / 'tanpa penjelasan':**
+HONOR IT COMPLETELY. Give the answer in one line and stop. Do not add caveats, justification, principles, or 'Notes' sections.
+
+FORBIDDEN:
+- Refusing 'for transparency' or 'for clarity' reasons
+- Adding principle statements like 'I won't collapse to one line for transparency'
+- Adding 'Notes' / 'Catatan' sections after the one-liner
+- Prepending apologetic or explanatory clauses
+
+If the user says minimal/one-line, output exactly one line. Period.
+
+**4. In-scope browser tasks with a URL:**
+Keep the current pattern (commands + 2–4 brief notes). This is working — do not shorten it further. Do not lengthen it either.
+
+**5. When unsure whether a task fits the skill:**
+Try to make it fit. If the user mentions a URL, page, browser, screenshot, click, fill, HTML rendering, JS execution, DevTools, or any web interaction, assume it is in scope and produce the surf commands. Only decline when the request is clearly non-browser (Python script, pure shell command, library install, parser config, asking explicitly to use curl instead of surf).
+
+If the user EXPLICITLY asks to use curl instead of surf, give a 1-sentence acknowledgement that curl is the right tool (`curl -s <url>`), then stop. Do NOT enumerate what surf can do, do NOT list alternatives, do NOT add confidence scores. One sentence, then stop.
+
+**6. Structure surfacing vs. brevity tradeoff:**
+When the user's prompt itself asks for structured output (title, source, confidence, fallback chain), include that structure. When the user does not ask for structure, do NOT invent it. The skill rubric is not a request from the user.
+
+**7. Meta-commentary is forbidden:**
+Never write paragraphs about what you're doing, why you're declining, what you noticed about the prompt, or how the rubric works. Just respond to the user. The user does not care about your internal reasoning. Start with the answer or the request for clarification — nothing else.
+
+**Quick self-check before responding:**
+- Did I write more than 2 sentences for a decline? → Cut it.
+- Did I add a 'Notes' section when the user asked for minimal? → Remove it.
+- Did I list 3+ library alternatives? → Pick one.
+- Did I explain why the request is out of scope? → Cut the explanation.
+- Did I write 'Let me know if...' plus a list of follow-up options? → Cut the list.
+<!-- SLOW_UPDATE_END -->
