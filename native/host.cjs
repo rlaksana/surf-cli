@@ -411,9 +411,14 @@ const browserSessionStore = new BrowserSessionStore();
 let browserIdentity = null;
 const browserIdentityWaiters = new Set();
 const transientFrameContexts = new Map();
+let identityGraceTimer = null;
 
 function setBrowserIdentity(value) {
   if (!value?.browserInstanceId || !value?.browserEpoch) return;
+  if (identityGraceTimer) {
+    clearTimeout(identityGraceTimer);
+    identityGraceTimer = null;
+  }
   const identityChanged = browserIdentity && (
     browserIdentity.browserInstanceId !== value.browserInstanceId ||
     browserIdentity.browserEpoch !== value.browserEpoch
@@ -3552,6 +3557,20 @@ async function startListeners() {
     await listenerLifecycle.start();
   } catch (error) { failStartup(error, endpoint?.display || process.env.SURF_LISTEN || SOCKET_PATH); }
 }
+// Self-heal: the extension sends EXTENSION_HELLO within moments of spawning
+// this host. A host that never receives one is a zombie (stale extension code
+// or a Chrome-held pipe after the service worker died) that answers every CLI
+// request with extension_identity_missing. Exit so the extension's reconnect
+// loop can spawn a fresh host. Override with SURF_IDENTITY_GRACE_MS (tests).
+const IDENTITY_GRACE_MS = Math.max(0, Number(process.env.SURF_IDENTITY_GRACE_MS) || 30000);
+identityGraceTimer = setTimeout(() => {
+  identityGraceTimer = null;
+  if (!browserIdentity && !shuttingDown) {
+    log(`No EXTENSION_HELLO received within ${IDENTITY_GRACE_MS}ms; exiting so the extension can relaunch a fresh host`);
+    shutdown(1);
+  }
+}, IDENTITY_GRACE_MS);
+
 startListeners();
 
 process.on("SIGTERM", () => {

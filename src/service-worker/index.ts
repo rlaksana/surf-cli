@@ -538,30 +538,10 @@ function base64ToBlob(base64: string, mimeType = "image/png"): Blob {
   return new Blob([bytes], { type: mimeType });
 }
 
-function codeWithExpressionReturn(code: string): string {
-  // Prefer the expression form `return ( ... );` so that single-expression code
-  // (e.g. `1 + 2`, `document.title`) returns its value to the caller. Fall back
-  // to an async IIFE for code that contains declarations or statements at line
-  // start — those are not valid in expression position. The previous `new Function`
-  // parse-test approach was dropped because interpolating caller code into a
-  // Function body is a code-injection anti-pattern even when the function body
-  // is never executed; a regex heuristic over line starts is sufficient here
-  // because every caller (surf js, gemini-client.cjs) already routes through
-  // CDP Runtime.evaluate with awaitPromise, so the browser is the actual
-  // execution boundary, not this wrapper.
-  if (/^\s*(?:const|let|var|function|class|import|export|return|throw|if|for|while|do|switch|try)\b/m.test(code)) {
-    return `return (async () => { ${code} })()`;
-  }
-  return `return (\n${code}\n);`;
-}
-
-function scriptParses(code: string): boolean {
-  try {
-    new Function(code);
-    return true;
-  } catch (err) {
-    return !(err instanceof SyntaxError);
-  }
+function isSyntaxError(details: { text?: string; exception?: { description?: string } } | null | undefined): boolean {
+  if (!details) return false;
+  const text = `${details.exception?.description || ""} ${details.text || ""}`;
+  return text.includes("SyntaxError");
 }
 
 async function captureFullPage(tabId: number, maxHeight: number): Promise<{ base64: string; width: number; height: number }> {
@@ -2317,12 +2297,17 @@ export async function handleMessage(
         const piHelpersCode = `if(!window.piHelpers){const piHelpers={wait(ms){return new Promise(r=>setTimeout(r,ms))},async waitForSelector(sel,opts={}){const{state='visible',timeout=20000}=opts;const isVis=el=>el&&getComputedStyle(el).display!=='none'&&getComputedStyle(el).visibility!=='hidden'&&getComputedStyle(el).opacity!=='0'&&el.offsetWidth>0&&el.offsetHeight>0;const chk=()=>{const el=document.querySelector(sel);switch(state){case'attached':return el;case'detached':return el?null:document.body;case'hidden':return(!el||!isVis(el))?(el||document.body):null;default:return isVis(el)?el:null}};return new Promise((res,rej)=>{const r=chk();if(r){res(state==='detached'||state==='hidden'?null:r);return}const obs=new MutationObserver(()=>{const r=chk();if(r){obs.disconnect();clearTimeout(tid);res(state==='detached'||state==='hidden'?null:r)}});const tid=setTimeout(()=>{obs.disconnect();rej(new Error('Timeout'))},timeout);obs.observe(document.documentElement,{childList:true,subtree:true,attributes:true,attributeFilter:['style','class','hidden']})})},async waitForText(text,opts={}){const{selector,timeout=20000}=opts;const chk=()=>{const root=selector?document.querySelector(selector):document.body;if(!root)return null;const w=document.createTreeWalker(root,NodeFilter.SHOW_TEXT);while(w.nextNode())if(w.currentNode.textContent?.includes(text))return w.currentNode.parentElement;return null};return new Promise((res,rej)=>{const r=chk();if(r){res(r);return}const obs=new MutationObserver(()=>{const r=chk();if(r){obs.disconnect();clearTimeout(tid);res(r)}});const tid=setTimeout(()=>{obs.disconnect();rej(new Error('Timeout'))},timeout);obs.observe(document.documentElement,{childList:true,subtree:true,characterData:true})})},async waitForHidden(sel,t=20000){await piHelpers.waitForSelector(sel,{state:'hidden',timeout:t})},getByRole(role,opts={}){const{name}=opts;const roles={button:['button','input[type=button]','input[type=submit]','input[type=reset]'],link:['a[href]'],textbox:['input:not([type])','input[type=text]','input[type=email]','input[type=password]','textarea'],checkbox:['input[type=checkbox]'],radio:['input[type=radio]'],combobox:['select'],heading:['h1','h2','h3','h4','h5','h6']};const cands=[...document.querySelectorAll('[role='+role+']')];if(roles[role])roles[role].forEach(s=>cands.push(...document.querySelectorAll(s+':not([role])')));if(!name)return cands[0]||null;const n=name.toLowerCase().trim();for(const el of cands){const l=el.getAttribute('aria-label')?.toLowerCase().trim();const t=el.textContent?.toLowerCase().trim();if(l===n||t===n||l?.includes(n)||t?.includes(n))return el}return null}};window.__piHelpers=piHelpers;window.piHelpers=piHelpers}`;
         await cdp.evaluateScript(tabId, piHelpersCode);
 
-        const body = codeWithExpressionReturn(message.code);
-        const expression = `(async () => { 'use strict'; ${body} })()`;
+        // Expression form first so the completion value comes back (e.g. `1 + 1`,
+        // `(() => { ... })()`). Code with declarations/if/loops at statement level
+        // is not valid in return position; retry those as plain statements. The
+        // old line-start keyword regex misclassified IIFEs containing `const` and
+        // silently dropped their result (follow-up to #121, 2026-09-17).
+        let result = await cdp.evaluateScript(
+          tabId,
+          `(async () => { 'use strict'; return (\n${message.code}\n); })()`,
+        );
 
-        let result = await cdp.evaluateScript(tabId, expression);
-
-        if (result.exceptionDetails && !scriptParses(body)) {
+        if (isSyntaxError(result.exceptionDetails)) {
           result = await cdp.evaluateScript(tabId, `(async () => { 'use strict'; ${message.code} })()`);
         }
 

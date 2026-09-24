@@ -261,6 +261,7 @@ The MCP server (`native/mcp-server.cjs`) provides Model Context Protocol integra
 - Extension not loading: Check chrome://extensions for errors
 - CDP failures: Ensure debuggable tabs exist
 - Permission denied on socket: Check that no other surf instance is running
+- Zombie host (every command fails with `extension_identity_missing`): self-healing since 2026-09-17. If no `EXTENSION_HELLO` arrives within 30s of spawn, the host exits with code 1 and the extension's 5s reconnect loop respawns it. Override with `SURF_IDENTITY_GRACE_MS`. Both paths covered by `node native/tests/host-identity-grace.test.cjs`
 
 ### Stability test (AI provider self-heal)
 

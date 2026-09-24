@@ -20,6 +20,7 @@ module.exports = {
     'button[aria-label*="Stop"]',
     'button[aria-label*="stop"]',
     'button[aria-label*="Cancel"]',
+    'button[aria-label*="Hentikan"]',
   ],
   // Done token — Grok marks completion with specific text or elements
   doneToken: [

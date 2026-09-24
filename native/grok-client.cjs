@@ -101,8 +101,11 @@ function grokSendButtonFinderScript() {
     const matchesSendButton = (button) => {
       const label = (button.getAttribute('aria-label') || '').trim().toLowerCase();
       const testId = (button.getAttribute('data-testid') || '').trim().toLowerCase();
-      return label === 'send' || label === 'submit' ||
-             label.startsWith('send ') || label.startsWith('submit ') ||
+      // type=submit survives locale changes (grok.com renders "Kirim" in id locale);
+      // English labels kept as fallback for older UIs.
+      if (button.getAttribute('type') === 'submit') return true;
+      return label === 'send' || label === 'submit' || label === 'kirim' ||
+             label.startsWith('send ') || label.startsWith('submit ') || label.startsWith('kirim ') ||
              testId === 'groksend' || testId === 'send-button' ||
              testId.includes('composer-send') || testId.includes('grok-send');
     };
@@ -453,6 +456,11 @@ async function submitPrompt(cdp, inputCdp) {
 // Response Handling
 // ============================================================================
 
+// Glued-tail leftovers that are pure UI (model chips, buttons), not an answer
+function uiGluedJunk(text) {
+  return /^(Auto|Fast|Expert|Think|DeepSearch|Think Harder|Grok\s*\d)/i.test(text);
+}
+
 // Extract Grok's response from the full page body text
 function extractGrokResponse(bodyText, userPrompt = '', chipTexts = []) {
   if (!bodyText) return null;
@@ -486,12 +494,27 @@ function extractGrokResponse(bodyText, userPrompt = '', chipTexts = []) {
 
   // Find the LAST occurrence of the user's question to get the most recent conversation
   let lastQuestionIndex = -1;
+  let gluedTail = null; // answer glued onto the question line (new UI renders question+answer+chip in one innerText run)
   for (let i = lines.length - 1; i >= 0; i--) {
     const lineNorm = lines[i].toLowerCase().replace(/[^a-z0-9]/g, '');
     if (promptNorm && lineNorm.includes(promptNorm)) {
       lastQuestionIndex = i;
+      const promptRaw = String(userPrompt || '').trim();
+      const at = promptRaw ? lines[i].indexOf(promptRaw) : -1;
+      if (at !== -1 && lines[i].length > at + promptRaw.length) {
+        gluedTail = lines[i].substring(at + promptRaw.length).trim();
+      }
       break;
     }
+  }
+
+  // Glued answer: strip trailing chip strings from the tail (e.g. "PONGFast" -> "PONG")
+  if (gluedTail) {
+    for (const t of chipTexts || []) {
+      const key = String(t).trim();
+      if (key && gluedTail.endsWith(key)) gluedTail = gluedTail.slice(0, -key.length).trim();
+    }
+    if (gluedTail && !uiGluedJunk(gluedTail)) return gluedTail;
   }
 
   // Extract content after the last question
@@ -511,12 +534,19 @@ function extractGrokResponse(bodyText, userPrompt = '', chipTexts = []) {
   }
 
   // Chips follow the answer; strip trailing chip lines but never the first line.
+  // Page-marketing lines (banner/CTA) also trail the answer in the new UI — strip them too.
+  const trailingJunk = /^(Learn more|Meet Grok Bot|AI teammates.*|Bots sign in to your tools.*|Try Grok|Upgrade)$/;
   let contentEnd = contentLines.length;
   while (contentEnd > 1) {
-    const remaining = chipCounts.get(contentLines[contentEnd - 1]) || 0;
-    if (remaining <= 0) break;
-    chipCounts.set(contentLines[contentEnd - 1], remaining - 1);
-    contentEnd--;
+    const last = contentLines[contentEnd - 1];
+    const remaining = chipCounts.get(last) || 0;
+    if (remaining > 0) {
+      chipCounts.set(last, remaining - 1);
+      contentEnd--;
+      continue;
+    }
+    if (trailingJunk.test(last)) { contentEnd--; continue; }
+    break;
   }
   const responseLines = contentLines.slice(0, contentEnd);
 
@@ -558,7 +588,7 @@ async function waitForResponse(cdp, timeoutMs = 300000, userPrompt = '', signal)
       const bodyText = document.body.innerText || '';
 
       // Check for stop/cancel button (indicates still generating)
-      const hasStopBtn = !!document.querySelector('button[aria-label*="Stop"], button[aria-label*="stop"], button[aria-label*="Cancel"]');
+      const hasStopBtn = !!document.querySelector('button[aria-label*="Stop"], button[aria-label*="stop"], button[aria-label*="Cancel"], button[aria-label*="Hentikan"], button[data-testid*="stop" i], button[aria-label*="Berhenti"]');
 
       // Try to find the actual Grok response in the DOM
       // Look for the main content area - Grok responses appear in the conversation area
