@@ -28,6 +28,9 @@ type HostResponse = {
     content: Array<{ type: string; text: string }>;
   };
   error?: {
+    code?: string;
+    message?: string;
+    details?: Record<string, unknown>;
     content: Array<{ type: string; text: string }>;
   };
 };
@@ -67,6 +70,9 @@ const net = require("node:net") as {
 };
 const os = require("node:os") as { tmpdir(): string };
 const path = require("node:path") as { join(...paths: string[]): string };
+const hostHelpers = require("../../native/host-helpers.cjs") as {
+  formatToolContent(result: Record<string, unknown>): Array<{ type: string; text: string }>;
+};
 
 const tempDirs: string[] = [];
 
@@ -227,6 +233,101 @@ afterEach(() => {
 });
 
 describe("CLI native socket integration", () => {
+  it.each([false, true])("renders structured host errors (json=%s)", async (json) => {
+    const message = "Action blocked";
+    const recovery = "Recovery: choose another tab\n  surf tab.list";
+    const result = await runCliWithFakeHost(
+      ["click", "e1", ...(json ? ["--json"] : [])],
+      (request) => ({
+        id: request.id,
+        error: {
+          code: "target_busy",
+          message,
+          details: { code: "target_busy", message, recovery, retryable: true },
+          content: [{ type: "text", text: `${message}\n${recovery}` }],
+        },
+      }),
+    );
+    expect(result.code).toBe(1);
+    expect(result.stderr).toBe(`Error: ${message} [target_busy]\n${recovery}\n`);
+    if (json) {
+      expect(JSON.parse(result.stdout)).toEqual({
+        error: {
+          code: "target_busy",
+          message,
+          details: { recovery, retryable: true },
+        },
+      });
+    } else {
+      expect(result.stdout).toBe("");
+    }
+  });
+
+  it("does not duplicate an existing first-line code", async () => {
+    const result = await runCliWithFakeHost(["click", "e1", "--json"], (request) => ({
+      id: request.id,
+      error: {
+        code: "target_busy",
+        content: [{ type: "text", text: "Action blocked [target_busy]\nTry again" }],
+      },
+    }));
+    expect(result.code).toBe(1);
+    expect(result.stderr).toBe("Error: Action blocked [target_busy]\nTry again\n");
+    expect(JSON.parse(result.stdout)).toEqual({
+      error: { code: "target_busy", message: "Action blocked [target_busy]" },
+    });
+  });
+
+  it.each([false, true])("handles missing host error codes (json=%s)", async (json) => {
+    const result = await runCliWithFakeHost(
+      ["click", "e1", ...(json ? ["--json"] : [])],
+      (request) => ({
+        id: request.id,
+        error: { content: [{ type: "text", text: "Action failed\nTry again" }] },
+      }),
+    );
+    expect(result.code).toBe(1);
+    expect(result.stderr).toBe("Error: Action failed\nTry again\n");
+    if (json) {
+      expect(JSON.parse(result.stdout)).toEqual({
+        error: { code: "error", message: "Action failed" },
+      });
+    } else {
+      expect(result.stdout).toBe("");
+    }
+  });
+
+  it.each([false, true])("preserves soft-fail host warnings (json=%s)", async (json) => {
+    const result = await runCliWithFakeHost(
+      ["click", "e1", "--soft-fail", ...(json ? ["--json"] : [])],
+      (request) => ({
+        id: request.id,
+        error: {
+          code: "target_busy",
+          message: "Action blocked",
+          content: [{ type: "text", text: "Action blocked\nTry again" }],
+        },
+      }),
+    );
+    expect(result.code).toBe(0);
+    expect(result.stdout).toBe("");
+    expect(result.stderr).toBe("Warning: Action blocked\nTry again\n");
+  });
+
+  it.each([false, true])(
+    "does not JSON-wrap connection failures (soft-fail=%s)",
+    async (softFail) => {
+      const result = await runCliWithMissingSocket([
+        "tab.list",
+        "--json",
+        ...(softFail ? ["--soft-fail"] : []),
+      ]);
+      expect(result.code).toBe(1);
+      expect(result.stdout).toBe("");
+      expect(result.stderr).toContain("Error: Socket connect failed: Socket not found.");
+    },
+  );
+
   it("sends newline-framed tab.list requests and renders successful tab responses", async () => {
     const result = await runCliWithFakeHost(["tab.list"], (request) =>
       responseWithText(
@@ -270,18 +371,33 @@ describe("CLI native socket integration", () => {
     });
   });
 
-  it("propagates native host errors to stderr and exits non-zero", async () => {
-    const result = await runCliWithFakeHost(["tab.list"], (request) => ({
+  it.each([
+    ["plain text", "hello from CDP"],
+    ["JSON object text", '{"answer":42}'],
+    ["JSON string text", '"quoted"'],
+    ["a nested body key", '{"body":"nested"}'],
+    ["an empty body", ""],
+  ])("prints %s exactly and keeps --json structured", async (_label, body) => {
+    const createBodyResponse = (request: CliRequest): HostResponse => ({
       id: request.id,
-      error: {
-        content: [{ type: "text", text: "native host exploded" }],
+      result: {
+        content: hostHelpers.formatToolContent({ success: true, body, base64Encoded: false }),
       },
-    }));
+    });
 
-    expect(result.code).toBe(1);
-    expect(result.stdout).toBe("");
-    expect(result.stderr).toContain("Error: native host exploded");
-    expect(result.request.params.tool).toBe("tab.list");
+    const textResult = await runCliWithFakeHost(["network.body", "r_001"], createBodyResponse);
+    expect(textResult.code).toBe(0);
+    expect(textResult.stderr).toBe("");
+    expect(textResult.stdout).toBe(body);
+    expect(textResult.request.params).toEqual({ tool: "network.body", args: { id: "r_001" } });
+
+    const jsonResult = await runCliWithFakeHost(
+      ["network.body", "r_001", "--json"],
+      createBodyResponse,
+    );
+    expect(jsonResult.code).toBe(0);
+    expect(jsonResult.stderr).toBe("");
+    expect(JSON.parse(jsonResult.stdout)).toEqual({ success: true, body, base64Encoded: false });
   });
 
   it("prints socket diagnostics when SURF_SOCKET points at a missing socket", async () => {

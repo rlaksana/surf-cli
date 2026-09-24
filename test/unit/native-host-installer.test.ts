@@ -13,10 +13,15 @@ const path = require("node:path");
 const { spawnSync } = require("node:child_process");
 const {
   createWrapper,
+  installWithValidatedWrapper,
+  installManifest,
+  probeWindowsWrapper,
   writeManifest,
   assertListenTargetSupported,
   assertSocketAccessTargetSupported,
 } = require("../../scripts/install-native-host.cjs");
+const { removeManifest } = require("../../scripts/uninstall-native-host.cjs");
+const { runWindowsExecutable } = require("../../scripts/windows-interop.cjs");
 const { parseListenEndpoint } = require("../../native/listener.cjs");
 const {
   normalizeSocketConfig,
@@ -39,7 +44,202 @@ function envWithoutPersistedSettings() {
   return env;
 }
 
+function writeWslManifest(tempDir: string, relativeDir: string) {
+  const manifestPath = path.join(tempDir, relativeDir, "surf.browser.host.json");
+  fs.mkdirSync(path.dirname(manifestPath), { recursive: true });
+  fs.writeFileSync(manifestPath, "{}");
+  return manifestPath;
+}
+
+function wslRegistryFailure(tempDir: string, stderr: string) {
+  return {
+    execFileSync: (file: string, args: string[]) => {
+      if (file === "cmd.exe") {
+        return "C:\\Users\\Test\\AppData\\Local\r\n";
+      }
+      if (file === "wslpath" && args[0] === "-u") {
+        return `${tempDir}\n`;
+      }
+      throw Object.assign(new Error("reg delete failed"), { stderr });
+    },
+  };
+}
+
 describe("native host installer", () => {
+  it("uses a bare Windows tool when it is available", () => {
+    const calls: any[] = [];
+    const output = runWindowsExecutable("cmd.exe", ["/c", "echo", "ok"], {
+      allowWslFallback: true,
+      execFileSync: (file: string, args: string[]) => {
+        calls.push([file, args]);
+        return "ok\r\n";
+      },
+    });
+
+    expect(output).toBe("ok\r\n");
+    expect(calls).toEqual([["cmd.exe", ["/c", "echo", "ok"]]]);
+  });
+
+  it("resolves a missing bare Windows tool through wslpath", () => {
+    const calls: any[] = [];
+    const output = runWindowsExecutable("cmd.exe", ["/c", "echo", "ok"], {
+      allowWslFallback: true,
+      execFileSync: (file: string, args: string[]) => {
+        calls.push([file, args]);
+        if (file === "cmd.exe") {
+          throw Object.assign(new Error("spawn cmd.exe ENOENT"), { code: "ENOENT" });
+        }
+        if (file === "wslpath") {
+          return "/windows/System32/cmd.exe\n";
+        }
+        return "ok\r\n";
+      },
+    });
+
+    expect(output).toBe("ok\r\n");
+    expect(calls.map(([file]) => file)).toEqual([
+      "cmd.exe",
+      "wslpath",
+      "/windows/System32/cmd.exe",
+    ]);
+  });
+
+  it("reports both bare and fallback Windows tool lookup failures", () => {
+    expect(() =>
+      runWindowsExecutable("cmd.exe", ["/c", "echo", "ok"], {
+        allowWslFallback: true,
+        execFileSync: (file: string) => {
+          if (file === "cmd.exe") {
+            throw Object.assign(new Error("bare missing"), { code: "ENOENT" });
+          }
+          throw new Error("wslpath missing");
+        },
+      }),
+    ).toThrow(/cmd\.exe.*bare missing.*wslpath.*wslpath missing/);
+  });
+
+  it("does not fall back when the bare Windows tool fails for another reason", () => {
+    const calls: string[] = [];
+    expect(() =>
+      runWindowsExecutable("cmd.exe", ["/c", "exit", "1"], {
+        allowWslFallback: true,
+        execFileSync: (file: string) => {
+          calls.push(file);
+          throw Object.assign(new Error("access denied"), { code: "EACCES" });
+        },
+      }),
+    ).toThrow(/cmd\.exe.*access denied/);
+    expect(calls).toEqual(["cmd.exe"]);
+  });
+
+  it("registers a WSL Windows install and unregisters it on uninstall", () => {
+    const tempDir = makeTempDir();
+    const calls: any[] = [];
+    const manifestFsPath = path.join(
+      tempDir,
+      "BraveSoftware/Brave-Browser/User Data/NativeMessagingHosts/surf.browser.host.json",
+    );
+    const windowsManifestPath =
+      "C:\\Users\\Nico\\AppData\\Local\\BraveSoftware\\Brave-Browser\\User Data\\NativeMessagingHosts\\surf.browser.host.json";
+    const execFileSync = (file: string, args: string[]) => {
+      calls.push([file, args]);
+      if (file === "cmd.exe") {
+        return "C:\\Users\\Nico\\AppData\\Local\r\n";
+      }
+      if (file === "wslpath" && args[0] === "-u") {
+        return `${tempDir}\n`;
+      }
+      if (file === "wslpath" && args[0] === "-w") {
+        return `${windowsManifestPath}\r\n`;
+      }
+      if (file === "reg.exe") {
+        expect(fs.existsSync(manifestFsPath)).toBe(true);
+        return "completed";
+      }
+      throw new Error(`unexpected command: ${file} ${args.join(" ")}`);
+    };
+    const deps = { execFileSync };
+
+    const manifestPath = installManifest(
+      "brave",
+      extensionA,
+      "C:\\Users\\Nico\\AppData\\Local\\surf-cli\\host-wrapper-wsl.cmd",
+      "wsl-windows",
+      deps,
+    );
+    expect(manifestPath).toBe(manifestFsPath);
+    expect(fs.existsSync(manifestPath)).toBe(true);
+    expect(calls).toContainEqual([
+      "reg.exe",
+      [
+        "add",
+        "HKCU\\Software\\BraveSoftware\\Brave-Browser\\NativeMessagingHosts\\surf.browser.host",
+        "/ve",
+        "/t",
+        "REG_SZ",
+        "/d",
+        windowsManifestPath,
+        "/f",
+      ],
+    ]);
+
+    expect(removeManifest("brave", "wsl-windows", deps)).toBe(manifestPath);
+    expect(fs.existsSync(manifestPath)).toBe(false);
+    expect(calls).toContainEqual([
+      "reg.exe",
+      [
+        "delete",
+        "HKCU\\Software\\BraveSoftware\\Brave-Browser\\NativeMessagingHosts\\surf.browser.host",
+        "/f",
+      ],
+    ]);
+  });
+
+  it("removes a pre-fix WSL manifest when its registry key is already absent", () => {
+    const tempDir = makeTempDir();
+    const manifestPath = writeWslManifest(tempDir, "Google/Chrome/User Data/NativeMessagingHosts");
+    const deps = wslRegistryFailure(
+      tempDir,
+      "ERROR: The system was unable to find the specified registry key or value.\r\n",
+    );
+    const result = removeManifest("chrome", "wsl-windows", deps);
+
+    expect(result).toBe(manifestPath);
+    expect(fs.existsSync(manifestPath)).toBe(false);
+  });
+
+  it("keeps the WSL manifest when registry deletion is denied", () => {
+    const tempDir = makeTempDir();
+    const manifestPath = writeWslManifest(tempDir, "Google/Chrome/User Data/NativeMessagingHosts");
+    const deps = wslRegistryFailure(tempDir, "ERROR: Access is denied.\r\n");
+    const remove = () => removeManifest("chrome", "wsl-windows", deps);
+
+    expect(remove).toThrow(/reg\.exe.*Access is denied/);
+    expect(fs.existsSync(manifestPath)).toBe(true);
+  });
+
+  it("fails a WSL Windows install when registry registration fails", () => {
+    const tempDir = makeTempDir();
+    const execFileSync = (file: string, args: string[]) => {
+      if (file === "cmd.exe") {
+        return "C:\\Users\\Nico\\AppData\\Local\r\n";
+      }
+      if (file === "wslpath" && args[0] === "-u") {
+        return `${tempDir}\n`;
+      }
+      if (file === "wslpath" && args[0] === "-w") {
+        return "C:\\manifest.json\r\n";
+      }
+      throw new Error("registry access denied");
+    };
+
+    expect(() =>
+      installManifest("chrome", extensionA, "C:\\wrapper.cmd", "wsl-windows", {
+        execFileSync,
+      }),
+    ).toThrow(/reg\.exe.*registry access denied/);
+  });
+
   it("documents the Tailnet-only listener option", () => {
     const result = spawnSync(process.execPath, ["scripts/install-native-host.cjs", "--help"], {
       encoding: "utf8",
@@ -211,11 +411,253 @@ describe("native host installer", () => {
       });
     }
 
-    const cmdPath = createWrapper(tempDir, nodePath, hostPath, "wsl-windows");
-    expect(fs.readFileSync(path.join(tempDir, "host-wrapper-wsl.cmd"), "utf8")).toContain(
-      `"${hostPath}" %*`,
+    const cmdPath = createWrapper(
+      tempDir,
+      nodePath,
+      hostPath,
+      "wsl-windows",
+      undefined,
+      undefined,
+      undefined,
+      "Ubuntu-24.04",
+      () => "C:\\Users\\Test\\surf-cli\\host-wrapper-wsl.cmd",
     );
-    expect(cmdPath).toBeTruthy();
+    expect(fs.readFileSync(path.join(tempDir, "host-wrapper-wsl.cmd"), "utf8")).toBe(
+      `@echo off\r\nrem SURF_NATIVE_HOST_LAUNCH_PROBE_V1\r\nwsl.exe -d "Ubuntu-24.04" --cd "${path.dirname(hostPath)}" --exec "${nodePath}" "${hostPath}" %*\r\n`,
+    );
+    expect(cmdPath).toBe("C:\\Users\\Test\\surf-cli\\host-wrapper-wsl.cmd");
+  });
+
+  it("probes a generated WSL Windows wrapper through bounded cmd interop", () => {
+    const calls: any[] = [];
+    probeWindowsWrapper("C:\\Users\\Test User\\surf-cli\\host-wrapper-wsl.cmd", {
+      execFileSync: (file: string, args: string[], options: any) => {
+        calls.push([file, args, options]);
+        return "SURF_NATIVE_HOST_LAUNCH_PROBE_OK\r\n";
+      },
+    });
+
+    expect(calls).toEqual([
+      [
+        "cmd.exe",
+        [
+          "/d",
+          "/s",
+          "/c",
+          '""C:\\Users\\Test User\\surf-cli\\host-wrapper-wsl.cmd" --surf-native-host-launch-probe"',
+        ],
+        expect.objectContaining({ encoding: "utf8", timeout: 5000 }),
+      ],
+    ]);
+  });
+
+  it("preserves an installed wrapper when its Windows path cannot be resolved", () => {
+    const wrapperDir = makeTempDir();
+    const wrapperFsPath = path.join(wrapperDir, "host-wrapper-wsl.cmd");
+    fs.writeFileSync(wrapperFsPath, "existing working wrapper");
+    expect(() =>
+      createWrapper(
+        wrapperDir,
+        "/usr/bin/node",
+        "/home/surf/native/host.cjs",
+        "wsl-windows",
+        undefined,
+        undefined,
+        undefined,
+        "Ubuntu",
+        () => {
+          throw new Error("wslpath conversion failed");
+        },
+      ),
+    ).toThrow("wslpath conversion failed");
+    expect(fs.readFileSync(wrapperFsPath, "utf8")).toBe("existing working wrapper");
+  });
+
+  it("reports failed, timed out, and malformed WSL wrapper probes", () => {
+    expect(() =>
+      probeWindowsWrapper("C:\\surf\\host-wrapper-wsl.cmd", {
+        execFileSync: () => {
+          throw Object.assign(new Error("wrapper exited with status 1"), {
+            stderr: "wsl.exe could not start the distro",
+          });
+        },
+      }),
+    ).toThrow(/launch probe failed.*wsl\.exe could not start the distro/);
+
+    expect(() =>
+      probeWindowsWrapper("C:\\surf\\host-wrapper-wsl.cmd", {
+        execFileSync: () => "not the probe marker\n",
+      }),
+    ).toThrow(/launch probe failed.*unexpected output/);
+
+    expect(() =>
+      probeWindowsWrapper("C:\\surf\\host-wrapper-wsl.cmd", {
+        timeoutMs: 25,
+        execFileSync: (_file: string, _args: string[], options: any) => {
+          expect(options.timeout).toBe(25);
+          throw Object.assign(new Error("spawnSync cmd.exe ETIMEDOUT"), { code: "ETIMEDOUT" });
+        },
+      }),
+    ).toThrow(/launch probe failed.*ETIMEDOUT/);
+  });
+
+  it("does not register a WSL wrapper when its launch probe fails", () => {
+    const tempDir = makeTempDir();
+    const wrapperFsPath = path.join(tempDir, "host-wrapper-wsl.cmd");
+    fs.writeFileSync(wrapperFsPath, "original wrapper");
+    let registered = false;
+    expect(() =>
+      installWithValidatedWrapper(
+        "C:\\surf\\host-wrapper-wsl.cmd",
+        "wsl-windows",
+        () => {
+          registered = true;
+        },
+        {
+          wrapperFsPath,
+          nodePath: "/usr/bin/node",
+          hostPath: "/home/surf/native/host.cjs",
+          distro: "Ubuntu",
+          execFileSync: () => "wrong output\n",
+        },
+      ),
+    ).toThrow(/before registration/);
+    expect(registered).toBe(false);
+    expect(fs.readFileSync(wrapperFsPath, "utf8")).toBe("original wrapper");
+  });
+
+  it("uses the Windows default distro only after the launch probe confirms its identity", () => {
+    const tempDir = makeTempDir();
+    const wrapperFsPath = path.join(tempDir, "host-wrapper-wsl.cmd");
+    const nodePath = "/usr/bin/node";
+    const hostPath = "/home/surf/native/host.cjs";
+    const explicit = `@echo off\r\nrem SURF_NATIVE_HOST_LAUNCH_PROBE_V1\r\nwsl.exe -d "Ubuntu" --cd "/home/surf/native" --exec "${nodePath}" "${hostPath}" %*\r\n`;
+    const fallback = `@echo off\r\nrem SURF_NATIVE_HOST_LAUNCH_PROBE_V1\r\nwsl.exe --cd "/home/surf/native" --exec "${nodePath}" "${hostPath}" %*\r\n`;
+    fs.writeFileSync(wrapperFsPath, explicit);
+    let attempts = 0;
+    const result = installWithValidatedWrapper(
+      "C:\\surf\\host-wrapper-wsl.cmd",
+      "wsl-windows",
+      () => "registered",
+      {
+        wrapperFsPath,
+        nodePath,
+        hostPath,
+        distro: "Ubuntu",
+        execFileSync: (_file: string, args: string[]) => {
+          attempts++;
+          if (attempts === 1) {
+            expect(fs.readFileSync(wrapperFsPath, "utf8")).toBe(explicit);
+            throw new Error("WSL_E_DISTRO_NOT_FOUND");
+          }
+          expect(fs.readFileSync(wrapperFsPath, "utf8")).toBe(fallback);
+          expect(args[3]).toContain("--surf-native-host-launch-probe-distro");
+          return 'SURF_NATIVE_HOST_LAUNCH_PROBE_OK:"Ubuntu"\n';
+        },
+      },
+    );
+    expect(result).toBe("registered");
+    expect(attempts).toBe(2);
+    expect(fs.readFileSync(wrapperFsPath, "utf8")).toBe(fallback);
+  });
+
+  it("keeps explicit distro selection when its wrapper launches successfully", () => {
+    const tempDir = makeTempDir();
+    const wrapperFsPath = path.join(tempDir, "host-wrapper-wsl.cmd");
+    fs.writeFileSync(wrapperFsPath, "explicit wrapper");
+    const installed = installWithValidatedWrapper(
+      "C:\\surf\\host-wrapper-wsl.cmd",
+      "wsl-windows",
+      () => "registered",
+      {
+        wrapperFsPath,
+        distro: "Ubuntu",
+        execFileSync: () => "SURF_NATIVE_HOST_LAUNCH_PROBE_OK\n",
+      },
+    );
+    expect(installed).toBe("registered");
+    expect(fs.readFileSync(wrapperFsPath, "utf8")).toBe("explicit wrapper");
+  });
+
+  it.each([null, "Other", "broken"])("rejects an unverified default distro %s", (identity) => {
+    const tempDir = makeTempDir();
+    const wrapperFsPath = path.join(tempDir, "host-wrapper-wsl.cmd");
+    fs.writeFileSync(wrapperFsPath, "explicit wrapper");
+    let registered = false;
+    let attempts = 0;
+    expect(() =>
+      installWithValidatedWrapper(
+        "C:\\surf\\host-wrapper-wsl.cmd",
+        "wsl-windows",
+        () => {
+          registered = true;
+        },
+        {
+          wrapperFsPath,
+          nodePath: "/usr/bin/node",
+          hostPath: "/home/surf/native/host.cjs",
+          distro: "Ubuntu",
+          execFileSync: () => {
+            attempts++;
+            if (attempts === 1) {
+              throw new Error("WSL_E_DISTRO_NOT_FOUND");
+            }
+            return identity === "broken"
+              ? "unexpected output"
+              : `SURF_NATIVE_HOST_LAUNCH_PROBE_OK:${JSON.stringify(identity)}\n`;
+          },
+        },
+      ),
+    ).toThrow(/before registration/);
+    expect(registered).toBe(false);
+    expect(fs.readFileSync(wrapperFsPath, "utf8")).toBe("explicit wrapper");
+  });
+
+  it("does not probe ordinary native-host wrappers", () => {
+    const result = installWithValidatedWrapper("/tmp/host-wrapper.sh", "linux", () => "installed", {
+      execFileSync: () => {
+        throw new Error("probe should not run");
+      },
+    });
+
+    expect(result).toBe("installed");
+  });
+
+  it("launch probe exits without creating a Surf socket", () => {
+    const tempDir = makeTempDir();
+    const socketPath = path.join(tempDir, "surf.sock");
+    const result = spawnSync(
+      process.execPath,
+      ["native/host.cjs", "--surf-native-host-launch-probe"],
+      {
+        encoding: "utf8",
+        env: { ...process.env, SURF_SOCKET: socketPath },
+        timeout: 5000,
+      },
+    );
+
+    expect(result.status).toBe(0);
+    expect(result.signal).toBeNull();
+    expect(result.stdout).toBe("SURF_NATIVE_HOST_LAUNCH_PROBE_OK\n");
+    expect(result.stderr).toBe("");
+    expect(fs.existsSync(socketPath)).toBe(false);
+  });
+
+  it("launch probe reports only the WSL distro identity without opening a socket", () => {
+    const socketPath = path.join(makeTempDir(), "surf.sock");
+    const result = spawnSync(
+      process.execPath,
+      ["native/host.cjs", "--surf-native-host-launch-probe-distro"],
+      {
+        encoding: "utf8",
+        env: { ...process.env, SURF_SOCKET: socketPath, WSL_DISTRO_NAME: "Ubuntu" },
+        timeout: 5000,
+      },
+    );
+    expect(result.status).toBe(0);
+    expect(result.stdout).toBe('SURF_NATIVE_HOST_LAUNCH_PROBE_OK:"Ubuntu"\n');
+    expect(result.stderr).toBe("");
+    expect(fs.existsSync(socketPath)).toBe(false);
   });
 
   it("validates Tailnet-only listener endpoints and persists the wrapper setting", () => {
@@ -293,6 +735,88 @@ describe("native host installer", () => {
 
     expect(result.status).toBe(1);
     expect(result.stderr).toContain("--target linux is only supported on Linux or WSL2");
+  });
+
+  it("does not mutate the Windows registry for explicit Linux install or uninstall in WSL", ({
+    skip,
+  }) => {
+    if (process.platform !== "linux") {
+      skip();
+    }
+    const tempDir = makeTempDir();
+    const binDir = path.join(tempDir, "bin");
+    const marker = path.join(tempDir, "registry-called");
+    fs.mkdirSync(binDir);
+    const regPath = path.join(binDir, "reg.exe");
+    fs.writeFileSync(regPath, `#!/bin/sh\ntouch "${marker}"\n`);
+    fs.chmodSync(regPath, 0o755);
+    const env = {
+      ...process.env,
+      HOME: tempDir,
+      PATH: `${binDir}:${process.env.PATH}`,
+      WSL_DISTRO_NAME: "SurfTest",
+      SURF_NODE_PATH: process.execPath,
+      SURF_HOST_PATH: path.resolve("native/host.cjs"),
+    };
+
+    for (const args of [
+      ["scripts/install-native-host.cjs", extensionA, "--target", "linux"],
+      ["scripts/uninstall-native-host.cjs", "--target", "linux"],
+    ]) {
+      const result = spawnSync(process.execPath, args, { encoding: "utf8", env });
+      expect(result.status).toBe(0);
+      expect(fs.existsSync(marker)).toBe(false);
+    }
+  });
+
+  it("continues WSL --all cleanup when one browser registry key is already absent", ({ skip }) => {
+    if (process.platform !== "linux") {
+      skip();
+    }
+    const tempDir = makeTempDir();
+    const binDir = path.join(tempDir, "bin");
+    const wrapperDir = path.join(tempDir, "surf-cli");
+    const chromeManifest = writeWslManifest(
+      tempDir,
+      "Google/Chrome/User Data/NativeMessagingHosts",
+    );
+    const braveManifest = writeWslManifest(
+      tempDir,
+      "BraveSoftware/Brave-Browser/User Data/NativeMessagingHosts",
+    );
+    fs.mkdirSync(binDir);
+    fs.mkdirSync(wrapperDir);
+    fs.writeFileSync(path.join(wrapperDir, "host-wrapper-wsl.cmd"), "@echo off\r\n");
+    fs.writeFileSync(
+      path.join(binDir, "cmd.exe"),
+      "#!/bin/sh\nprintf '%s\\r\\n' 'C:\\Users\\Test\\AppData\\Local'\n",
+    );
+    fs.writeFileSync(path.join(binDir, "wslpath"), `#!/bin/sh\nprintf '%s\\n' '${tempDir}'\n`);
+    fs.writeFileSync(
+      path.join(binDir, "reg.exe"),
+      "#!/bin/sh\ncase \"$*\" in *'Google\\Chrome'*) echo 'ERROR: The system was unable to find the specified registry key or value.' >&2; exit 1;; esac\n",
+    );
+    for (const file of ["cmd.exe", "wslpath", "reg.exe"]) {
+      fs.chmodSync(path.join(binDir, file), 0o755);
+    }
+
+    const result = spawnSync(
+      process.execPath,
+      ["scripts/uninstall-native-host.cjs", "--all", "--target", "windows"],
+      {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          PATH: `${binDir}:${process.env.PATH}`,
+          WSL_DISTRO_NAME: "SurfTest",
+        },
+      },
+    );
+
+    expect(result.status).toBe(0);
+    expect(fs.existsSync(chromeManifest)).toBe(false);
+    expect(fs.existsSync(braveManifest)).toBe(false);
+    expect(fs.existsSync(wrapperDir)).toBe(false);
   });
 
   it("rejects uninstall --target linux on non-Linux platforms", ({ skip }) => {

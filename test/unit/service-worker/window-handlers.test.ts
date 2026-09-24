@@ -53,10 +53,7 @@ describe("window command handlers", () => {
       chrome.windows.create.mockResolvedValue({ id: 123 });
       chrome.tabs.query.mockResolvedValue([{ id: 456 }]);
 
-      await handleMessage(
-        { type: "WINDOW_NEW", url: "https://example.com", focused: true },
-        {},
-      );
+      await handleMessage({ type: "WINDOW_NEW", url: "https://example.com", focused: true }, {});
 
       expect(chrome.windows.create).toHaveBeenCalledWith(
         expect.objectContaining({ focused: false }),

@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createChromeMock, resetChromeMock } from "../../mocks/chrome";
 
 vi.mock("../../../src/native/port-manager", () => ({
@@ -15,6 +15,7 @@ async function loadHandleMessage() {
 
 describe("browser session handlers", () => {
   beforeEach(() => resetChromeMock());
+  afterEach(() => vi.useRealTimers());
 
   it("creates session windows unfocused and labels the bound tab", async () => {
     const handleMessage = await loadHandleMessage();
@@ -113,6 +114,154 @@ describe("browser session handlers", () => {
     ).rejects.toMatchObject({ code: "screenshot_target_not_visible" });
     expect(chrome.tabs.update).not.toHaveBeenCalled();
     expect(chrome.windows.update).not.toHaveBeenCalled();
+  });
+
+  it("settles direct capture after a CDP timeout without capturing another strict tab", async () => {
+    vi.useFakeTimers();
+    const handleMessage = await loadHandleMessage();
+    const chrome = (globalThis as any).chrome;
+    chrome.tabs.get.mockResolvedValue({
+      id: 61,
+      windowId: 14,
+      active: false,
+      groupId: -1,
+      url: "https://example.com/",
+    });
+    chrome.tabs.query.mockResolvedValue([{ id: 62, windowId: 14, active: true }]);
+    chrome.debugger.sendCommand.mockImplementation((_target: unknown, method: string) =>
+      method === "Page.captureScreenshot"
+        ? new Promise(() => {
+            /* intentionally pending */
+          })
+        : Promise.resolve({}),
+    );
+
+    const capture = handleMessage(
+      { type: "EXECUTE_SCREENSHOT", tabId: 61, strictTarget: true },
+      {},
+    );
+    const rejection = expect(capture).rejects.toMatchObject({
+      code: "screenshot_target_not_visible",
+    });
+    await vi.advanceTimersByTimeAsync(5050);
+
+    await rejection;
+  });
+
+  it("preserves page output and reports a timed-out optional screenshot", async () => {
+    vi.useFakeTimers();
+    const handleMessage = await loadHandleMessage();
+    const chrome = (globalThis as any).chrome;
+    chrome.tabs.sendMessage.mockImplementation((_tabId: number, message: { type: string }) => {
+      if (message.type === "GENERATE_ACCESSIBILITY_TREE") {
+        return Promise.resolve({
+          pageContent: "primary output",
+          viewport: { width: 800, height: 600 },
+        });
+      }
+      return Promise.resolve({});
+    });
+    chrome.debugger.sendCommand.mockImplementation((_target: unknown, method: string) =>
+      method === "Page.captureScreenshot"
+        ? new Promise(() => {
+            /* intentionally pending */
+          })
+        : Promise.resolve({}),
+    );
+
+    const read = handleMessage(
+      {
+        type: "READ_PAGE",
+        tabId: 71,
+        options: { includeScreenshot: true },
+      },
+      {},
+    );
+    await vi.advanceTimersByTimeAsync(5050);
+
+    await expect(read).resolves.toEqual({
+      pageContent: "primary output",
+      viewport: { width: 800, height: 600 },
+      screenshotError: "Screenshot capture timed out after 5000ms",
+    });
+  });
+
+  it("adds tab/frame identity to semantic observations and forwards guarded actions", async () => {
+    const handleMessage = await loadHandleMessage();
+    const chrome = (globalThis as any).chrome;
+    const identity = {
+      fullUrl: "https://example.test/frame",
+      documentToken: "doc-1",
+      ref: "e1",
+      role: "button",
+      name: "Continue",
+      type: "button",
+    };
+    chrome.tabs.sendMessage.mockImplementation((_tabId: number, message: { type: string }) => {
+      if (message.type === "GENERATE_ACCESSIBILITY_TREE") {
+        return Promise.resolve({ semanticObservation: { identity }, pageContent: "ordinary" });
+      }
+      return Promise.resolve({ success: true });
+    });
+
+    const read: any = await handleMessage(
+      { type: "READ_PAGE", tabId: 71, frameId: 4, options: { semanticObservation: true } },
+      {},
+    );
+    expect(read.semanticObservation.identity).toMatchObject({ tabId: 71, frameId: 4 });
+
+    await handleMessage(
+      { type: "CLICK_REF", tabId: 71, frameId: 4, ref: "e1", expectedIdentity: identity },
+      {},
+    );
+    expect(chrome.tabs.sendMessage).toHaveBeenLastCalledWith(
+      71,
+      { type: "CLICK_ELEMENT", ref: "e1", button: "left", expectedIdentity: identity },
+      { frameId: 4 },
+    );
+
+    await handleMessage(
+      {
+        type: "EXECUTE_NAVIGATE",
+        tabId: 71,
+        frameId: 4,
+        url: "https://example.test/next",
+        expectedIdentity: identity,
+      },
+      {},
+    );
+    expect(chrome.tabs.sendMessage).toHaveBeenLastCalledWith(
+      71,
+      { type: "SEMANTIC_NAVIGATE", url: "https://example.test/next", expectedIdentity: identity },
+      { frameId: 4 },
+    );
+
+    await handleMessage(
+      {
+        type: "EXECUTE_SCROLL",
+        tabId: 71,
+        frameId: 4,
+        deltaX: 0,
+        deltaY: 600,
+        expectedIdentity: identity,
+      },
+      {},
+    );
+    expect(chrome.tabs.sendMessage).toHaveBeenLastCalledWith(
+      71,
+      { type: "SEMANTIC_SCROLL", deltaX: 0, deltaY: 600, expectedIdentity: identity },
+      { frameId: 4 },
+    );
+
+    await handleMessage(
+      { type: "SCROLL_TO_POSITION", tabId: 71, frameId: 4, position: "bottom" },
+      {},
+    );
+    expect(chrome.tabs.sendMessage).toHaveBeenLastCalledWith(
+      71,
+      { type: "SCROLL_TO_POSITION", position: "bottom", selector: undefined },
+      { frameId: 4 },
+    );
   });
 
   it("uses only an explicit host-provided frame context", async () => {

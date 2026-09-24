@@ -23,6 +23,14 @@ describe("tool scope classification", () => {
 
   it("keeps tab operations independent and provider browser flows exclusive", () => {
     expect(classifyTool("page.read")).toMatchObject({ scope: "tab", targetUse: "default-tab" });
+    expect(classifyTool("semantic.localCompare")).toMatchObject({
+      scope: "tab",
+      targetUse: "default-tab",
+    });
+    expect(classifyTool("semantic.scrollScope")).toMatchObject({
+      scope: "tab",
+      targetUse: "default-tab",
+    });
     expect(classifyTool("chatgpt")).toMatchObject({ scope: "provider", targetUse: "default-tab" });
     expect(classifyTool("oracle.result")).toMatchObject({ scope: "host", targetUse: "host" });
   });
@@ -46,6 +54,26 @@ describe("tool scope classification", () => {
     const classified = classifyTool("network.export", { output: "same.har" });
     expect(classified).toMatchObject({ scope: "tab", targetUse: "default-tab" });
     expect(classified.resourceKeys).toEqual([`file:${require("node:path").resolve("same.har")}`]);
+  });
+
+  it("keeps readiness probes on the tab lane", () => {
+    expect(classifyTool("wait.ready", { selector: ".x" })).toEqual({
+      scope: "tab",
+      targetUse: "default-tab",
+      resourceKeys: [],
+    });
+    expect(classifyTool("page.readiness", {})).toEqual({
+      scope: "tab",
+      targetUse: "default-tab",
+      resourceKeys: [],
+    });
+  });
+
+  it("keeps frame.diagnose on the tab lane", () => {
+    expect(classifyTool("frame.diagnose", {})).toMatchObject({
+      scope: "tab",
+      targetUse: "default-tab",
+    });
   });
 
   it("fails conservative for unclassified browser commands", () => {

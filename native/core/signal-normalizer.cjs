@@ -49,7 +49,7 @@ function createNormalizer(emitFn) {
    * @returns {SignalEnvelope|null}
    */
   function normalizeCDPEvent(event) {
-    if (!event || !event.method) {
+    if (!event?.method) {
       return null;
     }
 
@@ -115,7 +115,7 @@ function createNormalizer(emitFn) {
     if (typeof window !== "undefined" && window.Tampermonkey === undefined) {
       return null;
     }
-    if (!event || !event.detail) {
+    if (!event?.detail) {
       return null;
     }
 

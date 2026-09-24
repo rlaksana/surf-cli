@@ -190,6 +190,26 @@ describe("mapToolToMessage", () => {
       });
     });
 
+    it("enables structured semantic observation only through the internal flag", () => {
+      expect(helpers.mapToolToMessage("page.read", {}).options).not.toHaveProperty(
+        "semanticObservation",
+      );
+      expect(
+        helpers.mapToolToMessage("page.read", { semanticObservation: true }).options
+          .semanticObservation,
+      ).toBe(true);
+    });
+
+    it("pins internal semantic reads to the designated frame", () => {
+      expect(
+        helpers.mapToolToMessage(
+          "page.read",
+          { semanticObservation: true, semanticFrameId: 4 },
+          71,
+        ),
+      ).toMatchObject({ type: "READ_PAGE", tabId: 71, frameId: 4 });
+    });
+
     it("throws when max-bytes is not a positive integer", () => {
       for (const bad of ["abc", "0", "-5", "12abc", "1.5", " ", ""]) {
         expect(() => helpers.mapToolToMessage("page.read", { "max-bytes": bad })).toThrow(
@@ -411,6 +431,177 @@ describe("mapToolToMessage", () => {
       expect(helpers.mapToolToMessage("unknown.command", {})).toBeNull();
     });
   });
+
+  describe("internal semantic browser operations", () => {
+    it("maps local compare and pinned scroll scope without public fallbacks", () => {
+      const identity = { fullUrl: "https://example.test", documentToken: "doc" };
+      expect(
+        helpers.mapToolToMessage(
+          "semantic.localCompare",
+          {
+            ref: "e4",
+            predicate: { kind: "visible" },
+            semanticExpectedIdentity: identity,
+            semanticFrameId: 2,
+          },
+          7,
+        ),
+      ).toEqual({
+        type: "SEMANTIC_LOCAL_COMPARE",
+        tabId: 7,
+        frameId: 2,
+        ref: "e4",
+        predicate: { kind: "visible" },
+        expectedIdentity: identity,
+      });
+      expect(
+        helpers.mapToolToMessage(
+          "semantic.scrollScope",
+          {
+            action: "advance",
+            scopeToken: "opaque",
+            semanticExpectedIdentity: identity,
+          },
+          7,
+        ),
+      ).toMatchObject({
+        type: "SEMANTIC_SCROLL_SCOPE",
+        tabId: 7,
+        action: "advance",
+        scopeToken: "opaque",
+      });
+      expect(() =>
+        helpers.mapToolToMessage("semantic.scrollScope", { action: "bottom" }, 7),
+      ).toThrow("inspect, top, or advance");
+    });
+  });
+});
+
+describe("applySemanticExpectedIdentity", () => {
+  const expected = {
+    browserEpoch: "epoch-1",
+    tabId: 7,
+    frameId: 3,
+    fullUrl: "https://example.test/page",
+    documentToken: "document-1",
+    ref: "e4",
+    role: "button",
+    name: "Continue",
+    type: "button",
+  };
+
+  it("attaches only the DOM portion after host identity validation", () => {
+    const message: any = { type: "CLICK_REF", ref: "e4", frameId: 3 };
+    helpers.applySemanticExpectedIdentity(
+      { browserIdentity: { browserEpoch: "epoch-1" }, target: { tabId: 7 } },
+      message,
+      { semanticExpectedIdentity: expected },
+    );
+    expect(message.expectedIdentity).toEqual({
+      fullUrl: expected.fullUrl,
+      documentToken: expected.documentToken,
+      ref: expected.ref,
+      role: expected.role,
+      name: expected.name,
+      type: expected.type,
+    });
+  });
+
+  it("rejects stale epochs, tabs, frames, and refs before extension dispatch", () => {
+    for (const message of [
+      { type: "CLICK_REF", ref: "other", frameId: 3 },
+      { type: "CLICK_REF", ref: "e4", frameId: 2 },
+    ]) {
+      expect(() =>
+        helpers.applySemanticExpectedIdentity(
+          { browserIdentity: { browserEpoch: "epoch-1" }, target: { tabId: 7 } },
+          message,
+          { semanticExpectedIdentity: expected },
+        ),
+      ).toThrow("stale_observation");
+    }
+    expect(() =>
+      helpers.applySemanticExpectedIdentity(
+        { browserIdentity: { browserEpoch: "new-epoch" }, target: { tabId: 7 } },
+        { type: "CLICK_REF", ref: "e4", frameId: 3 },
+        { semanticExpectedIdentity: expected },
+      ),
+    ).toThrow("stale_observation");
+  });
+
+  it.each(["EXECUTE_NAVIGATE", "EXECUTE_SCROLL", "SCROLL_TO_POSITION"])(
+    "forwards document identity for guarded %s",
+    (type) => {
+      const message: any = { type, frameId: 3 };
+      helpers.applySemanticExpectedIdentity(
+        { browserIdentity: { browserEpoch: "epoch-1" }, target: { tabId: 7 } },
+        message,
+        { semanticExpectedIdentity: expected },
+      );
+      expect(message.expectedIdentity).toEqual({
+        fullUrl: expected.fullUrl,
+        documentToken: expected.documentToken,
+      });
+    },
+  );
+
+  it("guards local compare with full element identity", () => {
+    const message: any = { type: "SEMANTIC_LOCAL_COMPARE", ref: "e4", frameId: 3 };
+    helpers.applySemanticExpectedIdentity(
+      { browserIdentity: { browserEpoch: "epoch-1" }, target: { tabId: 7 } },
+      message,
+      { semanticExpectedIdentity: expected },
+    );
+    expect(message.expectedIdentity).toEqual({
+      fullUrl: expected.fullUrl,
+      documentToken: expected.documentToken,
+      ref: expected.ref,
+      role: expected.role,
+      name: expected.name,
+      type: expected.type,
+    });
+  });
+
+  it("guards pinned scroll scope with host and document identity", () => {
+    const message: any = { type: "SEMANTIC_SCROLL_SCOPE", action: "inspect", frameId: 3 };
+    helpers.applySemanticExpectedIdentity(
+      { browserIdentity: { browserEpoch: "epoch-1" }, target: { tabId: 7 } },
+      message,
+      { semanticExpectedIdentity: expected },
+    );
+    expect(message.expectedIdentity).toEqual({
+      fullUrl: expected.fullUrl,
+      documentToken: expected.documentToken,
+    });
+  });
+
+  it.each(["SEMANTIC_LOCAL_COMPARE", "SEMANTIC_SCROLL_SCOPE"])(
+    "requires host identity for internal %s dispatch",
+    (type) => {
+      expect(() =>
+        helpers.applySemanticExpectedIdentity(
+          { browserIdentity: { browserEpoch: "epoch-1" }, target: { tabId: 7 } },
+          { type, ref: "e4", frameId: 3 },
+          {},
+        ),
+      ).toThrow("semantic expected identity is required");
+    },
+  );
+
+  it.each(["EXECUTE_NAVIGATE", "EXECUTE_SCROLL", "SCROLL_TO_POSITION"])(
+    "rejects %s on a replacement target before extension dispatch",
+    (type) => {
+      const message: any = { type, frameId: 3 };
+      expect(() =>
+        helpers.applySemanticExpectedIdentity(
+          { browserIdentity: { browserEpoch: "epoch-1" }, target: { tabId: 8 } },
+          message,
+          { semanticExpectedIdentity: expected },
+        ),
+      ).toThrow("stale_observation");
+      expect(message.expectedIdentity).toBeUndefined();
+    },
+  );
 });
 
 describe("formatToolError", () => {
@@ -446,6 +637,32 @@ describe("formatToolError", () => {
 });
 
 describe("formatToolContent", () => {
+  it("preserves internal semantic compare and scroll-scope responses", () => {
+    const compare = { success: true, matches: false, reason: "compared", identity: { ref: "e1" } };
+    const scope = { success: true, scopeToken: "opaque", geometry: { scrollTop: 0 } };
+    expect(JSON.parse(helpers.formatToolContent(compare)[0].text)).toEqual(compare);
+    expect(JSON.parse(helpers.formatToolContent(scope)[0].text)).toEqual(scope);
+  });
+
+  it("preserves the internal structured semantic observation envelope", () => {
+    const observation = {
+      version: 1,
+      identity: { documentToken: "doc-1" },
+      candidates: [],
+      chunks: [],
+    };
+    const content = helpers.formatToolContent({
+      pageContent: "legacy text",
+      viewport: { width: 800, height: 600 },
+      semanticObservation: observation,
+    });
+    expect(JSON.parse(content[0].text)).toEqual({
+      pageContent: "legacy text",
+      viewport: { width: 800, height: 600 },
+      semanticObservation: observation,
+    });
+  });
+
   it("preserves browser session results as reviewable JSON", () => {
     const result = helpers.formatToolContent({
       session: { name: "research", tabId: 10, queue: { active: false } },
@@ -497,6 +714,26 @@ describe("formatToolContent", () => {
       });
       expect(result[0].text).not.toContain("_resolvedTabId");
     });
+
+    it("strips _resolvedWindowId from JSON output", () => {
+      const result = helpers.formatToolContent({
+        state: "ready",
+        evidence: [],
+        _resolvedTabId: 123,
+        _resolvedWindowId: 456,
+      });
+      expect(JSON.parse(result[0].text)).toEqual({ state: "ready", evidence: [] });
+    });
+
+    it("keeps public ids and hints while stripping internal window routing", () => {
+      const result = helpers.formatToolContent({
+        id: 7,
+        windowId: 456,
+        _resolvedWindowId: 456,
+        _hint: "Try another window",
+      });
+      expect(result[0].text).toBe('{"id":7,"windowId":456}\n[hint] Try another window');
+    });
   });
 
   describe("scroll responses", () => {
@@ -540,6 +777,74 @@ describe("formatToolContent", () => {
     it("returns OK for null/undefined", () => {
       expect(helpers.formatToolContent(null)[0].text).toBe("OK");
       expect(helpers.formatToolContent(undefined)[0].text).toBe("OK");
+    });
+  });
+});
+
+describe("frame.diagnose", () => {
+  it("maps to FRAME_DIAGNOSE with the tab id", () => {
+    expect(helpers.mapToolToMessage("frame.diagnose", {}, 9)).toEqual({
+      type: "FRAME_DIAGNOSE",
+      tabId: 9,
+    });
+  });
+});
+
+describe("readiness tools", () => {
+  it("maps wait.ready with CLI flag spelling", () => {
+    const msg = helpers.mapToolToMessage(
+      "wait.ready",
+      {
+        selector: ".x",
+        "url-prefix": "https://a/",
+        "empty-text": "None",
+        timeout: 5000,
+        interval: 200,
+        accept: "login",
+      },
+      7,
+    );
+    expect(msg).toEqual({
+      type: "WAIT_FOR_READY",
+      expect: { selector: ".x", urlPrefix: "https://a/", emptyText: "None" },
+      timeout: 5000,
+      interval: 200,
+      accept: "login",
+      tabId: 7,
+    });
+  });
+
+  it("maps page.readiness with socket API spelling and drops empty values", () => {
+    const msg = helpers.mapToolToMessage(
+      "page.readiness",
+      { urlPrefix: "https://a/", text: "  ", selector: "" },
+      7,
+    );
+    expect(msg).toEqual({ type: "PAGE_READINESS", expect: { urlPrefix: "https://a/" }, tabId: 7 });
+  });
+
+  it("renders wait.ready results as JSON rather than the generic page-loaded line", () => {
+    const content = helpers.formatToolContent({
+      state: "ready",
+      evidence: ["document.readyState is complete"],
+      readyState: "complete",
+      polls: 2,
+      waited: 410,
+      _resolvedTabId: 7,
+    });
+    expect(content).toHaveLength(1);
+    expect(JSON.parse(content[0].text)).toEqual({
+      state: "ready",
+      evidence: ["document.readyState is complete"],
+      readyState: "complete",
+      polls: 2,
+      waited: 410,
+    });
+  });
+
+  it("prefers camelCase over hyphenated spelling when both are present", () => {
+    expect(helpers.readinessExpectations({ urlPrefix: "a", "url-prefix": "b" })).toEqual({
+      urlPrefix: "a",
     });
   });
 });

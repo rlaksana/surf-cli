@@ -1,4 +1,15 @@
+import { setNativeValue } from "./native-value";
+import {
+  createDomProbe,
+  InvalidReadinessSelectorError,
+  probePageReadiness,
+} from "./page-readiness-probe";
 import type { VisualIndicatorMessageType } from "./visual-indicator.ts";
+import {
+  inspectSemanticScrollScope,
+  moveSemanticScrollScope,
+  scrollToPosition,
+} from "../utils/scroll-position";
 
 export {};
 
@@ -16,6 +27,303 @@ interface ModalState {
   type: 'dialog' | 'alertdialog';
   description: string;
   clearedBy: string;
+}
+
+const SEMANTIC_MAX_CANDIDATES = 64;
+const SEMANTIC_MAX_CHUNKS = 48;
+const SEMANTIC_MAX_BYTES = 24 * 1024;
+const semanticDocumentToken = (() => {
+  try {
+    return globalThis.crypto?.randomUUID?.() || `doc-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  } catch {
+    return `doc-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  }
+})();
+
+function boundedText(value: string | null | undefined, maxLength: number): string {
+  return (value || "").replace(/\s+/g, " ").trim().slice(0, maxLength);
+}
+
+function semanticElementType(element: Element): string {
+  const tag = element.tagName.toLowerCase();
+  if (tag === "input") return boundedText(element.getAttribute("type") || "text", 32).toLowerCase();
+  return tag;
+}
+
+type SemanticInteractiveState = {
+  checked?: boolean | "mixed";
+  selected?: boolean;
+};
+
+function semanticInteractiveState(element: Element): SemanticInteractiveState | undefined {
+  const state: SemanticInteractiveState = {};
+  const checked = element.getAttribute("aria-checked");
+  if (checked === "true" || checked === "false" || checked === "mixed") {
+    state.checked = checked === "mixed" ? "mixed" : checked === "true";
+  } else if (element instanceof HTMLInputElement && (element.type === "checkbox" || element.type === "radio")) {
+    state.checked = element.type === "checkbox" && element.indeterminate ? "mixed" : element.checked;
+  }
+  const selected = element.getAttribute("aria-selected");
+  if (selected === "true" || selected === "false") {
+    state.selected = selected === "true";
+  } else if (element.tagName.toLowerCase() === "option") {
+    state.selected = (element as HTMLOptionElement).selected;
+  }
+  return Object.keys(state).length ? state : undefined;
+}
+
+function semanticStateEvidence(candidate: {
+  role: string;
+  name: string;
+  state?: SemanticInteractiveState;
+}): string {
+  if (!candidate.state) return "";
+  const labels: string[] = [];
+  if (candidate.state.checked !== undefined) {
+    labels.push(candidate.state.checked === "mixed" ? "[checked=mixed]" : candidate.state.checked ? "[checked]" : "[unchecked]");
+  }
+  if (candidate.state.selected !== undefined) {
+    labels.push(candidate.state.selected ? "[selected]" : "[not-selected]");
+  }
+  const name = candidate.name ? ` "${candidate.name.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"` : "";
+  return boundedText(`${candidate.role}${name} ${labels.join(" ")}`, 240);
+}
+
+// Accessible labels are deliberately rebuilt here rather than copied from the
+// ordinary read tree: the latter preserves legacy behavior that can use an
+// input's current value as its name.
+function getValueFreeSemanticName(element: Element): string {
+  const labelledBy = element.getAttribute("aria-labelledby");
+  if (labelledBy) {
+    const label = labelledBy.split(/\s+/).map((id) => document.getElementById(id)?.textContent || "").join(" ");
+    if (boundedText(label, 160)) return boundedText(label, 160);
+  }
+  for (const attribute of ["aria-label", "placeholder", "title", "alt"]) {
+    const label = boundedText(element.getAttribute(attribute), 160);
+    if (label) return label;
+  }
+  if (element.id) {
+    const label = document.querySelector(`label[for="${element.id}"]`);
+    const text = boundedText(label?.textContent, 160);
+    if (text) return text;
+  }
+  const tag = element.tagName.toLowerCase();
+  if (["button", "a", "summary"].includes(tag)) {
+    const text = boundedText(element.textContent, 160);
+    if (text) return text;
+    if (tag === "a") {
+      const image = element.querySelector("img");
+      for (const attribute of ["aria-label", "alt", "title"]) {
+        const label = boundedText(image?.getAttribute(attribute), 160);
+        if (label) return label;
+      }
+    }
+  }
+  return "";
+}
+
+function isSemanticControl(element: Element): boolean {
+  const tag = element.tagName.toLowerCase();
+  return ["input", "textarea", "select", "option", "button"].includes(tag) || element.getAttribute("contenteditable") === "true";
+}
+
+function isVisibleSemanticElement(element: Element): boolean {
+  const style = window.getComputedStyle(element);
+  const rect = element.getBoundingClientRect();
+  return style.display !== "none" && style.visibility !== "hidden" && style.opacity !== "0" &&
+    rect.top < window.innerHeight && rect.bottom > 0 && rect.left < window.innerWidth && rect.right > 0;
+}
+
+function collectValueFreeText(root: Element, maxLength: number): string {
+  const parts: string[] = [];
+  const visit = (node: Node): void => {
+    if (parts.join(" ").length >= maxLength) return;
+    if (node.nodeType === Node.TEXT_NODE) {
+      const value = boundedText(node.textContent, maxLength);
+      if (value) parts.push(value);
+      return;
+    }
+    if (!(node instanceof Element) || isSemanticControl(node)) return;
+    const tag = node.tagName.toLowerCase();
+    if (["script", "style", "noscript", "template"].includes(tag)) return;
+    for (const child of Array.from(node.childNodes)) visit(child);
+  };
+  visit(root);
+  return boundedText(parts.join(" "), maxLength);
+}
+
+function semanticNearbyContext(element: Element, name: string): string {
+  const normalizedName = boundedText(name, 160).toLocaleLowerCase();
+  let fallback = "";
+  let ancestor = element.parentElement;
+  for (let depth = 0; ancestor && depth < 4; depth++, ancestor = ancestor.parentElement) {
+    const text = collectValueFreeText(ancestor, 240);
+    if (!text) continue;
+    fallback = text;
+    if (text.toLocaleLowerCase() !== normalizedName) return text;
+  }
+  return fallback;
+}
+
+function buildSemanticObservation() {
+  const seenElements = new Set<Element>();
+  const allCandidates = Object.entries(getElementMap()).flatMap(([ref, entry]) => {
+    const element = entry.element.deref();
+    if (!element || seenElements.has(element) || ("isConnected" in element && element.isConnected === false) || !isVisibleSemanticElement(element)) return [];
+    seenElements.add(element);
+    const role = getResolvedRole(element);
+    if (!isFocusable(element) && role === "generic") return [];
+    const name = getValueFreeSemanticName(element);
+    return [{
+      ref,
+      role: boundedText(role, 40),
+      name,
+      type: semanticElementType(element),
+      state: semanticInteractiveState(element),
+      representation: element.tagName.toLowerCase() === "a"
+        ? boundedText(element.textContent, 160) ? "text" : element.querySelector("img") ? "image" : "other"
+        : undefined,
+      href: element.tagName.toLowerCase() === "a" ? boundedText(element.getAttribute("href"), 2048) || undefined : undefined,
+      download: element.tagName.toLowerCase() === "a" && element.hasAttribute("download") || undefined,
+      nearbyText: semanticNearbyContext(element, name),
+    }];
+  });
+  const candidates = allCandidates.slice(0, SEMANTIC_MAX_CANDIDATES);
+
+  const stateChunks = candidates.flatMap((candidate) => {
+    const text = semanticStateEvidence(candidate);
+    return text ? [{ text, refs: [candidate.ref] }] : [];
+  });
+  const associatedText = new Map<string, string[]>();
+  for (const candidate of candidates) {
+    if (!candidate.nearbyText) continue;
+    const refs = associatedText.get(candidate.nearbyText) || [];
+    refs.push(candidate.ref);
+    associatedText.set(candidate.nearbyText, refs);
+  }
+  const text = document.body ? collectValueFreeText(document.body, 12 * 1024) : "";
+  const pageChunks = text.match(/.{1,400}(?:\s|$)/g)?.map((chunk) => boundedText(chunk, 400)).filter(Boolean) || [];
+  const rawChunks = [
+    ...stateChunks,
+    ...Array.from(associatedText, ([text, refs]) => ({ text, refs })),
+    ...pageChunks.filter((text) => !associatedText.has(text)).map((text) => ({ text, refs: [] as string[] })),
+  ];
+  const chunks = rawChunks.slice(0, SEMANTIC_MAX_CHUNKS).map(({ text, refs }, index) => ({ id: `c${index + 1}`, text, refs }));
+  const observation = {
+    version: 1,
+    identity: {
+      fullUrl: window.location.href,
+      documentToken: semanticDocumentToken,
+    },
+    page: {
+      title: boundedText(document.title, 300),
+      readyState: document.readyState,
+      modals: detectModalStates().slice(0, 8),
+    },
+    candidates,
+    chunks,
+    omitted: {
+      candidates: Math.max(0, allCandidates.length - candidates.length),
+      chunks: Math.max(0, rawChunks.length - chunks.length),
+    },
+  };
+  while (new TextEncoder().encode(JSON.stringify(observation)).length > SEMANTIC_MAX_BYTES && observation.chunks.length) {
+    observation.chunks.pop();
+    observation.omitted.chunks++;
+  }
+  while (new TextEncoder().encode(JSON.stringify(observation)).length > SEMANTIC_MAX_BYTES && observation.candidates.length) {
+    observation.candidates.pop();
+    observation.omitted.candidates++;
+  }
+  return observation;
+}
+
+function semanticGuardError(element: Element | undefined, expected: any, requireElement = true): string | null {
+  if (!expected || typeof expected !== "object") return null;
+  if (window.location.href !== expected.fullUrl || semanticDocumentToken !== expected.documentToken) return "stale_observation";
+  if (!requireElement) return null;
+  if (!element || ("isConnected" in element && element.isConnected === false)) return "stale_observation";
+  if (
+    expected.ref !== undefined &&
+    (getResolvedRole(element) !== expected.role ||
+      getValueFreeSemanticName(element) !== expected.name ||
+      semanticElementType(element) !== expected.type)
+  ) return "stale_observation";
+  return null;
+}
+
+function semanticElementIdentity(element?: Element, ref?: string) {
+  return {
+    fullUrl: window.location.href,
+    documentToken: semanticDocumentToken,
+    ...(element && ref ? {
+      ref,
+      role: getResolvedRole(element),
+      name: getValueFreeSemanticName(element),
+      type: semanticElementType(element),
+    } : {}),
+  };
+}
+
+function compareSemanticElement(element: Element, predicate: any): { success: boolean; matches: boolean; reason: string } {
+  if (!predicate || typeof predicate !== "object" || typeof predicate.kind !== "string") {
+    return { success: false, matches: false, reason: "unsupported_predicate" };
+  }
+  switch (predicate.kind) {
+    case "visible":
+      return { success: true, matches: isVisibleSemanticElement(element), reason: "compared" };
+    case "checkedEquals": { // Actual state is deliberately never included in the response.
+      if (typeof predicate.expected !== "boolean") {
+        return { success: false, matches: false, reason: "unsupported_predicate" };
+      }
+      const tag = element.tagName.toLowerCase();
+      const type = semanticElementType(element);
+      if (tag === "input" && (type === "checkbox" || type === "radio")) {
+        const control = element as HTMLInputElement;
+        if (control.indeterminate) return { success: true, matches: false, reason: "indeterminate" };
+        return { success: true, matches: control.checked === predicate.expected, reason: "compared" };
+      }
+      const role = getResolvedRole(element);
+      if (["checkbox", "radio", "switch", "menuitemcheckbox", "menuitemradio"].includes(role)) {
+        const state = element.getAttribute("aria-checked");
+        if (state !== "true" && state !== "false") {
+          return { success: false, matches: false, reason: "unsupported_control" };
+        }
+        return { success: true, matches: (state === "true") === predicate.expected, reason: "compared" };
+      }
+      return { success: false, matches: false, reason: "unsupported_control" };
+    }
+    case "valueEquals": {
+      if (typeof predicate.expected !== "string") {
+        return { success: false, matches: false, reason: "unsupported_predicate" };
+      }
+      const tag = element.tagName.toLowerCase();
+      if (!["input", "textarea", "select"].includes(tag) ||
+          tag === "input" && semanticElementType(element) === "file") {
+        return { success: false, matches: false, reason: "unsupported_control" };
+      }
+      return {
+        success: true,
+        matches: (element as HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement).value === predicate.expected,
+        reason: "compared",
+      };
+    }
+    case "textEquals":
+    case "textContains": {
+      if (typeof predicate.expected !== "string") {
+        return { success: false, matches: false, reason: "unsupported_predicate" };
+      }
+      const actual = boundedText(element.textContent, 16 * 1024);
+      const expected = boundedText(predicate.expected, 16 * 1024);
+      return {
+        success: true,
+        matches: predicate.kind === "textEquals" ? actual === expected : actual.includes(expected),
+        reason: "compared",
+      };
+    }
+    default:
+      return { success: false, matches: false, reason: "unsupported_predicate" };
+  }
 }
 
 const VALID_ARIA_ROLES = new Set([
@@ -1227,15 +1535,10 @@ function setFormValue(ref: string, value: string | boolean | number): { success:
         input.checked = Boolean(value);
         input.dispatchEvent(new Event("change", { bubbles: true }));
       } else {
-        input.value = String(value);
-        input.dispatchEvent(new Event("input", { bubbles: true }));
-        input.dispatchEvent(new Event("change", { bubbles: true }));
+        setNativeValue(input, String(value));
       }
     } else if (tagName === "textarea") {
-      const textarea = element as HTMLTextAreaElement;
-      textarea.value = String(value);
-      textarea.dispatchEvent(new Event("input", { bubbles: true }));
-      textarea.dispatchEvent(new Event("change", { bubbles: true }));
+      setNativeValue(element as HTMLTextAreaElement, String(value));
     } else if (tagName === "select") {
       const select = element as HTMLSelectElement;
       const strValue = String(value);
@@ -1277,16 +1580,16 @@ function smartType(selector: string, text: string, clear = true, submit = false)
     const contentEditable = element.isContentEditable || !!contentEditableChild;
     target.focus();
 
-    if (clear) {
-      if (contentEditable) target.textContent = "";
-      else (target as HTMLInputElement | HTMLTextAreaElement).value = "";
+    if (contentEditable) {
+      if (clear) target.textContent = "";
+      target.textContent = text;
+      target.dispatchEvent(new Event("input", { bubbles: true }));
+      target.dispatchEvent(new Event("change", { bubbles: true }));
+    } else {
+      // Assigning a value always replaces the previous one, so `clear` only
+      // matters for the contenteditable branch above.
+      setNativeValue(target as HTMLInputElement | HTMLTextAreaElement, text);
     }
-
-    if (contentEditable) target.textContent = text;
-    else (target as HTMLInputElement | HTMLTextAreaElement).value = text;
-
-    target.dispatchEvent(new Event("input", { bubbles: true }));
-    target.dispatchEvent(new Event("change", { bubbles: true }));
 
     if (submit) {
       const form = element.closest("form");
@@ -1530,6 +1833,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           options.forceFullSnapshot ?? false,
           options.compact ?? false
         );
+        if (options.semanticObservation === true && !result.error) {
+          (result as typeof result & { semanticObservation: ReturnType<typeof buildSemanticObservation> }).semanticObservation = buildSemanticObservation();
+        }
         sendResponse(result);
       }
       break;
@@ -1537,6 +1843,68 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     case "GET_ELEMENT_COORDINATES": {
       const result = getElementCoordinates(message.ref);
       sendResponse(result);
+      break;
+    }
+    case "SEMANTIC_NAVIGATE": {
+      const guardError = semanticGuardError(undefined, message.expectedIdentity, false);
+      if (guardError) {
+        sendResponse({ error: guardError, code: guardError });
+        break;
+      }
+      window.location.href = message.url;
+      sendResponse({ success: true });
+      break;
+    }
+    case "SEMANTIC_LOCAL_COMPARE": {
+      const element = getElementMap()[message.ref]?.element.deref();
+      const identity = semanticElementIdentity(element, message.ref);
+      if (!message.expectedIdentity) {
+        sendResponse({ success: false, matches: false, reason: "invalid_expected_identity", identity });
+        break;
+      }
+      const guardError = semanticGuardError(element, message.expectedIdentity);
+      if (guardError) {
+        sendResponse({ success: false, matches: false, reason: guardError, identity });
+        break;
+      }
+      const result = compareSemanticElement(element!, message.predicate);
+      sendResponse({ ...result, identity });
+      break;
+    }
+    case "SEMANTIC_SCROLL_SCOPE": {
+      if (!message.expectedIdentity) {
+        sendResponse({ success: false, reason: "invalid_expected_identity" });
+        break;
+      }
+      const guardError = semanticGuardError(undefined, message.expectedIdentity, false);
+      if (guardError) {
+        sendResponse({ success: false, reason: guardError });
+        break;
+      }
+      if (message.action === "inspect") {
+        sendResponse(inspectSemanticScrollScope(semanticDocumentToken));
+      } else {
+        sendResponse(moveSemanticScrollScope(message.action, message.scopeToken, semanticDocumentToken));
+      }
+      break;
+    }
+    case "SEMANTIC_SCROLL": {
+      const guardError = semanticGuardError(undefined, message.expectedIdentity, false);
+      if (guardError) {
+        sendResponse({ error: guardError, code: guardError });
+        break;
+      }
+      if (message.position === "top" || message.position === "bottom") {
+        sendResponse(scrollToPosition(message.position));
+        break;
+      } else {
+        window.scrollBy(message.deltaX || 0, message.deltaY || 0);
+      }
+      sendResponse({ success: true, scrollX: window.scrollX, scrollY: window.scrollY });
+      break;
+    }
+    case "SCROLL_TO_POSITION": {
+      sendResponse(scrollToPosition(message.position, message.selector || null));
       break;
     }
     case "CLICK_ELEMENT": {
@@ -1552,6 +1920,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       }
       if (!element) {
         sendResponse({ error: `Element ${message.ref} not found. Use read_page to get current elements.` });
+        break;
+      }
+      const guardError = semanticGuardError(element, message.expectedIdentity);
+      if (guardError) {
+        sendResponse({ error: guardError, code: guardError });
         break;
       }
       if (message.button === "triple") {
@@ -1570,6 +1943,21 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     case "FORM_INPUT": {
       const result = setFormValue(message.ref, message.value);
       sendResponse(result);
+      break;
+    }
+    case "PAGE_READINESS": {
+      try {
+        sendResponse(probePageReadiness(createDomProbe(document, window), message.expect || {}));
+      } catch (err) {
+        sendResponse({
+          error: err instanceof Error ? err.message : String(err),
+          code: err instanceof InvalidReadinessSelectorError ? "invalid_selector" : "page_probe_error",
+        });
+      }
+      break;
+    }
+    case "PING": {
+      sendResponse({ success: true, href: location.href, readyState: document.readyState });
       break;
     }
     case "EVAL_IN_PAGE": {
@@ -2224,6 +2612,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         sendResponse({ error: "data must be an array of {ref, value} pairs" });
         return true;
       }
+      if (message.expectedIdentity && data.length !== 1) {
+        sendResponse({ error: "guarded fill requires exactly one field", code: "stale_observation" });
+        return true;
+      }
       const elementMap = getElementMap();
       const results: { ref: string; success: boolean; error?: string }[] = [];
       for (const item of data) {
@@ -2243,6 +2635,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           results.push({ ref, success: false, error: "Element no longer exists" });
           continue;
         }
+        const guardError = semanticGuardError(el, message.expectedIdentity);
+        if (guardError) {
+          sendResponse({ success: false, error: guardError, code: guardError, filled: 0, failed: 1, results: [] });
+          return true;
+        }
         try {
           if (el instanceof HTMLInputElement) {
             const inputType = el.type.toLowerCase();
@@ -2252,16 +2649,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
               el.dispatchEvent(new Event("change", { bubbles: true }));
             } else {
               el.focus();
-              el.value = String(value);
-              el.dispatchEvent(new Event("input", { bubbles: true }));
-              el.dispatchEvent(new Event("change", { bubbles: true }));
+              setNativeValue(el, String(value));
             }
             results.push({ ref, success: true });
           } else if (el instanceof HTMLTextAreaElement) {
             el.focus();
-            el.value = String(value);
-            el.dispatchEvent(new Event("input", { bubbles: true }));
-            el.dispatchEvent(new Event("change", { bubbles: true }));
+            setNativeValue(el, String(value));
             results.push({ ref, success: true });
           } else if (el instanceof HTMLSelectElement) {
             el.value = String(value);

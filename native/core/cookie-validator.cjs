@@ -288,7 +288,7 @@ function validatePhase2(ctx, cache, fingerprint, getCookiesFn) {
   const { config, clientId } = ctx;
   const validation = config.validation || {};
 
-  if (!validation || !validation.targetUrl) {
+  if (!validation?.targetUrl) {
     return Promise.resolve({
       valid: false,
       phase: /** @type {1|2} */ (2),

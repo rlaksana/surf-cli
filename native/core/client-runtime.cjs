@@ -712,7 +712,7 @@ function createClientRuntime(clientId, config, strategy, options = {}) {
     const failedSignals = [];
     for (const required of requiredCookies) {
       const found = cookies.find((c) => c.name === required.name);
-      if (!found || !found.value) {
+      if (!found?.value) {
         failedSignals.push(required.name);
       }
     }

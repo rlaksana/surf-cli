@@ -135,6 +135,30 @@ SURF_REMOTE_CREDENTIAL=~/.config/surf/agent-macbook.json \
   surf tab.list
 ```
 
+For a TLS-terminating reverse proxy in front of the native host's existing clear-TCP
+listener, opt in on the client:
+
+```bash
+surf --remote surf.example.com:443 --remote-tls \
+  --remote-credential ~/.config/surf/agent-macbook.json tab.list
+
+# Private CA and an IP destination with a DNS certificate identity
+surf --remote 100.101.102.103:443 --remote-tls \
+  --remote-tls-ca ~/.config/surf/private-ca.pem \
+  --remote-tls-server-name surf.example.com \
+  --remote-credential ~/.config/surf/agent-macbook.json tab.list
+```
+
+`--remote-tls-ca` replaces Node's system roots rather than adding to them. DNS endpoints
+use their hostname for SNI and certificate validation; IP endpoints omit SNI and validate
+the certificate's IP SAN unless `--remote-tls-server-name` supplies a DNS identity. TLS
+certificate validation finishes before the mandatory Ed25519 authentication. Surf has no
+insecure mode, downgrade, or plaintext retry. `SURF_REMOTE_TLS=1` is the only accepted
+environment spelling; unset it to disable TLS. There is no CLI negation for env-enabled TLS.
+CLI values override `SURF_REMOTE_TLS_CA` and `SURF_REMOTE_TLS_SERVER_NAME` independently.
+`SURF_LISTEN` remains a plaintext listener behind the reverse proxy; Surf does not terminate
+TLS on the browser host.
+
 Surf performs mutual Ed25519 challenge-response with fresh nonces and checks authorization throughout the connection. A credential grants the same browser and host-file authority as a trusted local Surf user. Give each client its own credential, do not share it, and revoke it immediately if the client or file is lost:
 
 ```bash
@@ -162,7 +186,9 @@ Keep Tailscale policy restrictions as defense in depth. For example:
 }
 ```
 
-Adapt tags and ports to your Tailnet. Surf authentication does not replace Tailnet policy, and Surf does not add a separate TLS or SSH tunnel.
+Adapt tags and ports to your Tailnet. Surf authentication does not replace Tailnet policy.
+Optional outbound remote TLS protects the client-to-proxy connection; Surf does not add an
+SSH tunnel or a TLS listener.
 
 **Operations and troubleshooting**
 
@@ -278,6 +304,13 @@ surf type "4242" --into "#card-number"
 surf locate.role button --action click
 
 surf frame.main                     # Return to main page
+```
+
+When a selector never matches, `frame.diagnose` shows the three frame views side by side (DOM `<iframe>` elements, the extension's frames with content-script reachability, and the CDP frame tree) and explains the mismatches: `srcdoc`/`about:blank` frames (matched to their CDP frame by `name`/`id`), sandboxes without `allow-scripts`, cross-origin frames, out-of-process frames that the CDP tree does not list (`frame.js` cannot reach them; `frame.switch` and `page.read` can when the content script answers), and frames still loading. The DOM inventory walks open shadow roots, so frames rendered by custom elements are listed with their `shadowHost` path. The text report abbreviates long frame URLs; `--json` keeps them whole.
+
+```bash
+surf frame.diagnose                 # Human-readable report with warnings
+surf frame.diagnose --json          # Full inventories
 ```
 
 ### Interaction
@@ -569,12 +602,55 @@ surf wait 2                         # Wait 2 seconds
 surf wait.element ".loaded"         # Wait for element
 surf wait.network                   # Wait for network idle
 surf wait.url "/dashboard"          # Wait for URL pattern
+surf wait.ready --selector ".results"   # Wait for content, fail fast on a bounce
+surf page.readiness --json          # Classify the page once
 ```
+
+`wait.ready` polls with a bounded budget and reports a typed state instead of timing out silently: `ready`, `empty` (the page showed its own no-results message, `--empty-text`), or one of the negative states `login`, `challenge` (anti-bot interstitial), `not-found`, `error`. A negative state exits non-zero with codes `page_login`, `page_challenge`, `page_not_found`, `page_error`; `page_timeout` reports the last observed state. Pass `--accept login` to return a state to the caller instead. Detection uses visible UI state (a rendered password field, a login-looking route, the page's own wording, `--url-prefix` bounces), never site-specific selectors.
+
+```bash
+surf wait.ready --url-prefix "https://app.example.com/" --empty-text "No results"
+surf wait.ready --accept login --json   # {"state":"login","evidence":[...]} instead of an error
+```
+
+### Extracting structured data
+
+`surf extract` composes existing client-side tools: it opens an owned tab,
+waits for explicit readiness, runs a page script, validates its JSON result,
+and closes the tab. It prints concise Markdown by default or structured JSON
+with `--json`. Return an array, or an object containing a conventional row key
+such as `rows`, `items`, or `results`; use `--rows <key>` for another key.
+
+```bash
+surf extract "https://example.com/list" --file rows.js --ready-selector ".item"
+surf extract "https://example.com/search" --file rows.js --options '{"limit":20}' --empty-text "No results" --json
+surf extract --tab-id 42 --code 'return [...document.querySelectorAll("h2")].map(h => ({title: h.textContent}))'
+```
+
+Owned-tab failures always attempt cleanup. Zero rows retry unless
+`--allow-empty` is set or `--empty-text` identifies the page's accepted empty
+state. Fresh-tab retries are bounded (`--retry`, default 1, maximum 5) and are
+limited to readiness timeouts, zero rows, and lost tab/execution-context
+failures. Login, challenge, not-found, page-error, script/output, and cleanup
+failures do not retry. `--tab-id` and `--session` target an existing page and
+never retry or close it; `--keep-tab` preserves a successfully owned tab.
+
+Extract is intended for read-only or otherwise idempotent caller scripts.
+JavaScript is not inherently read-only: a retry can replay the script, so avoid
+mutations or make them idempotent.
 
 ### Other
 
+`js` and `frame.js` accept `--options '{"limit": 20}'` with inline code or
+`--file`. This defines `SURF_OPTIONS` by parsing the JSON and freezing the
+result; use an explicit `return` for the script's result. The freeze is shallow.
+Invalid JSON and non-object values are rejected before sending a request;
+`--options ''` defines an empty object. Without `--options`, code is unchanged.
+
 ```bash
 surf js "return document.title"     # Execute JavaScript
+surf js "piHelpers.setValue(document.querySelector('#q'), 'hello')"  # Native value setter + input/change events
+surf js --file script.js --options '{"limit": 20}'   # Script reads SURF_OPTIONS.limit
 surf record --duration 2000 --fps 10 --output /tmp/anim.gif      # Animated GIF capture
 surf animate-audit --selector ".thing" --duration 2000 --fps 10  # JSON animation timeline
 surf perf-audit --duration 3000 --output /tmp/perf.json           # PerformanceObserver snapshot
@@ -650,6 +726,9 @@ surf do 'go "url" | click e5 | screenshot' --dry-run
 - `--step-delay <ms>` - Delay between steps (default: 100, use 0 to disable)
 - `--no-auto-wait` - Disable automatic waits between steps
 - `--json` - Output structured JSON result
+- `--allow-semantic` - Opt in to bounded TypeSafe decisions for a semantic workflow
+- `--allow-write` - Additionally authorize declared `fill`, `ensureChecked`, and `click` steps
+- `--inputs-stdin` - Read one bounded JSON object of private local input slots from stdin
 - `--<arg> <value>` - Pass arguments to workflow (e.g., `--url "..."`)
 
 **Auto-waits:** Commands that trigger page changes automatically wait for completion:
@@ -744,7 +823,67 @@ surf workflow.info my-workflow
 surf workflow.validate ./my-workflow.json
 ```
 
-**Supported commands:** All surf commands work in workflows. Use aliases (`go`, `snap`, `read`) or full names (`navigate`, `screenshot`, `page.read`).
+#### Bounded semantic workflow steps
+
+Semantic workflow files declare `"semantic": { "version": 1 }` and use only
+linear `semantic.step` operations: `find`, `open`, `ensureChecked`, `fill`,
+`click`, and `assert`. Validate or dry-run them offline, then opt in explicitly:
+
+```bash
+surf workflow.validate ./product.json
+surf do --file product.json --dry-run
+printf '%s' '{"quantity":"2"}' | SURF_SESSION=shopping surf do \
+  --file product.json --inputs-stdin --allow-semantic --allow-write --json
+```
+
+```json
+{
+  "name": "configure-matching-product",
+  "semantic": { "version": 1, "deadlineMs": 60000, "maxProviderCalls": 32 },
+  "steps": [
+    { "id": "find-product", "tool": "semantic.step", "as": "product", "args": {
+      "op": "find", "target": { "query": "The in-stock blue insulated bottle", "role": "link" },
+      "search": { "mode": "scroll", "maxObservations": 12 }
+    } },
+    { "id": "open-product", "tool": "semantic.step", "args": {
+      "op": "open", "target": { "binding": "product" }
+    } },
+    { "id": "select-gift-wrap", "tool": "semantic.step", "args": {
+      "op": "ensureChecked", "target": { "query": "Gift wrap", "role": "checkbox" },
+      "checked": true
+    } },
+    { "id": "set-quantity", "tool": "semantic.step", "args": {
+      "op": "fill", "target": { "query": "Quantity", "role": "spinbutton" },
+      "input": "quantity"
+    } },
+    { "id": "add-to-cart", "tool": "semantic.step", "args": {
+      "op": "click", "target": { "query": "Add to cart", "role": "button" },
+      "expect": { "kind": "visible", "target": { "query": "Remove from cart", "role": "button" } }
+    } },
+    { "id": "verify-cart", "tool": "semantic.step", "args": {
+      "op": "assert", "mode": "semantic",
+      "claim": "The cart contains the selected product with gift wrap enabled",
+      "bindings": ["product"]
+    } }
+  ]
+}
+```
+
+This example includes every supported operation and the required `claim` for a
+semantic `assert`. Use it as a valid starting shape, then remove steps the task
+does not need.
+
+`open` performs freshly validated same-origin HTTP(S) navigation; it never falls
+back to a click. Model-derived writes retain the `0.95` gate, dispatch at most
+once in a run, and require local/read-only verification. A stopped or uncertain
+step fails the workflow. Search reports bounded overlapping coverage and does
+not prove global ranking or absence outside that scope. Local input values are
+sent only to their browser fill/compare operation, not to TypeSafe, workflow
+variables, events, output, or checkpoints. A new run can repeat an external
+effect: Surf does not claim exactly-once server behavior or automatic resume.
+
+**Supported commands:** Ordinary workflows support all Surf commands. Semantic
+v1 workflows intentionally support only the six closed operations above.
 
 ### Playbooks
 
@@ -811,21 +950,142 @@ Generated manifests declare provenance and authentication environment inputs. Su
 --window-id <id>   # Target a specific window
 --no-wait          # Return tab_busy/browser_busy instead of queueing
 --json             # Raw JSON including resolved target metadata
---soft-fail        # Warn instead of error (exit 0) on restricted pages
+--soft-fail        # Host tool errors: stderr warning, exit 0, no JSON error output
 --no-lock          # Bypass the legacy lock for compound client-side commands
 --no-screenshot    # Skip auto-screenshot after actions
 --full             # Full resolution screenshots (skip resize)
 ```
 
+### Host tool-response errors
+
+For ordinary socket-backed commands, a host response with a top-level `error`
+exits 1 and prints `Error: ...` on stderr. A supplied code is appended as `[code]`
+to the first line unless already present there; subsequent recovery lines are
+preserved. Without a code, no suffix is added.
+
+`--json` additionally writes `{"error":{"code":"...","message":"...","details":{...}}}`
+to stdout, while retaining stderr and exit 1. The JSON code defaults to `"error"`;
+the message uses the host's message, or the first display line if absent. Optional
+details retain the host's fields except redundant `code` and `message` fields.
+
+`--soft-fail` takes precedence: the original host display text is printed as a
+stderr warning, without adding a code, stdout stays empty even with `--json`,
+and the command exits 0. This is **not a universal JSON error envelope**: local
+validation, transport/parser failures, compound commands and errors embedded in
+successful result payloads retain their existing behavior. In particular, a
+connection failure still prints stderr, leaves stdout empty and exits 1 with
+`--json`, even with `--soft-fail`.
+
+## Optional Jev semantic commands
+
+`semantic.act` is a bounded, goal-driven website controller. Give it an outcome
+and it repeatedly observes the current page, asks Jev to select the next action
+from Surf's allowed menu, validates and executes that action, then checks whether
+the overall goal is complete. It stops when the goal is satisfied, a decision is
+uncertain, or a step, provider-call, or time budget is exhausted.
+
+```text
+agent goal
+    |
+    v
+Surf observes -> Jev selects -> Surf validates + acts -> Jev checks goal
+    ^                                                        |
+    +---------------- goal incomplete -----------------------+
+                                                             |
+                                      complete / uncertain / budget reached
+                                                             |
+                                                             v
+                                                        return result
+```
+
+The other semantic commands expose individual parts of that loop:
+
+```text
+semantic.find     select one control matching a goal
+semantic.filter   rank the page regions relevant to a goal
+semantic.verify   check whether one outcome is visible
+semantic.act      run the bounded observe/choose/act/verify loop
+```
+
+This is most useful when the agent does not yet know a site's structure or happy
+path: Jev handles next-action selection and goal verification while Surf builds
+the allowed action menu and enforces permissions, confidence thresholds, and
+element freshness. The agent owns the goal and final confirmation. Once the path
+is known and stable, deterministic Surf commands are usually faster and more
+reliable for repeated execution.
+
+Semantic commands are an explicit remote-AI boundary: only `surf semantic.*`
+sends a bounded, value-free current-page observation to TypeSafe. Existing Surf
+commands do not read a TypeSafe credential, load the SDK, or make provider calls.
+
+```bash
+surf semantic.find "the control for notification preferences"
+surf semantic.verify "Notification preferences were saved" --json
+surf semantic.filter "notification preferences" --top 6
+surf semantic.act "Open notification settings" --max-steps 5
+surf semantic.act "Fill the email field" --input email="$EMAIL" --allow-write
+surf semantic.act 'Add the selected item to the cart' --allow-write --threshold write=0.85
+surf semantic auth set       # hidden prompt, or exactly one stdin line
+surf semantic auth status    # source and redacted fingerprint only
+surf semantic auth clear     # removes the shared credential for all clients
+
+# Ephemeral/CI override (highest precedence; does not modify the stored key)
+TYPESAFE_API_KEY="$CI_TYPESAFE_KEY" surf semantic.find "the checkout link"
+
+# Non-interactive persisted setup (exactly one bounded line on stdin)
+printf '%s\n' "$TYPESAFE_KEY" | surf semantic auth set
+```
+
+The provider-neutral shared schema is `{"version":1,"apiKey":"..."}`. Persisted
+setup lives at `${XDG_CONFIG_HOME:-~/.config}/typesafe/credentials.json` on
+Unix/macOS and `%APPDATA%\TypeSafe\credentials.json` on Windows, independent of
+`SURF_STATE_DIR`, project, and cwd. On POSIX, directories use mode `0700` and the
+file mode `0600`; writes are atomic and symlinked paths are rejected. Windows
+uses the current user's profile and ACL semantics. A nonblank `TYPESAFE_API_KEY`
+always wins over the shared file; `auth status` prints only `environment`,
+`shared-store`, or `not-configured` plus a short fingerprint. `auth clear`
+removes the shared file for every client that uses it while an environment
+override remains effective. Keys are never accepted on argv or from
+`surf.json`, project config, or auto-loaded `.env` files, and are never sent to
+the host/extension or included in logs, errors, or JSON output. Install,
+configuration, doctor, startup, and non-semantic commands never prompt for a key
+or load the TypeSafe SDK.
+
+`semantic.act` is bounded to observed same-origin HTTP(S) links, fixed scrolling
+and waits, and observed refs. Every DOM click and fill is mutation-capable and is
+excluded unless `--allow-write` is present. That flag intentionally permits
+high-impact submit, purchase, delete, send, and publish controls; repeat
+`--allow-ref <ref>` to narrow authorization to exact current refs. Fill values
+come only from named `--input name=value` slots and are never sent to TypeSafe or
+included in traces. Broad and ambiguous writes require probability `0.95`. The
+threshold is `0.65` only when exactly one `--allow-ref` names exactly one
+applicable click, or one fill with one input slot; the applied threshold appears
+in decision/trace output and never grants authority. Repeatable
+`--threshold name=value` overrides applicable confidence thresholds for one run
+only; defaults remain safer, and overrides never replace `--allow-write` or
+`--allow-ref` authority. Actions are
+freshness-guarded and uncertain writes are not replayed. Each provider choice is
+capped at 70 actions: six fixed scroll/wait
+actions plus at least one action for each of the 64 observed refs explicitly
+authorized with `--allow-ref`; additional variants are omitted deterministically.
+An oversized mandatory authorized set fails before provider selection. Page text
+remains adversarial data; model output never grants authority.
+
+The real-Jev evaluation harness is opt-in and excluded from CI:
+`SURF_REAL_JEV=1 TYPESAFE_API_KEY=... npm run eval:jev`.
+
 ## Environment Variables
 
 ```bash
 SURF_NETWORK_PATH         # Native-host network state root (default: ~/.surf/state/network)
-SURF_STATE_DIR            # Private Surf state root, including browser sessions (default: ~/.surf/state)
+SURF_STATE_DIR            # Private Surf state root; does not affect shared TypeSafe credentials
 SURF_SESSION              # Default named browser session for tab-scoped commands
 SURF_SOCKET               # Socket path or named pipe (default: /tmp/surf.sock, Windows: //./pipe/surf)
 SURF_REMOTE               # Remote Surf endpoint as host:port (overrides SURF_SOCKET)
 SURF_REMOTE_CREDENTIAL    # Client Ed25519 credential for the selected remote endpoint
+SURF_REMOTE_TLS           # Exactly 1 enables TLS for a selected remote endpoint
+SURF_REMOTE_TLS_CA        # Custom CA bundle that replaces system roots
+SURF_REMOTE_TLS_SERVER_NAME # DNS SNI and certificate identity override
 SURF_REMOTE_STATE_DIR     # Host identity/authorization directory (default: ~/.surf/remote)
 SURF_LISTEN               # Native-host Tailnet bind address as <tailscale-ip>:<port>
 SURF_SOCKET_MODE          # Advanced POSIX local socket mode: 600 (default) or 660
@@ -833,6 +1093,9 @@ SURF_SOCKET_GROUP         # Group name or numeric gid required with mode 660
 SURF_NODE_PATH            # Path to node binary (for native host wrapper)
 SURF_HOST_PATH            # Path to native/host.cjs (for native host wrapper)
 SURF_EXTENSION_PATH       # Path to extension dist/ directory
+TYPESAFE_API_KEY          # Optional semantic-command credential; overrides the shared store
+SURF_JEV_MODEL            # Optional observable Jev model override (default: jev-1.13.0)
+XDG_CONFIG_HOME           # Unix/macOS base for shared TypeSafe credentials (default: ~/.config)
 ```
 
 **Use cases:**
@@ -841,11 +1104,16 @@ SURF_EXTENSION_PATH       # Path to extension dist/ directory
 - `SURF_SOCKET`: Advanced socket override. Set it for both the native host and CLI when separate browser/profile instances need hard isolation.
 - `SURF_REMOTE`: Remote client endpoint. `--remote <host>:<port>` overrides it; both override `SURF_SOCKET`.
 - `SURF_REMOTE_CREDENTIAL`: Credential used for mutual remote authentication. `--remote-credential <path>` overrides it.
+- `SURF_REMOTE_TLS`: Set exactly `1` for TLS through a terminating reverse proxy; `--remote-tls` also enables it and cannot negate an env-enabled setting.
+- `SURF_REMOTE_TLS_CA`: CA bundle for remote TLS, replacing system roots. `--remote-tls-ca <path>` overrides it.
+- `SURF_REMOTE_TLS_SERVER_NAME`: DNS SNI and certificate identity override. `--remote-tls-server-name <name>` overrides it.
 - `SURF_REMOTE_STATE_DIR`: Advanced host-side override for the mode-0700 identity and client registry directory.
 - `SURF_LISTEN`: Native-host listener address on the browser machine. Use `surf install ... --listen <tailscale-ip>:<port>` to persist it in that host's wrapper.
 - `SURF_SOCKET_MODE` / `SURF_SOCKET_GROUP`: Advanced POSIX native-host settings. Use `surf install ... --socket-mode 660 --socket-group <group>` to persist group access; mode `660` grants full Surf authority to every member of that group.
 - `SURF_NODE_PATH` / `SURF_HOST_PATH`: Package manager installs (e.g., Nix) that store binaries in non-standard locations
 - `SURF_EXTENSION_PATH`: Package managers that create stable symlinks instead of changing paths on reinstall
+- `TYPESAFE_API_KEY`: Used only by explicit `semantic.*` networked commands. Otherwise use `surf semantic auth set` for the provider-neutral shared store.
+- `SURF_JEV_MODEL`: Explicit model override for semantic commands; Surf otherwise pins `jev-1.13.0`.
 
 **Example (Nix):**
 ```bash
@@ -879,7 +1147,7 @@ macOS checklist:
 - Confirm the manifest `allowed_origins` entry uses the same extension ID shown on `chrome://extensions` for the Surf extension.
 - Reinstall the manifest with `surf install <extension-id>` after copying a fresh extension build or if the extension ID changed.
 - Fully restart Chrome, then reload the Surf extension on `chrome://extensions`.
-- Open the extension service worker from `chrome://extensions` and check its console for native messaging or socket errors.
+- Open Surf's service worker console from `chrome://extensions`. In Surf's **Details > Extension options**, enable **Debug Mode**, reproduce the failure, then disable **Debug Mode** when finished.
 - If `SURF_SOCKET` is set in your shell, make sure Chrome launches the native host with the same value; otherwise both sides should use `/tmp/surf.sock`.
 - Run a simple CLI command such as `surf tab.list`; if it fails, compare its `Attempted socket:` line with the socket expected by the native host.
 
@@ -938,11 +1206,11 @@ echo '{"type":"tool_request","method":"execute_tool","params":{"tool":"tab.list"
 | `window.*` | `new`, `list`, `focus`, `close`, `resize` |
 | `tab.*` | `list`, `new`, `switch`, `close`, `name`, `unname`, `named`, `group`, `ungroup`, `groups`, `reload` |
 | `scroll.*` | `top`, `bottom`, `to`, `info` |
-| `page.*` | `read`, `text`, `state` |
+| `page.*` | `read`, `text`, `state`, `readiness` |
 | `locate.*` | `role`, `text`, `label` |
 | `element.*` | `styles` |
-| `frame.*` | `list`, `switch`, `main`, `js` |
-| `wait.*` | `element`, `network`, `url`, `dom`, `load` |
+| `frame.*` | `list`, `diagnose`, `switch`, `main`, `js` |
+| `wait.*` | `element`, `network`, `url`, `dom`, `load`, `ready` |
 | `cookie` / `cookie.*` | `list`, `get`, `set`, `clear`, `delete` |
 | `bookmark.*` | `add`, `remove`, `list` |
 | `history.*` | `list`, `search` |

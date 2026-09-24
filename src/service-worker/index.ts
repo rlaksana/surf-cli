@@ -1,5 +1,21 @@
 import { CDPController } from "../cdp/controller";
 import { debugLog } from "../utils/debug";
+import {
+  type CdpFrameEntry,
+  DOM_IFRAME_INVENTORY_EXPRESSION,
+  type DomIframeEntry,
+  type ExtensionFrameEntry,
+  buildFrameDiagnosis,
+} from "../utils/frame-diagnose";
+import type { ReadinessExpectations } from "../utils/page-readiness";
+import {
+  type ReadinessProbeResult,
+  type ReadinessState,
+  clampReadinessBudget,
+  parseAcceptStates,
+  pollReadiness,
+  readinessErrorCode,
+} from "../utils/readiness-poll";
 import { initNativeMessaging, postToNativeHost } from "../native/port-manager";
 import { resolveTabForCommand } from "./tab-resolver";
 
@@ -220,6 +236,118 @@ async function labelSessionTab(tabId: number, name: string): Promise<number | un
   } catch {
     return undefined;
   }
+}
+
+function readinessExpectationsFrom(input: unknown): ReadinessExpectations {
+  const raw = input && typeof input === "object" ? (input as Record<string, unknown>) : {};
+  const expect: ReadinessExpectations = {};
+  for (const key of ["selector", "text", "urlPrefix", "emptyText"] as const) {
+    const value = raw[key];
+    if (typeof value === "string" && value.trim() !== "") expect[key] = value;
+  }
+  return expect;
+}
+
+/**
+ * One readiness probe of a tab. A blank tab is `loading` (a navigation is
+ * usually pending), other restricted pages are `error`, and an unreachable
+ * content script (mid-navigation, or not injected yet) is `loading`, so the
+ * poll loop needs no special cases.
+ */
+async function probeTabReadiness(tabId: number, expect: ReadinessExpectations): Promise<ReadinessProbeResult> {
+  let tabStatus: string | undefined;
+  let tabUrl: string | undefined;
+  let pendingUrl: string | undefined;
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    tabStatus = tab.status;
+    pendingUrl = tab.pendingUrl;
+    tabUrl = pendingUrl || tab.url;
+  } catch {}
+  if (!tabUrl || tabUrl === "about:blank") {
+    return { state: "loading", evidence: [`tab URL is ${tabUrl || "empty"}`], href: tabUrl, tabStatus };
+  }
+  if (isRestrictedTabUrl(tabUrl)) {
+    return { state: "error", evidence: [`restricted browser or extension page ${tabUrl}`], href: tabUrl, tabStatus };
+  }
+  let report;
+  try {
+    report = await chrome.tabs.sendMessage(tabId, { type: "PAGE_READINESS", expect }, { frameId: 0 });
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    return { state: "loading", evidence: [`content script unreachable: ${reason}`], href: tabUrl, tabStatus };
+  }
+  if (report?.state) {
+    if (pendingUrl && report.href !== pendingUrl) {
+      return {
+        state: "loading",
+        evidence: [`navigation to ${pendingUrl} pending; report is from ${report.href}`],
+        href: report.href,
+        tabStatus,
+      };
+    }
+    return { ...report, tabStatus };
+  }
+  if (report?.code === "invalid_selector") {
+    throw new BrowserCommandError("invalid_selector", String(report.error || "Invalid CSS selector"), {
+      selector: expect.selector,
+      tabId,
+    });
+  }
+  const reason = report?.error ? String(report.error) : "content script returned no verdict";
+  return { state: "loading", evidence: [reason], href: tabUrl, tabStatus };
+}
+
+function describeReadiness(result: ReadinessProbeResult): string {
+  const where = result.href ? ` at ${result.href}` : "";
+  const evidence = result.evidence.length > 0 ? ` (${result.evidence.join("; ")})` : "";
+  return `${result.state}${where}${evidence}`;
+}
+
+async function collectDomIframeInventory(
+  tabId: number,
+): Promise<{ href: string; title: string; iframes: DomIframeEntry[] }> {
+  const result = await cdp.evaluateScript(tabId, DOM_IFRAME_INVENTORY_EXPRESSION);
+  if (result.exceptionDetails) {
+    throw new Error(
+      result.exceptionDetails.exception?.description ||
+        result.exceptionDetails.text ||
+        "Failed to collect the DOM iframe inventory",
+    );
+  }
+  const value = result.result?.value;
+  if (!value || typeof value !== "object" || !Array.isArray(value.iframes)) {
+    throw new Error("Unexpected DOM iframe inventory result shape");
+  }
+  return value as { href: string; title: string; iframes: DomIframeEntry[] };
+}
+
+/** webNavigation frames plus a content-script PING per frame. */
+async function collectExtensionFrames(tabId: number): Promise<ExtensionFrameEntry[]> {
+  const frames = (await chrome.webNavigation.getAllFrames({ tabId })) ?? [];
+  const entries: ExtensionFrameEntry[] = [];
+  for (const frame of frames) {
+    const entry: ExtensionFrameEntry = {
+      frameId: frame.frameId,
+      parentFrameId: frame.parentFrameId,
+      url: frame.url,
+      errorOccurred: frame.errorOccurred === true,
+      contentScriptReachable: false,
+    };
+    try {
+      const ping = await chrome.tabs.sendMessage(tabId, { type: "PING" }, { frameId: frame.frameId });
+      if (ping?.success) {
+        entry.contentScriptReachable = true;
+        entry.contentScript = { href: ping.href, readyState: ping.readyState };
+      } else {
+        entry.contentScriptError = ping?.error ? String(ping.error) : "no response";
+      }
+    } catch (err) {
+      entry.contentScriptError = err instanceof Error ? err.message : String(err);
+    }
+    entries.push(entry);
+  }
+  return entries;
 }
 
 const screenshotCache = new Map<string, { base64: string; width: number; height: number }>();
@@ -538,10 +666,25 @@ function base64ToBlob(base64: string, mimeType = "image/png"): Blob {
   return new Blob([bytes], { type: mimeType });
 }
 
-function isSyntaxError(details: { text?: string; exception?: { description?: string } } | null | undefined): boolean {
-  if (!details) return false;
-  const text = `${details.exception?.description || ""} ${details.text || ""}`;
-  return text.includes("SyntaxError");
+function codeWithExpressionReturn(code: string): string {
+  return `return (\n${code}\n);`;
+}
+
+/**
+ * Whether the wrapped statement body parses. The MV3 extension CSP
+ * (`script-src 'self'`) makes `new Function` throw an EvalError inside the
+ * service worker; in that case ask the page's parser through CDP instead,
+ * which compiles without running anything.
+ */
+async function statementBodyParses(tabId: number, body: string): Promise<boolean> {
+  try {
+    new Function(body);
+    return true;
+  } catch (err) {
+    if (err instanceof SyntaxError) return false;
+  }
+  const compiled = await cdp.compileScript(tabId, `(async () => { 'use strict'; ${body} })()`);
+  return compiled.parses;
 }
 
 async function captureFullPage(tabId: number, maxHeight: number): Promise<{ base64: string; width: number; height: number }> {
@@ -1199,10 +1342,38 @@ export async function handleMessage(
       return stateResult.result?.value || { error: "Failed to get page state" };
     }
 
+    case "SEMANTIC_LOCAL_COMPARE": {
+      if (!tabId) throw new Error("No tabId provided");
+      return await chrome.tabs.sendMessage(tabId, {
+        type: "SEMANTIC_LOCAL_COMPARE",
+        ref: message.ref,
+        predicate: message.predicate,
+        expectedIdentity: message.expectedIdentity,
+      }, { frameId: getFrameIdForTab(tabId, message) });
+    }
+
+    case "SEMANTIC_SCROLL_SCOPE": {
+      if (!tabId) throw new Error("No tabId provided");
+      return await chrome.tabs.sendMessage(tabId, {
+        type: "SEMANTIC_SCROLL_SCOPE",
+        action: message.action,
+        scopeToken: message.scopeToken,
+        expectedIdentity: message.expectedIdentity,
+      }, { frameId: getFrameIdForTab(tabId, message) });
+    }
+
     case "EXECUTE_SCROLL": {
       if (!tabId) throw new Error("No tabId provided");
       const deltaX = message.deltaX || 0;
       const deltaY = message.deltaY || 0;
+      if (message.expectedIdentity) {
+        return await chrome.tabs.sendMessage(tabId, {
+          type: "SEMANTIC_SCROLL",
+          deltaX,
+          deltaY,
+          expectedIdentity: message.expectedIdentity,
+        }, { frameId: getFrameIdForTab(tabId, message) });
+      }
 
       const scrollScript = (dx: number, dy: number) => {
         const before = { x: window.scrollX, y: window.scrollY };
@@ -1251,6 +1422,13 @@ export async function handleMessage(
     case "EXECUTE_NAVIGATE": {
       if (!tabId) throw new Error("No tabId provided");
       if (!message.url) throw new Error("No url provided");
+      if (message.expectedIdentity) {
+        return await chrome.tabs.sendMessage(tabId, {
+          type: "SEMANTIC_NAVIGATE",
+          url: message.url,
+          expectedIdentity: message.expectedIdentity,
+        }, { frameId: getFrameIdForTab(tabId, message) });
+      }
 
       // HARD-CODED POLICY: never reuse the user's active tab.
       // Open a fresh background tab; CDP attaches to it.
@@ -1330,8 +1508,15 @@ export async function handleMessage(
           const screenshot = await cdp.captureScreenshot(tabId);
           return { ...result, screenshot };
         } catch (err) {
-          return { ...result, screenshotError: "Failed to capture screenshot" };
+          return {
+            ...result,
+            screenshotError: err instanceof Error ? err.message : "Failed to capture screenshot",
+          };
         }
+      }
+      if (result?.semanticObservation?.identity) {
+        result.semanticObservation.identity.tabId = tabId;
+        result.semanticObservation.identity.frameId = readFrameId;
       }
       return result;
     }
@@ -1391,6 +1576,21 @@ export async function handleMessage(
       const position = message.position;
       if (position === undefined) throw new Error("position required (\"top\", \"bottom\", or number)");
       const selector = message.selector;
+      if (message.expectedIdentity) {
+        return await chrome.tabs.sendMessage(tabId, {
+          type: "SEMANTIC_SCROLL",
+          position,
+          expectedIdentity: message.expectedIdentity,
+        }, { frameId: getFrameIdForTab(tabId, message) });
+      }
+
+      try {
+        return await chrome.tabs.sendMessage(tabId, {
+          type: "SCROLL_TO_POSITION",
+          position,
+          selector,
+        }, { frameId: getFrameIdForTab(tabId, message) });
+      } catch {}
 
       const scrollScript = (pos: string | number, sel: string | null) => {
         const findScrollable = (): Element => {
@@ -1671,8 +1871,9 @@ export async function handleMessage(
           type: "CLICK_ELEMENT",
           ref: message.ref,
           button: message.button || "left",
+          expectedIdentity: message.expectedIdentity,
         }, { frameId: getFrameIdForTab(tabId, message) });
-        if (result.error) return { error: result.error };
+        if (result.error) return { error: result.error, code: result.code };
         return { success: true };
       } catch (err) {
         return { error: "Content script not loaded. Try refreshing the page." };
@@ -1923,6 +2124,52 @@ export async function handleMessage(
       }
     }
 
+    case "PAGE_READINESS": {
+      if (!tabId) throw new Error("No tabId provided");
+      return await probeTabReadiness(tabId, readinessExpectationsFrom(message.expect));
+    }
+
+    case "WAIT_FOR_READY": {
+      if (!tabId) throw new Error("No tabId provided");
+      const expect = readinessExpectationsFrom(message.expect);
+      const budget = clampReadinessBudget({ timeoutMs: message.timeout, intervalMs: message.interval });
+      const accept: ReadinessState[] = parseAcceptStates(message.accept);
+      const outcome = await pollReadiness({
+        ...budget,
+        accept,
+        probe: () => probeTabReadiness(tabId, expect),
+      });
+      const summary = {
+        state: outcome.result.state,
+        evidence: outcome.result.evidence,
+        href: outcome.result.href,
+        title: outcome.result.title,
+        readyState: outcome.result.readyState,
+        tabStatus: outcome.result.tabStatus,
+        polls: outcome.polls,
+        waited: outcome.waitedMs,
+        timeout: budget.timeoutMs,
+        interval: budget.intervalMs,
+      };
+      if (outcome.kind === "settled" || outcome.kind === "accepted") {
+        // No `success` key on purpose: formatToolContent renders any
+        // {success, readyState} result as a fixed "Page loaded" line.
+        return { accepted: outcome.kind === "accepted", ...summary };
+      }
+      if (outcome.kind === "timeout") {
+        throw new BrowserCommandError(
+          "page_timeout",
+          `Page did not become ready within ${budget.timeoutMs}ms; last state ${describeReadiness(outcome.result)}`,
+          { ...summary, tabId },
+        );
+      }
+      throw new BrowserCommandError(
+        readinessErrorCode(outcome.result.state) ?? "page_not_ready",
+        `Page is not ready: ${describeReadiness(outcome.result)}`,
+        { ...summary, tabId },
+      );
+    }
+
     case "WAIT_FOR_DOM_STABLE": {
       if (!tabId) throw new Error("No tabId provided");
 
@@ -2138,6 +2385,7 @@ export async function handleMessage(
       const response = await chrome.tabs.sendMessage(tabId, {
         type: "FORM_FILL",
         data: message.data,
+        expectedIdentity: message.expectedIdentity,
       }, { frameId: getFrameIdForTab(tabId, message) });
       return response;
     }
@@ -2191,6 +2439,67 @@ export async function handleMessage(
       return { success: true, frames: result.frames };
     }
 
+    case "FRAME_DIAGNOSE": {
+      if (!tabId) throw new Error("No tabId provided");
+      const extensionFrames = await collectExtensionFrames(tabId);
+      const mainExtensionFrame = extensionFrames.find((frame) => frame.parentFrameId === -1);
+      let dom = { href: mainExtensionFrame?.url ?? "", title: "", iframes: [] as DomIframeEntry[] };
+      let cdpFrames: CdpFrameEntry[] = [];
+      let cdpFramesAvailable = true;
+      const inventoryWarnings: string[] = [];
+      const ownedAttachment = !cdp.isAttached(tabId);
+      try {
+        if (ownedAttachment) {
+          try {
+            await cdp.attach(tabId);
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            inventoryWarnings.push(`CDP inventories unavailable: ${message}`);
+            cdpFramesAvailable = false;
+          }
+        }
+        if (cdp.isAttached(tabId)) {
+          try {
+            dom = await collectDomIframeInventory(tabId);
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            inventoryWarnings.push(`DOM iframe inventory unavailable: ${message}`);
+          }
+          try {
+            const cdpResult = await cdp.getFrames(tabId);
+            if (cdpResult.success) {
+              cdpFrames = cdpResult.frames ?? [];
+            } else {
+              inventoryWarnings.push(`CDP frame tree unavailable: ${cdpResult.error}`);
+              cdpFramesAvailable = false;
+            }
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            inventoryWarnings.push(`CDP frame tree unavailable: ${message}`);
+            cdpFramesAvailable = false;
+          }
+        }
+      } finally {
+        if (ownedAttachment && cdp.isAttached(tabId)) {
+          const detachResult = await cdp.detach(tabId);
+          if (!detachResult.success) {
+            inventoryWarnings.push(`CDP detach failed: ${detachResult.error}`);
+          }
+        }
+      }
+      const diagnosis = buildFrameDiagnosis({
+        mainPage: { href: dom.href, title: dom.title },
+        domIframes: dom.iframes,
+        extensionFrames,
+        cdpFrames,
+        cdpFramesAvailable,
+      });
+      diagnosis.warnings.unshift(...inventoryWarnings);
+      // No `success` key on purpose: formatToolContent renders {success, frames}
+      // as the bare frame list.
+      return diagnosis;
+    }
+
     case "FRAME_SWITCH": {
       if (!tabId) throw new Error("No tabId provided");
       const { selector, name, index } = message;
@@ -2213,7 +2522,6 @@ export async function handleMessage(
       }
 
       let targetFrame: chrome.webNavigation.GetAllFrameResultDetails | null = null;
-
       if (index !== undefined) {
         if (index < 0 || index >= childFrames.length) {
           throw new Error(`Frame index ${index} out of range. Found ${childFrames.length} frame(s).`);
@@ -2294,20 +2602,18 @@ export async function handleMessage(
       if (!message.code) throw new Error("No code provided");
 
       try {
-        const piHelpersCode = `if(!window.piHelpers){const piHelpers={wait(ms){return new Promise(r=>setTimeout(r,ms))},async waitForSelector(sel,opts={}){const{state='visible',timeout=20000}=opts;const isVis=el=>el&&getComputedStyle(el).display!=='none'&&getComputedStyle(el).visibility!=='hidden'&&getComputedStyle(el).opacity!=='0'&&el.offsetWidth>0&&el.offsetHeight>0;const chk=()=>{const el=document.querySelector(sel);switch(state){case'attached':return el;case'detached':return el?null:document.body;case'hidden':return(!el||!isVis(el))?(el||document.body):null;default:return isVis(el)?el:null}};return new Promise((res,rej)=>{const r=chk();if(r){res(state==='detached'||state==='hidden'?null:r);return}const obs=new MutationObserver(()=>{const r=chk();if(r){obs.disconnect();clearTimeout(tid);res(state==='detached'||state==='hidden'?null:r)}});const tid=setTimeout(()=>{obs.disconnect();rej(new Error('Timeout'))},timeout);obs.observe(document.documentElement,{childList:true,subtree:true,attributes:true,attributeFilter:['style','class','hidden']})})},async waitForText(text,opts={}){const{selector,timeout=20000}=opts;const chk=()=>{const root=selector?document.querySelector(selector):document.body;if(!root)return null;const w=document.createTreeWalker(root,NodeFilter.SHOW_TEXT);while(w.nextNode())if(w.currentNode.textContent?.includes(text))return w.currentNode.parentElement;return null};return new Promise((res,rej)=>{const r=chk();if(r){res(r);return}const obs=new MutationObserver(()=>{const r=chk();if(r){obs.disconnect();clearTimeout(tid);res(r)}});const tid=setTimeout(()=>{obs.disconnect();rej(new Error('Timeout'))},timeout);obs.observe(document.documentElement,{childList:true,subtree:true,characterData:true})})},async waitForHidden(sel,t=20000){await piHelpers.waitForSelector(sel,{state:'hidden',timeout:t})},getByRole(role,opts={}){const{name}=opts;const roles={button:['button','input[type=button]','input[type=submit]','input[type=reset]'],link:['a[href]'],textbox:['input:not([type])','input[type=text]','input[type=email]','input[type=password]','textarea'],checkbox:['input[type=checkbox]'],radio:['input[type=radio]'],combobox:['select'],heading:['h1','h2','h3','h4','h5','h6']};const cands=[...document.querySelectorAll('[role='+role+']')];if(roles[role])roles[role].forEach(s=>cands.push(...document.querySelectorAll(s+':not([role])')));if(!name)return cands[0]||null;const n=name.toLowerCase().trim();for(const el of cands){const l=el.getAttribute('aria-label')?.toLowerCase().trim();const t=el.textContent?.toLowerCase().trim();if(l===n||t===n||l?.includes(n)||t?.includes(n))return el}return null}};window.__piHelpers=piHelpers;window.piHelpers=piHelpers}`;
+        const piHelpersCode = `if(!window.piHelpers){const piHelpers={wait(ms){return new Promise(r=>setTimeout(r,ms))},setValue(el,v,events=['input','change']){let p=Object.getPrototypeOf(el),s=null;while(p&&p!==Object.prototype){const d=Object.getOwnPropertyDescriptor(p,'value');if(d&&d.set){s=d.set;break}p=Object.getPrototypeOf(p)}if(s)s.call(el,v);else el.value=v;for(const n of events)el.dispatchEvent(new Event(n,{bubbles:n!=='blur'}));return el},async waitForSelector(sel,opts={}){const{state='visible',timeout=20000}=opts;const isVis=el=>el&&getComputedStyle(el).display!=='none'&&getComputedStyle(el).visibility!=='hidden'&&getComputedStyle(el).opacity!=='0'&&el.offsetWidth>0&&el.offsetHeight>0;const chk=()=>{const el=document.querySelector(sel);switch(state){case'attached':return el;case'detached':return el?null:document.body;case'hidden':return(!el||!isVis(el))?(el||document.body):null;default:return isVis(el)?el:null}};return new Promise((res,rej)=>{const r=chk();if(r){res(state==='detached'||state==='hidden'?null:r);return}const obs=new MutationObserver(()=>{const r=chk();if(r){obs.disconnect();clearTimeout(tid);res(state==='detached'||state==='hidden'?null:r)}});const tid=setTimeout(()=>{obs.disconnect();rej(new Error('Timeout'))},timeout);obs.observe(document.documentElement,{childList:true,subtree:true,attributes:true,attributeFilter:['style','class','hidden']})})},async waitForText(text,opts={}){const{selector,timeout=20000}=opts;const chk=()=>{const root=selector?document.querySelector(selector):document.body;if(!root)return null;const w=document.createTreeWalker(root,NodeFilter.SHOW_TEXT);while(w.nextNode())if(w.currentNode.textContent?.includes(text))return w.currentNode.parentElement;return null};return new Promise((res,rej)=>{const r=chk();if(r){res(r);return}const obs=new MutationObserver(()=>{const r=chk();if(r){obs.disconnect();clearTimeout(tid);res(r)}});const tid=setTimeout(()=>{obs.disconnect();rej(new Error('Timeout'))},timeout);obs.observe(document.documentElement,{childList:true,subtree:true,characterData:true})})},async waitForHidden(sel,t=20000){await piHelpers.waitForSelector(sel,{state:'hidden',timeout:t})},getByRole(role,opts={}){const{name}=opts;const roles={button:['button','input[type=button]','input[type=submit]','input[type=reset]'],link:['a[href]'],textbox:['input:not([type])','input[type=text]','input[type=email]','input[type=password]','textarea'],checkbox:['input[type=checkbox]'],radio:['input[type=radio]'],combobox:['select'],heading:['h1','h2','h3','h4','h5','h6']};const cands=[...document.querySelectorAll('[role='+role+']')];if(roles[role])roles[role].forEach(s=>cands.push(...document.querySelectorAll(s+':not([role])')));if(!name)return cands[0]||null;const n=name.toLowerCase().trim();for(const el of cands){const l=el.getAttribute('aria-label')?.toLowerCase().trim();const t=el.textContent?.toLowerCase().trim();if(l===n||t===n||l?.includes(n)||t?.includes(n))return el}return null}};window.__piHelpers=piHelpers;window.piHelpers=piHelpers}`;
         await cdp.evaluateScript(tabId, piHelpersCode);
 
-        // Expression form first so the completion value comes back (e.g. `1 + 1`,
-        // `(() => { ... })()`). Code with declarations/if/loops at statement level
-        // is not valid in return position; retry those as plain statements. The
-        // old line-start keyword regex misclassified IIFEs containing `const` and
-        // silently dropped their result (follow-up to #121, 2026-09-17).
-        let result = await cdp.evaluateScript(
-          tabId,
-          `(async () => { 'use strict'; return (\n${message.code}\n); })()`,
-        );
+        const body = codeWithExpressionReturn(message.code);
+        const expression = `(async () => { 'use strict'; ${body} })()`;
 
-        if (isSyntaxError(result.exceptionDetails)) {
+        let result = await cdp.evaluateScript(tabId, expression);
+
+        // Statement scripts (declarations, loops, explicit `return`) cannot be
+        // wrapped as an expression; retry them in statement mode when the
+        // expression form failed to parse.
+        if (result.exceptionDetails && !(await statementBodyParses(tabId, body))) {
           result = await cdp.evaluateScript(tabId, `(async () => { 'use strict'; ${message.code} })()`);
         }
 

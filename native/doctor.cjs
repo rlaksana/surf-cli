@@ -4,6 +4,17 @@ const os = require("os");
 const path = require("path");
 const { execFileSync } = require("child_process");
 const { connectEndpoint, selectEndpoint } = require("./endpoint.cjs");
+const {
+  convertWindowsPath,
+  getWindowsEnv,
+  nativeMessagingRegistryPath,
+  runWindowsExecutable,
+} = require("../scripts/windows-interop.cjs");
+const {
+  renderWslWrapper,
+  probeWindowsWrapper,
+} = require("./native-host-launch-probe.cjs");
+const { findNode, getHostPath } = require("../scripts/install-native-host.cjs");
 
 const HOST_NAME = "surf.browser.host";
 
@@ -115,32 +126,12 @@ function resolveBrowsers(browserArg) {
   return browsers;
 }
 
-function getWindowsEnv(name, { env = process.env, execFileSync: execFile = execFileSync } = {}) {
-  if (env[name]) return env[name];
-  try {
-    return execFile("cmd.exe", ["/c", "echo", `%${name}%`], { encoding: "utf8" })
-      .trim()
-      .replace(/\r/g, "");
-  } catch {
-    return null;
-  }
-}
-
-function windowsPathToWslPath(winPath) {
-  const normalized = winPath.replace(/\\/g, "/");
-  const match = normalized.match(/^([A-Za-z]):\/(.*)$/);
-  if (!match) return normalized;
-  return `/mnt/${match[1].toLowerCase()}/${match[2]}`;
-}
-
 function manifestPathForBrowser(browserKey, context) {
   const browser = BROWSERS[browserKey];
   if (!browser) return null;
 
   if (context.effectiveTarget === "wsl-windows") {
-    const localAppData = getWindowsEnv("LOCALAPPDATA", context);
-    if (!localAppData || !browser.wsl) return null;
-    return path.join(windowsPathToWslPath(localAppData), browser.wsl, `${HOST_NAME}.json`);
+    return null;
   }
 
   if (context.platform === "win32") {
@@ -156,7 +147,7 @@ function manifestPathForBrowser(browserKey, context) {
 
 function fsPathFromManifestPath(manifestPath, context) {
   if (context.platform === "linux" && /^[A-Za-z]:[\\/]/.test(manifestPath)) {
-    return windowsPathToWslPath(manifestPath);
+    return convertWindowsPath(manifestPath, context);
   }
   return manifestPath;
 }
@@ -164,17 +155,21 @@ function fsPathFromManifestPath(manifestPath, context) {
 function windowsRegistryPathForBrowser(browserKey) {
   const browser = BROWSERS[browserKey];
   if (!browser?.win32) return null;
-  return `HKCU\\Software\\${browser.win32}\\NativeMessagingHosts\\${HOST_NAME}`;
+  return nativeMessagingRegistryPath(browser.win32, HOST_NAME);
 }
 
 function readWindowsRegistryManifestPath(registryPath, context) {
   try {
-    const output = context.execFileSync("reg", ["query", registryPath, "/ve"], { encoding: "utf8" });
+    const output = runWindowsExecutable("reg.exe", ["query", registryPath, "/ve"], {
+      execFileSync: context.execFileSync,
+      allowWslFallback: context.effectiveTarget === "wsl-windows",
+      execOptions: { encoding: "utf8" },
+    });
     const line = output.split(/\r?\n/).find((item) => item.includes("REG_SZ"));
-    if (!line) return null;
-    return line.replace(/^.*REG_SZ\s+/, "").trim() || null;
-  } catch {
-    return null;
+    if (!line) return { manifestPath: null, error: "registry output contained no REG_SZ default value" };
+    return { manifestPath: line.replace(/^.*REG_SZ\s+/, "").trim() || null, error: null };
+  } catch (error) {
+    return { manifestPath: null, error: error.message };
   }
 }
 
@@ -192,15 +187,16 @@ function checkWindowsRegistry(browserKey, context) {
     };
   }
 
-  const manifestPath = readWindowsRegistryManifestPath(registryPath, context);
+  const registry = readWindowsRegistryManifestPath(registryPath, context);
+  const manifestPath = registry.manifestPath;
   return {
     check: {
       id: "windows-registry",
       status: manifestPath ? "pass" : "fail",
       browser: browserKey,
-      message: manifestPath
-        ? `Windows native messaging registry points to ${manifestPath}`
-        : `Windows native messaging registry entry not found: ${registryPath}`,
+      message: !manifestPath
+        ? `Windows native messaging registry entry not found: ${registryPath}${registry.error ? ` (${registry.error})` : ""}`
+        : `Windows native messaging registry points to ${manifestPath}`,
       registryPath,
       path: manifestPath,
     },
@@ -210,19 +206,32 @@ function checkWindowsRegistry(browserKey, context) {
 
 function checkManifest(manifestPath, context) {
   const checks = [];
-  const exists = manifestPath ? context.fs.existsSync(manifestPath) : false;
+  let manifestFsPath = manifestPath;
+  try {
+    manifestFsPath = manifestPath ? fsPathFromManifestPath(manifestPath, context) : manifestPath;
+  } catch (error) {
+    checks.push({
+      id: "manifest-file",
+      status: "fail",
+      message: `Could not resolve manifest path ${manifestPath}: ${error.message}`,
+      path: manifestPath,
+    });
+    return { checks, manifest: null };
+  }
+  const exists = manifestFsPath ? context.fs.existsSync(manifestFsPath) : false;
   checks.push({
     id: "manifest-file",
     status: exists ? "pass" : "fail",
-    message: exists ? `Manifest found: ${manifestPath}` : "Native messaging manifest not found",
+    message: exists ? `Manifest found: ${manifestPath}` : `Native messaging manifest not found: ${manifestPath}`,
     path: manifestPath,
+    fsPath: manifestFsPath,
   });
 
   if (!exists) return { checks, manifest: null };
 
   let manifest;
   try {
-    manifest = JSON.parse(context.fs.readFileSync(manifestPath, "utf8"));
+    manifest = JSON.parse(context.fs.readFileSync(manifestFsPath, "utf8"));
     checks.push({ id: "manifest-json", status: "pass", message: "Manifest JSON is valid" });
   } catch (error) {
     checks.push({ id: "manifest-json", status: "fail", message: `Manifest JSON is invalid: ${error.message}` });
@@ -286,6 +295,126 @@ function checkManifest(manifestPath, context) {
   }
 
   return { checks, manifest };
+}
+
+function normalizeWindowsPath(filePath) {
+  return path.win32.normalize(filePath).replace(/[\\/]+$/, "").toLowerCase();
+}
+
+function checkWslWrapperLaunch(manifest, context) {
+  if (!manifest || typeof manifest.path !== "string" || manifest.path.length === 0) {
+    return null;
+  }
+
+  let canonicalWindowsPath;
+  try {
+    const localAppData = getWindowsEnv("LOCALAPPDATA", { execFileSync: context.execFileSync });
+    canonicalWindowsPath = path.win32.join(
+      localAppData,
+      "surf-cli",
+      "host-wrapper-wsl.cmd",
+    );
+  } catch (error) {
+    return {
+      id: "wrapper-launch",
+      status: "fail",
+      message: `Could not resolve Surf's managed Windows wrapper path: ${error.message}`,
+    };
+  }
+
+  if (normalizeWindowsPath(manifest.path) !== normalizeWindowsPath(canonicalWindowsPath)) {
+    return {
+      id: "wrapper-launch",
+      status: "warn",
+      message:
+        "Skipped launch probe because the manifest does not point to Surf's managed WSL wrapper. Run `surf install <extension-id>` to restore the managed wrapper.",
+      path: manifest.path,
+    };
+  }
+
+  let wrapperFsPath;
+  try {
+    wrapperFsPath = fsPathFromManifestPath(canonicalWindowsPath, context);
+  } catch (error) {
+    return {
+      id: "wrapper-launch",
+      status: "fail",
+      message: `Could not resolve Surf's managed WSL wrapper: ${error.message}`,
+      path: canonicalWindowsPath,
+    };
+  }
+
+  if (!context.fs.existsSync(wrapperFsPath)) {
+    return {
+      id: "wrapper-launch",
+      status: "fail",
+      message: `Surf's managed WSL wrapper does not exist: ${canonicalWindowsPath}`,
+      path: canonicalWindowsPath,
+      fsPath: wrapperFsPath,
+    };
+  }
+
+  let wrapperContent;
+  try {
+    wrapperContent = context.fs.readFileSync(wrapperFsPath, "utf8");
+  } catch (error) {
+    return {
+      id: "wrapper-launch",
+      status: "fail",
+      message: `Could not read Surf's managed WSL wrapper: ${error.message}`,
+      path: canonicalWindowsPath,
+      fsPath: wrapperFsPath,
+    };
+  }
+
+  const nodePath = context.nodePath || findNode();
+  const hostPath = context.hostPath || getHostPath();
+  const distro = context.env.WSL_DISTRO_NAME;
+  let explicitWrapper = null;
+  let defaultWrapper = null;
+  if (nodePath && hostPath && distro) {
+    try {
+      explicitWrapper = renderWslWrapper(nodePath, hostPath, distro);
+      defaultWrapper = renderWslWrapper(nodePath, hostPath, null);
+    } catch {
+      // Do not execute a wrapper whose installed paths cannot be rendered safely.
+    }
+  }
+  if (wrapperContent !== explicitWrapper && wrapperContent !== defaultWrapper) {
+    return {
+      id: "wrapper-launch",
+      status: "warn",
+      message:
+        "Surf's managed WSL wrapper does not match this installation, so it was not executed. Run `surf install <extension-id>` to replace it.",
+      path: canonicalWindowsPath,
+      fsPath: wrapperFsPath,
+    };
+  }
+
+  try {
+    const observedDistro = context.probeWindowsWrapper(canonicalWindowsPath, {
+      execFileSync: context.execFileSync,
+      verifyDistro: wrapperContent === defaultWrapper,
+    });
+    if (wrapperContent === defaultWrapper && observedDistro !== distro) {
+      throw new Error("Windows default WSL distro does not match this installation");
+    }
+    return {
+      id: "wrapper-launch",
+      status: "pass",
+      message: "Surf's managed WSL wrapper completed its launch probe",
+      path: canonicalWindowsPath,
+      fsPath: wrapperFsPath,
+    };
+  } catch (error) {
+    return {
+      id: "wrapper-launch",
+      status: "fail",
+      message: `Surf's managed WSL wrapper failed validation: ${error.message}`,
+      path: canonicalWindowsPath,
+      fsPath: wrapperFsPath,
+    };
+  }
 }
 
 async function checkSocket(socketPath, context) {
@@ -371,6 +500,20 @@ function summarize(checks) {
 function buildRecommendations(report) {
   const recommendations = [];
   const failedIds = new Set(report.checks.filter((check) => check.status === "fail").map((check) => check.id));
+  const debugRelevantIds = new Set([
+    "windows-registry",
+    "manifest-file",
+    "manifest-json",
+    "manifest-shape",
+    "manifest-name",
+    "manifest-type",
+    "manifest-origins",
+    "manifest-path",
+    "manifest-path-executable",
+    "wrapper-launch",
+    "socket-file",
+    "socket-connect",
+  ]);
 
   if (failedIds.has("windows-registry")) {
     recommendations.push("Run `surf install <extension-id> --browser <browser>` so Windows registers the native messaging host, then restart the browser.");
@@ -384,11 +527,17 @@ function buildRecommendations(report) {
   if (failedIds.has("manifest-path") || failedIds.has("manifest-path-executable")) {
     recommendations.push("Reinstall the native host so the manifest path points at the current Surf wrapper.");
   }
+  if (failedIds.has("wrapper-launch")) {
+    recommendations.push("Rerun `surf install <extension-id>` from the same WSL distro so Surf can replace and validate the Windows wrapper.");
+  }
   if (failedIds.has("manifest-supported")) {
     recommendations.push("Choose a browser supported for this target, or rerun with `--browser all` to inspect every supported setup.");
   }
   if (failedIds.has("socket-file") || failedIds.has("socket-connect")) {
     recommendations.push("Make sure the browser is running with the Surf extension enabled, then restart the browser after install changes.");
+  }
+  if ([...failedIds].some((id) => debugRelevantIds.has(id))) {
+    recommendations.push("Open chrome://extensions and inspect Surf's service worker console. In Surf's Details > Extension options, enable Debug Mode, reproduce the failure, then disable Debug Mode when finished.");
   }
   if (report.environment.surfSocketSet) {
     recommendations.push("SURF_SOCKET is set; make sure Chrome launches the native host with the same socket value.");
@@ -405,6 +554,14 @@ function buildRecommendations(report) {
 
 function remoteRecommendations(endpoint, code) {
   const base = [`Confirm Surf is listening on ${endpoint.display}; the remote host listener must allow this Tailnet connection.`];
+  const tlsCodes = new Set([
+    "ERR_TLS_CERT_ALTNAME_INVALID", "UNABLE_TO_VERIFY_LEAF_SIGNATURE", "SELF_SIGNED_CERT_IN_CHAIN",
+    "DEPTH_ZERO_SELF_SIGNED_CERT", "UNABLE_TO_GET_ISSUER_CERT", "UNABLE_TO_GET_ISSUER_CERT_LOCALLY",
+    "CERT_HAS_EXPIRED",
+  ]);
+  if (endpoint.tls?.enabled && (code === "ETIMEDOUT" || tlsCodes.has(code))) {
+    return [...base, "Check the reverse-proxy certificate chain and expected server name (or --remote-tls-server-name); a custom CA replaces system roots."];
+  }
   if (code === "ENOTFOUND") return [...base, "Check the Tailnet DNS name, then run `tailscale status` and `tailscale ping <host>`."].map((item) => item.replace("<host>", endpoint.host));
   if (code === "ETIMEDOUT") return [...base, `Run \`tailscale ping ${endpoint.host}\`; check restrictive Tailnet ACLs/grants and host firewall rules.`];
   if (code === "ECONNREFUSED") return [...base, "Verify the host process is running and bound to the requested TCP port; check restrictive Tailnet ACLs/grants."];
@@ -445,9 +602,10 @@ async function runDoctor(rawOptions = {}, deps = {}) {
       socket = connectEndpoint(target, () => finish({ ok: true, message: "authenticated" }));
       socket.once("error", (error) => finish({ ok: false, code: error.code, message: error.message || String(error) }));
     })))(endpoint, options.connectTimeoutMs);
-    const checks = [{ id: "remote-endpoint", status: "info", message: `Remote endpoint: ${endpoint.display}`, endpoint: endpoint.display }, {
+    const tlsMarker = endpoint.tls?.enabled ? " (TLS)" : "";
+    const checks = [{ id: "remote-endpoint", status: "info", message: `Remote endpoint: ${endpoint.display}${tlsMarker}`, endpoint: endpoint.display }, {
       id: "remote-connect", status: connection.ok ? "pass" : "fail",
-      message: connection.ok ? `Connected to remote endpoint ${endpoint.display}` : `Could not connect to remote endpoint ${endpoint.display}: ${connection.message}`,
+      message: connection.ok ? `Connected to remote endpoint ${endpoint.display}${tlsMarker}` : `Could not connect to remote endpoint ${endpoint.display}${tlsMarker}: ${connection.message}`,
       code: connection.code,
     }, {
       id: "remote-auth", status: connection.ok ? "pass" : connection.code === "EAUTH" ? "fail" : "info",
@@ -469,6 +627,9 @@ async function runDoctor(rawOptions = {}, deps = {}) {
     effectiveTarget,
     fs: deps.fs || fs,
     execFileSync: deps.execFileSync || execFileSync,
+    probeWindowsWrapper: deps.probeWindowsWrapper || probeWindowsWrapper,
+    nodePath: deps.nodePath,
+    hostPath: deps.hostPath,
     connectSocket: deps.connectSocket || connectSocket,
     connectTimeoutMs: options.connectTimeoutMs,
   };
@@ -484,15 +645,20 @@ async function runDoctor(rawOptions = {}, deps = {}) {
   for (const browserKey of browsers) {
     const browser = BROWSERS[browserKey];
     const browserChecks = [];
-    let manifestPath = manifestPathForBrowser(browserKey, context);
+    const usesWindowsRegistry =
+      (context.platform === "win32" || context.effectiveTarget === "wsl-windows") &&
+      Boolean(browser.win32);
+    let manifestPath = null;
 
-    if (context.platform === "win32" && browser.win32) {
+    if (usesWindowsRegistry) {
       const registry = checkWindowsRegistry(browserKey, context);
       browserChecks.push(registry.check);
-      if (registry.manifestPath) manifestPath = registry.manifestPath;
+      manifestPath = registry.manifestPath;
+    } else {
+      manifestPath = manifestPathForBrowser(browserKey, context);
     }
 
-    if (!manifestPath) {
+    if (!manifestPath && !usesWindowsRegistry) {
       const check = {
         id: "manifest-supported",
         status: options.browser === "all" ? "warn" : "fail",
@@ -507,6 +673,10 @@ async function runDoctor(rawOptions = {}, deps = {}) {
 
     const result = checkManifest(manifestPath, context);
     browserChecks.push(...result.checks.map((check) => ({ ...check, browser: browserKey })));
+    if (context.effectiveTarget === "wsl-windows" && result.manifest) {
+      const wrapperLaunch = checkWslWrapperLaunch(result.manifest, context);
+      if (wrapperLaunch) browserChecks.push({ ...wrapperLaunch, browser: browserKey });
+    }
     checks.push(...browserChecks);
     manifests.push({
       browser: browserKey,
@@ -629,5 +799,4 @@ module.exports = {
   parseDoctorArgs,
   runDoctor,
   runDoctorCli,
-  windowsPathToWslPath,
 };

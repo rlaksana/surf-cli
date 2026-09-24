@@ -1,4 +1,16 @@
 #!/usr/bin/env node
+const LAUNCH_PROBE_ARGUMENT = "--surf-native-host-launch-probe";
+const LAUNCH_PROBE_MARKER = "SURF_NATIVE_HOST_LAUNCH_PROBE_OK";
+
+if (process.argv.length === 3 && process.argv[2] === LAUNCH_PROBE_ARGUMENT) {
+  process.stdout.write(`${LAUNCH_PROBE_MARKER}\n`);
+  process.exit(0);
+}
+if (process.argv.length === 3 && process.argv[2] === `${LAUNCH_PROBE_ARGUMENT}-distro`) {
+  process.stdout.write(`${LAUNCH_PROBE_MARKER}:${JSON.stringify(process.env.WSL_DISTRO_NAME || null)}\n`);
+  process.exit(0);
+}
+
 const net = require("net");
 const fs = require("fs");
 const path = require("path");
@@ -17,11 +29,12 @@ const kimiClient = require("./kimi-client.cjs");
 const aistudioClient = require("./aistudio-client.cjs");
 const aistudioBuild = require("./aistudio-build.cjs");
 const aimodeClient = require("./aimode-client.cjs");
-const { mapToolToMessage, mapComputerAction, formatToolContent, formatToolError, buildProviderUploadMessage } = require("./host-helpers.cjs");
+const { mapToolToMessage, mapComputerAction, formatToolContent, formatToolError, buildProviderUploadMessage, applySemanticExpectedIdentity } = require("./host-helpers.cjs");
 const { createOracleHost } = require("./oracle-host.cjs");
 
 const IS_WIN = process.platform === "win32";
 const { SOCKET_PATH, SURF_TMP } = require("./socket-path.cjs");
+const { takeFrames } = require("./stdin-frames.cjs");
 const { parseListenEndpoint } = require("./listener.cjs");
 const { getStateDir } = require("./remote-auth.cjs");
 const { createFrameParser, createServerAuthSession, createSocketWriter, isClientAuthorized, writeFrame, MAX_FRAME_BYTES } = require("./remote-transport.cjs");
@@ -850,7 +863,7 @@ function currentFrameContext(request) {
 function applyFrameContextToMessage(request, extensionMessage) {
   if (!extensionMessage || !FRAME_CONTEXT_MESSAGE_TYPES.has(extensionMessage.type)) return;
   const context = currentFrameContext(request);
-  if (context) extensionMessage.frameId = context.frameId;
+  if (context && !Number.isInteger(extensionMessage.frameId)) extensionMessage.frameId = context.frameId;
 }
 
 function persistFrameContext(request, frameId, url) {
@@ -1503,6 +1516,7 @@ async function executeMappedHostTool(request, tool, args, tabId) {
   if (!extensionMsg) throw new Error(`Unknown tool: ${tool}`);
   if (request.target?.strict) extensionMsg.strictTarget = true;
   applyFrameContextToMessage(request, extensionMsg);
+  applySemanticExpectedIdentity(request, extensionMsg, args);
   if (extensionMsg.type === "UNSUPPORTED_ACTION") throw new Error(extensionMsg.message);
   if (extensionMsg.type === "LOCAL_WAIT") {
     await abortableDelay(extensionMsg.seconds * 1000, request.signal);
@@ -1726,6 +1740,9 @@ function sendToolResponse(socket, id, result, error) {
     let output = result;
     try {
       if (!error) output = await sendRequestDownloads(context, request, result);
+      if (!error && output?.semanticObservation?.identity && request?.target) {
+        output.semanticObservation.identity.browserEpoch = request.target.browserEpoch;
+      }
     } catch (transferFailure) {
       finalError = transferFailure.message;
     }
@@ -1772,7 +1789,12 @@ function sendToolResponse(socket, id, result, error) {
     }
     if (request?.notice) response.notice = request.notice;
     if (formattedError) response.error = formattedError;
-    else response.result = { content: formatToolContent(output, log, { suppressImages: Boolean(context?.isRemote) }) };
+    else {
+      response.result = { content: formatToolContent(output, log, { suppressImages: Boolean(context?.isRemote) }) };
+      if (request?.tool === "tab.new" && Number.isInteger(output?.tabId) && output.tabId > 0) {
+        response.result.tabId = output.tabId;
+      }
+    }
     if (!context?.closed) await sendSocket(socket, response);
   })().catch((sendError) => log(`Error sending tool_response: ${sendError.message}`));
 }
@@ -1906,6 +1928,12 @@ function handleToolRequest(msg, socket, requestContext = requestStorage.getStore
   }
   if (requestContext.target?.strict) extensionMsg.strictTarget = true;
   applyFrameContextToMessage(requestContext, extensionMsg);
+  try {
+    applySemanticExpectedIdentity(requestContext, extensionMsg, args);
+  } catch (error) {
+    sendToolResponse(socket, originalId, null, error);
+    return;
+  }
   
   if (extensionMsg.type === "UNSUPPORTED_ACTION") {
     sendToolResponse(socket, originalId, null, extensionMsg.message);
@@ -2982,25 +3010,23 @@ function writeMessage(msg) {
 let inputBuffer = Buffer.alloc(0);
 
 function processInput() {
-  while (inputBuffer.length >= 4) {
-    const msgLen = inputBuffer.readUInt32LE(0);
-    if (inputBuffer.length < 4 + msgLen) break;
-    
-    const jsonStr = inputBuffer.slice(4, 4 + msgLen).toString("utf8");
-    inputBuffer = inputBuffer.slice(4 + msgLen);
-    
+  // Take every complete frame out of the buffer before dispatching: one
+  // chunk routinely carries a TARGET_EVENT and the reply to a tool request.
+  const { frames, rest } = takeFrames(inputBuffer);
+  inputBuffer = rest;
+  for (const jsonStr of frames) {
     try {
       const msg = JSON.parse(jsonStr);
       log(`Received from extension: ${msg.type || "unknown"}${msg.id !== undefined ? ` id=${msg.id}` : ""}`);
 
       if (msg.type === "EXTENSION_HELLO") {
         setBrowserIdentity(msg);
-        return;
+        continue;
       }
 
       if (msg.type === "TARGET_EVENT") {
         handleTargetEvent(msg);
-        return;
+        continue;
       }
       
       if (msg.type === "GET_AUTH") {
@@ -3024,12 +3050,12 @@ function processInput() {
             hint: "Failed to read auth credentials. Run 'pi --login anthropic' in terminal to authenticate."
           });
         }
-        return;
+        continue;
       }
       
       if (msg.type === "API_REQUEST") {
         handleApiRequest(msg, writeMessage);
-        return;
+        continue;
       }
 
       if (msg.type === "PLAYBOOK_WATCH_EVENT") {
@@ -3042,14 +3068,14 @@ function processInput() {
           tabId: msg.tabId,
           timestamp: msg.timestamp || new Date().toISOString(),
         });
-        return;
+        continue;
       }
 
       if (msg.type === "VIDEO_FRAME") {
         if (activeVideoRecorder && msg.recorderId === activeVideoRecorder.recorderId && msg.tabId === activeVideoRecorder.tabId) {
           activeVideoRecorder.recorder.addFrame(msg.data, Number.isFinite(msg.receivedAt) ? msg.receivedAt : Date.now());
         }
-        return;
+        continue;
       }
 
       if (msg.type === "VIDEO_ERROR") {
@@ -3059,7 +3085,7 @@ function processInput() {
             msg.error || "Video screencast failed",
           ));
         }
-        return;
+        continue;
       }
       
       if (msg.type === "STREAM_EVENT") {
@@ -3071,7 +3097,7 @@ function processInput() {
             stream.socket.destroy(error);
           });
         }
-        return;
+        continue;
       }
 
       if (msg.type === "STREAM_ERROR") {
@@ -3084,7 +3110,7 @@ function processInput() {
             })
             .finally(() => stopActiveStream(msg.streamId));
         }
-        return;
+        continue;
       }
       
       
@@ -3097,13 +3123,13 @@ function processInput() {
           if (topLevelResponse && request?.context) {
             completeOwnedRequest(request.context, request.id, "cleanup-settled");
           }
-          return;
+          continue;
         }
         handleFrameContextFailure(pending.request, msg);
         updateFrameContextFromResult(pending.request, pending.tool, msg);
         if (pending.resolve || pending.onComplete) {
           pendingToolRequests.resolve(msg.id, msg);
-          return;
+          continue;
         }
         pendingToolRequests.delete(msg.id);
         {
@@ -3112,7 +3138,11 @@ function processInput() {
           const tabId = storedTabId || msg._resolvedTabId;
           const failAutoScreenshot = (message) => pending.autoScreenshotOutput
             ? sendToolResponse(socket, originalId, null, `Auto-screenshot failed: ${message}`)
-            : sendToolResponse(socket, originalId, { ...msg, autoScreenshotError: message }, null);
+            : sendToolResponse(socket, originalId, {
+                ...msg,
+                screenshotError: message,
+                autoScreenshotError: message,
+              }, null);
           
           if (pending.networkExport && Array.isArray(msg.entries)) {
             try {
@@ -3203,7 +3233,7 @@ function processInput() {
                 }
               })
               .catch((error) => failAutoScreenshot(error.message));
-            return;
+            continue;
           } else if (autoScreenshot && pending.autoScreenshotOutput && !msg.error) {
             failAutoScreenshot(tabId ? "screenshot response was invalid" : "no tab available");
           } else if (msg.results && msg.savePath) {

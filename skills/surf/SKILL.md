@@ -110,11 +110,13 @@ The mandatory rules apply by default. One explicit exception: when the user them
 | Closing user's pre-existing tab | Destructive | Preserve all tabs the agent did not create |
 | Screenshotting without `--tab-id` | Implies `tab.switch` | Pass `--tab-id <id>` |
 
+Ordinary socket-backed CLI commands report top-level host tool-response errors on stderr with a supplied `[code]` on the first line and exit 1. `--json` additionally writes `{error:{code,message,details?}}` on stdout (missing code becomes `"error"`). `--soft-fail` instead keeps the original stderr warning, empty stdout and exit 0, even with `--json`. This does not cover local validation, transport/parser failures or compound-command errors: do not assume every failure produces JSON. Connection failures remain stderr-only and exit 1, including with `--soft-fail`.
+
 ## Native Host / Socket Notes
 
 For WSL2 with Windows Chrome, run `surf install <extension-id>` inside WSL2. Surf detects WSL2 and writes the Windows-side native messaging manifest plus a wrapper that launches the WSL host. Use `surf install <extension-id> --target linux` only for Linux browsers running inside WSLg.
 
-On macOS, Chrome reads the native messaging manifest at `~/Library/Application Support/Google/Chrome/NativeMessagingHosts/surf.browser.host.json`. If native messaging fails, confirm that file exists, its `allowed_origins` extension ID matches `chrome://extensions`, then rerun `surf install <extension-id>`, restart Chrome, reload the extension, and inspect the extension service-worker console.
+On macOS, Chrome reads the native messaging manifest at `~/Library/Application Support/Google/Chrome/NativeMessagingHosts/surf.browser.host.json`. If native messaging fails, confirm that file exists, its `allowed_origins` extension ID matches `chrome://extensions`, then rerun `surf install <extension-id>`, restart Chrome, and reload the extension. Open Surf's service-worker console from `chrome://extensions`; in **Details > Extension options**, enable **Debug Mode**, reproduce the failure, then disable it when finished.
 
 If a command reports `Socket connect failed`, run `surf doctor` first, then check the `Attempted socket:` line. Default sockets are `/tmp/surf.sock` on macOS/Linux/WSL2 and `//./pipe/surf` on Windows. If `SURF_SOCKET` is set, the browser-launched host and the shell running `surf` must use the same value.
 
@@ -137,8 +139,17 @@ surf --remote 100.101.102.103:4321 \
   --remote-credential ~/.config/surf/agent-macbook.json \
   page.read
 
+# TLS is client-side and requires a TLS-terminating reverse proxy in front of SURF_LISTEN
+surf --remote surf.example.com:443 --remote-tls \
+  --remote-tls-ca ~/.config/surf/private-ca.pem \
+  --remote-credential ~/.config/surf/agent-macbook.json page.read
+
 surf remote revoke agent-macbook  # Run on the browser host
 ```
+
+Environment equivalents are `SURF_REMOTE_TLS=1`, `SURF_REMOTE_TLS_CA`, and
+`SURF_REMOTE_TLS_SERVER_NAME`. A custom CA replaces system roots; Ed25519 credentials remain
+mandatory after TLS validation.
 
 Remote paths are client-local by default. `local:./file` is explicit client-local syntax; only `remote:/absolute/path` accesses the browser host directly. Remote transfer supports one upload or ChatGPT/Gemini input and one screenshot, network-export, or Gemini image output. Limits are 256 MiB per file, 512 MiB and 32 files per connection, and 256 KiB decoded chunks. `record`, `aistudio.build`, smoke screenshot directories, directories, and multi-file inputs are not supported remotely. Successful action screenshots and failure `--auto-capture` diagnostics are transferred back to client-local paths.
 
@@ -185,6 +196,83 @@ surf screenshot --full-page --output /tmp/shot.png
 # Inspect animation/style changes as JSON
 surf animate-audit --selector ".thing" --duration 2000 --fps 10
 ```
+
+## Optional semantic decisions
+
+`semantic.act` is a bounded, goal-driven website controller. It repeatedly
+observes the page, lets Jev select the next action from Surf's allowed menu,
+validates and executes that action, and checks the overall goal:
+
+```text
+goal -> observe -> choose -> validate + act -> verify
+           ^                              |
+           +-------- incomplete ----------+
+```
+
+It returns when the goal is complete, a decision is uncertain, or a configured
+budget is exhausted. Use `semantic.find` for one control, `semantic.filter` for
+relevant page regions, and
+`semantic.verify` for one outcome. Use Jev when the page or happy path is
+unfamiliar; once the path is stable, prefer deterministic Surf commands for
+repeated runs. The agent owns the goal and final confirmation, while Surf retains
+execution authority. Only `semantic.*` sends bounded, value-free page text to
+TypeSafe.
+
+```bash
+surf semantic.find "the settings control"
+surf semantic.verify "Settings were saved" --json
+surf semantic.filter "settings"
+surf semantic.act "Open settings" --max-steps 5
+surf semantic.act "Fill email" --input email="$EMAIL" --allow-write --allow-ref e3
+surf semantic.act 'Add the selected item to the cart' --allow-write --threshold write=0.85
+printf '%s\n' "$TYPESAFE_KEY" | surf semantic auth set
+surf semantic auth status
+surf semantic auth clear
+```
+
+For reusable bounded recipes, put only linear `semantic.step` operations in a
+workflow with `"semantic":{"version":1}`. Check it offline with
+`surf workflow.validate flow.json` or `surf do --file flow.json --dry-run`, then
+run with `--allow-semantic`; declared fill/check/click operations also require
+`--allow-write`. Supply private fill slots as a bounded JSON object on stdin:
+
+```bash
+printf '%s' '{"quantity":"2"}' | SURF_SESSION=shopping surf do --file flow.json \
+  --inputs-stdin --allow-semantic --allow-write --json
+```
+
+The closed operations are `find`, same-origin direct `open`, `ensureChecked`,
+`fill`, one-shot `click` with an explicit expectation, and `assert`. Search is
+bounded overlapping coverage, not global ranking. Unknown write outcomes stop
+without replay; a later new run can still repeat an external effect. Input
+values never enter provider state, workflow variables, events, or checkpoints.
+
+Required argument shapes:
+
+```text
+find           target (+ optional search), usually save with "as"
+open           target
+ensureChecked  target + checked
+fill           target + input
+click          target + expect
+assert         mode + claim (semantic) or predicate (local)
+```
+
+The complete valid six-operation example in the README uses these shapes; start
+from it instead of inventing fields.
+
+Every click/fill requires `--allow-write`; repeat `--allow-ref` to narrow it.
+Broad writes use threshold `0.95`; exactly one allowed ref with one applicable
+write uses `0.65`. The applied threshold is included in decision/trace output.
+Repeatable `--threshold name=value` overrides applicable confidence thresholds
+for one run only; defaults remain safer, and overrides never grant write authority.
+`TYPESAFE_API_KEY` is the ephemeral/CI override.
+The shared credential schema is `{"version":1,"apiKey":"..."}` at
+`${XDG_CONFIG_HOME:-~/.config}/typesafe/credentials.json` (Unix/macOS) or
+`%APPDATA%\TypeSafe\credentials.json` (Windows), independent of Surf state and
+the project. POSIX directories/files use `0700`/`0600`; Windows relies on the
+current user's profile ACL. `TYPESAFE_API_KEY` wins. Status reveals only source
+and fingerprint; clear affects all clients using the shared file.
 
 ## AI Assistants (No API Keys)
 
@@ -475,6 +563,7 @@ surf page.text                 # Plain text content only
 surf page.html --strip-scripts # Rendered HTML without scripts
 surf page.save --selector "#artifact" --strip-scripts --output page.html # Save one static element
 surf page.state                # Modals, loading state, scroll info
+surf frame.diagnose            # Why a selector misses: DOM iframes (incl. open shadow roots) vs extension frames vs CDP tree, with warnings; out-of-process frames need frame.switch, not frame.js
 ```
 
 ### Export Rendered HTML
@@ -552,7 +641,13 @@ surf wait.network              # Wait for network idle
 surf wait.url "/success"       # Wait for URL pattern
 surf wait.dom --stable 100     # Wait for DOM stability
 surf wait.load                 # Wait for page load complete
+surf wait.ready --selector ".results"                 # Ready, or fail fast: login / challenge / not-found / error
+surf wait.ready --url-prefix "https://app.example.com/" --empty-text "No results"  # empty vs blocked
+surf wait.ready --accept login --json                 # Return the negative state instead of failing
+surf page.readiness --json     # Classify the current page once (state + evidence)
 ```
+
+Typed readiness states replace "the selector never appeared": exit codes carry `page_login`, `page_challenge`, `page_not_found`, `page_error` or `page_timeout`. Detection uses visible UI (a rendered password field, a login route, the page's wording, a URL outside `--url-prefix`), not site selectors.
 
 ## Dialog Handling
 

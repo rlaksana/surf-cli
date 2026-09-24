@@ -228,6 +228,21 @@ function formatToolContent(result, log = () => {}, options = {}) {
     ];
   }
   
+  if (result.semanticObservation !== undefined) {
+    return text(JSON.stringify({
+      pageContent: result.pageContent,
+      viewport: result.viewport,
+      semanticObservation: result.semanticObservation,
+    }));
+  }
+
+  if (
+    result.identity !== undefined && result.matches !== undefined ||
+    result.scopeToken !== undefined && result.geometry !== undefined
+  ) {
+    return text(JSON.stringify(result));
+  }
+
   if (result.pageContent !== undefined) {
     const content = result.pageContent || "No content";
     let output = '';
@@ -442,6 +457,11 @@ function formatToolContent(result, log = () => {}, options = {}) {
 
   // Bug fix: Handle success with metrics/frames/readyState/hint in one block
   if (result.success) {
+    // Keep the response envelope intact so the CLI can print body bytes verbatim
+    // for text output while still producing structured output under --json.
+    if (typeof result.body === "string" && Object.hasOwn(result, "base64Encoded")) {
+      return text(JSON.stringify(result));
+    }
     if (result.metrics) {
       return text(JSON.stringify(result.metrics, null, 2));
     }
@@ -462,11 +482,35 @@ function formatToolContent(result, log = () => {}, options = {}) {
   }
   
   // Strip internal fields before JSON output
-  const { _resolvedTabId, _hint, ...cleanResult } = result;
+  const { _resolvedTabId, _resolvedWindowId, _hint, ...cleanResult } = result;
   if (_hint) {
     return text(JSON.stringify(cleanResult) + `\n[hint] ${_hint}`);
   }
   return text(JSON.stringify(cleanResult));
+}
+
+/**
+ * Readiness expectations accept both CLI flag spelling (--url-prefix) and
+ * socket API spelling (urlPrefix). Empty values are dropped.
+ */
+function readinessExpectations(a) {
+  const pick = (...keys) => {
+    for (const key of keys) {
+      const value = a[key];
+      if (typeof value === "string" && value.trim() !== "") return value;
+    }
+    return undefined;
+  };
+  const expect = {
+    selector: pick("selector"),
+    text: pick("text"),
+    urlPrefix: pick("urlPrefix", "url-prefix"),
+    emptyText: pick("emptyText", "empty-text"),
+  };
+  for (const key of Object.keys(expect)) {
+    if (expect[key] === undefined) delete expect[key];
+  }
+  return expect;
 }
 
 /**
@@ -477,7 +521,7 @@ function mapComputerAction(args, tabId) {
   const { action, text, scroll_direction, scroll_amount, 
           start_coordinate, ref, duration, modifiers } = a;
   const coordinate = a.coordinate || (a.x !== undefined && a.y !== undefined ? [a.x, a.y] : undefined);
-  const baseMsg = { tabId };
+  const baseMsg = { tabId, ...(Number.isInteger(a.semanticFrameId) ? { frameId: a.semanticFrameId } : {}) };
   
   if (!action) {
     return { type: "UNSUPPORTED_ACTION", action: null, message: "No action specified for computer tool" };
@@ -488,7 +532,7 @@ function mapComputerAction(args, tabId) {
       return { type: "EXECUTE_SCREENSHOT", ...baseMsg };
     
     case "left_click":
-      if (ref) return { type: "CLICK_REF", ref, button: "left", ...baseMsg };
+      if (ref) return { type: "CLICK_REF", ref, button: "left", expectedIdentity: a.semanticExpectedIdentity, ...baseMsg };
       if (a.selector) return { type: "CLICK_SELECTOR", selector: a.selector, index: a.index || 0, button: "left", ...baseMsg };
       return { type: "EXECUTE_CLICK", x: coordinate?.[0], y: coordinate?.[1], modifiers, ...baseMsg };
     
@@ -506,7 +550,7 @@ function mapComputerAction(args, tabId) {
     
     case "type": {
       if (ref) {
-        return { type: "FORM_FILL", data: [{ ref, value: text }], ...baseMsg };
+        return { type: "FORM_FILL", data: [{ ref, value: text }], expectedIdentity: a.semanticExpectedIdentity, ...baseMsg };
       }
       const typeSelector = a.selector || a.into;
       if (typeSelector) {
@@ -546,7 +590,7 @@ function mapComputerAction(args, tabId) {
         right: { deltaX: amount, deltaY: 0 },
       };
       const { deltaX, deltaY } = deltas[direction] || { deltaX: 0, deltaY: 0 };
-      return { type: "EXECUTE_SCROLL", deltaX, deltaY, x: coordinate?.[0], y: coordinate?.[1], ...baseMsg };
+      return { type: "EXECUTE_SCROLL", deltaX, deltaY, x: coordinate?.[0], y: coordinate?.[1], expectedIdentity: a.semanticExpectedIdentity, ...baseMsg };
     }
     
     case "scroll_to":
@@ -587,17 +631,21 @@ function mapComputerAction(args, tabId) {
 function mapToolToMessage(tool, args, tabId) {
   const a = args || {};
   // Pass through tab-isolation flags so the extension can choose auto-bg vs active.
+  // Keys are omitted (not set false) so default messages keep upstream's exact shape.
+  const wantsNewTab = a.newTab === true || a["new-tab"] === true;
+  const wantsKeepTab = a.keepTab === true || a["keep-tab"] === true;
   const baseMsg = {
     tabId,
-    _newTab: a.newTab === true || a["new-tab"] === true,
-    _keepTab: a.keepTab === true || a["keep-tab"] === true,
+    ...(Number.isInteger(a.semanticFrameId) ? { frameId: a.semanticFrameId } : {}),
+    ...(wantsNewTab ? { _newTab: true } : {}),
+    ...(wantsKeepTab ? { _keepTab: true } : {}),
   };
   
   switch (tool) {
     case "computer":
       return mapComputerAction(args, tabId);
     case "navigate":
-      return { type: "EXECUTE_NAVIGATE", url: a.url, ...baseMsg };
+      return { type: "EXECUTE_NAVIGATE", url: a.url, expectedIdentity: a.semanticExpectedIdentity, ...baseMsg };
     case "read_page":
       return { 
         type: "READ_PAGE", 
@@ -861,9 +909,9 @@ function mapToolToMessage(tool, args, tabId) {
     case "js":
       return { type: "EXECUTE_JAVASCRIPT", code: a.code, ...baseMsg };
     case "scroll.top":
-      return { type: "SCROLL_TO_POSITION", position: "top", selector: a.selector, ...baseMsg };
+      return { type: "SCROLL_TO_POSITION", position: "top", selector: a.selector, expectedIdentity: a.semanticExpectedIdentity, ...baseMsg };
     case "scroll.bottom":
-      return { type: "SCROLL_TO_POSITION", position: "bottom", selector: a.selector, ...baseMsg };
+      return { type: "SCROLL_TO_POSITION", position: "bottom", selector: a.selector, expectedIdentity: a.semanticExpectedIdentity, ...baseMsg };
     case "scroll.info":
       return { type: "GET_SCROLL_INFO", selector: a.selector, ...baseMsg };
     case "scroll.to":
@@ -876,10 +924,23 @@ function mapToolToMessage(tool, args, tabId) {
       return { type: "WAIT_FOR_URL", pattern: a.pattern || a.url, timeout: a.timeout, ...baseMsg };
     case "wait.dom":
       return { type: "WAIT_FOR_DOM_STABLE", stable: a.stable || 100, timeout: a.timeout || 5000, ...baseMsg };
+    case "wait.ready":
+      return {
+        type: "WAIT_FOR_READY",
+        expect: readinessExpectations(a),
+        timeout: a.timeout,
+        interval: a.interval,
+        accept: a.accept,
+        ...baseMsg,
+      };
+    case "page.readiness":
+      return { type: "PAGE_READINESS", expect: readinessExpectations(a), ...baseMsg };
     case "wait.load":
       return { type: "WAIT_FOR_LOAD", timeout: a.timeout || 30000, ...baseMsg };
     case "frame.list":
       return { type: "GET_FRAMES", ...baseMsg };
+    case "frame.diagnose":
+      return { type: "FRAME_DIAGNOSE", ...baseMsg };
     case "frame.switch":
       return { 
         type: "FRAME_SWITCH", 
@@ -934,7 +995,7 @@ function mapToolToMessage(tool, args, tabId) {
       if (typeof fillData === "string") {
         try { fillData = JSON.parse(fillData); } catch (e) { throw new Error("invalid --data JSON"); }
       }
-      return { type: "FORM_FILL", data: fillData, ...baseMsg };
+      return { type: "FORM_FILL", data: fillData, expectedIdentity: a.semanticExpectedIdentity, ...baseMsg };
     case "perf.start":
       return { type: "PERF_START", categories: a.categories ? a.categories.split(",") : undefined, ...baseMsg };
     case "perf.stop":
@@ -966,10 +1027,30 @@ function mapToolToMessage(tool, args, tabId) {
           compact: a.compact || false,
           maxBytes,
           forceFullSnapshot: a.compact === true || maxBytes !== undefined,
+          ...(a.semanticObservation === true ? { semanticObservation: true } : {}),
         },
         ...baseMsg
       };
     }
+    case "semantic.localCompare":
+      return {
+        type: "SEMANTIC_LOCAL_COMPARE",
+        ref: a.ref,
+        predicate: a.predicate,
+        expectedIdentity: a.semanticExpectedIdentity,
+        ...baseMsg,
+      };
+    case "semantic.scrollScope":
+      if (!["inspect", "top", "advance"].includes(a.action)) {
+        throw new Error("semantic scroll scope action must be inspect, top, or advance");
+      }
+      return {
+        type: "SEMANTIC_SCROLL_SCOPE",
+        action: a.action,
+        scopeToken: a.scopeToken,
+        expectedIdentity: a.semanticExpectedIdentity,
+        ...baseMsg,
+      };
     case "page.text":
       return { type: "GET_PAGE_TEXT", ...baseMsg };
     case "page.html":
@@ -1306,4 +1387,49 @@ function mapToolToMessage(tool, args, tabId) {
   }
 }
 
-module.exports = { mapToolToMessage, mapComputerAction, formatToolContent, formatToolError, buildProviderUploadMessage };
+function applySemanticExpectedIdentity(request, extensionMessage, args) {
+  const fail = (code, message) => {
+    const error = new Error(message);
+    error.code = code;
+    throw error;
+  };
+  const expected = args?.semanticExpectedIdentity;
+  const identityRequired = ["SEMANTIC_LOCAL_COMPARE", "SEMANTIC_SCROLL_SCOPE"].includes(extensionMessage?.type);
+  if (expected === undefined) {
+    if (identityRequired) fail("invalid_expected_identity", "semantic expected identity is required for this action");
+    return;
+  }
+  const guardedTypes = [
+    "CLICK_REF", "FORM_FILL", "EXECUTE_NAVIGATE", "EXECUTE_SCROLL", "SCROLL_TO_POSITION",
+    "SEMANTIC_LOCAL_COMPARE", "SEMANTIC_SCROLL_SCOPE",
+  ];
+  if (!extensionMessage || !guardedTypes.includes(extensionMessage.type)) {
+    fail("invalid_expected_identity", "semantic expected identity is not valid for this action");
+  }
+  const domAction = ["CLICK_REF", "FORM_FILL", "SEMANTIC_LOCAL_COMPARE"].includes(extensionMessage.type);
+  const stringFields = ["browserEpoch", "fullUrl", "documentToken", ...(domAction ? ["ref", "role", "name", "type"] : [])];
+  if (!expected || typeof expected !== "object" || stringFields.some((field) => typeof expected[field] !== "string")) {
+    fail("invalid_expected_identity", "invalid semantic expected identity");
+  }
+  if (!Number.isInteger(expected.tabId) || !Number.isInteger(expected.frameId)) {
+    fail("invalid_expected_identity", "invalid semantic expected identity");
+  }
+  const actualFrameId = Number.isInteger(extensionMessage.frameId) ? extensionMessage.frameId : 0;
+  if (
+    request?.browserIdentity?.browserEpoch !== expected.browserEpoch ||
+    request?.target?.tabId !== expected.tabId ||
+    actualFrameId !== expected.frameId ||
+    domAction && extensionMessage.ref && extensionMessage.ref !== expected.ref ||
+    extensionMessage.type === "FORM_FILL" &&
+      (!Array.isArray(extensionMessage.data) || extensionMessage.data.length !== 1 || extensionMessage.data[0]?.ref !== expected.ref)
+  ) {
+    fail("stale_observation", "stale_observation");
+  }
+  extensionMessage.expectedIdentity = {
+    fullUrl: expected.fullUrl,
+    documentToken: expected.documentToken,
+    ...(domAction ? { ref: expected.ref, role: expected.role, name: expected.name, type: expected.type } : {}),
+  };
+}
+
+module.exports = { mapToolToMessage, mapComputerAction, formatToolContent, formatToolError, buildProviderUploadMessage, readinessExpectations, applySemanticExpectedIdentity };
