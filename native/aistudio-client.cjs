@@ -324,6 +324,12 @@ async function submitPrompt(cdp, inputCdp) {
 }
 
 async function query(options) {
+  // Disabled 2026-09-25: completion detection never fires (times out even on
+  // trivial prompts). Re-enable after selectors.cjs is fixed against a fresh
+  // a11y capture.
+  throw new Error(
+    "aistudio provider is currently disabled (completion detection broken, see clients/aistudio/selectors.cjs). Use chatgpt, gemini, claude, or aimode.",
+  );
   const {
     prompt,
     model = DEFAULT_MODEL,

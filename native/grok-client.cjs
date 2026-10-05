@@ -751,6 +751,12 @@ async function waitForResponse(cdp, timeoutMs = 300000, userPrompt = '', signal)
 // ============================================================================
 
 async function query(options) {
+  // Disabled 2026-09-25: extraction returned landing-page content ("Meet Grok
+  // Bot") instead of the answer. Re-enable after responseContainer/extraction
+  // is fixed against a fresh a11y capture.
+  throw new Error(
+    "grok provider is currently disabled (response extraction broken, see clients/grok/selectors.cjs). Use chatgpt, gemini, claude, or aimode.",
+  );
   const {
     prompt,
     model,

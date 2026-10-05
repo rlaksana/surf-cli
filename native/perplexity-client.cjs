@@ -554,6 +554,12 @@ async function waitForResponse(cdp, timeoutMs = 120000, signal) {
 // ============================================================================
 
 async function query(options) {
+  // Disabled 2026-09-25: completion detection broken — stop button persists
+  // after completion and no done token was found before timeout. Re-enable
+  // after selectors.cjs is fixed against a fresh a11y capture.
+  throw new Error(
+    "perplexity provider is currently disabled (completion detection broken, see clients/perplexity/selectors.cjs). Use chatgpt, gemini, claude, or aimode.",
+  );
   const {
     prompt,
     model,
