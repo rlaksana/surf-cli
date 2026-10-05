@@ -17,8 +17,11 @@ const SELECTORS = {
   promptEditor: "#prompt-textarea",
   promptFallback: 'textarea[name="prompt-textarea"]',
   loginCta: 'a[href*="/auth/login"], button',
+  // 2026-10-05: ChatGPT dropped data-testid from all buttons; send is now a
+  // form submit button aria-labeled "Send" (repurposed to "Stop answering"
+  // while streaming).
   sendButton:
-    'button[data-testid="send-button"], button[data-testid*="composer-send"], form button[type="submit"]',
+    'button[data-testid="send-button"], button[aria-label="Send"], form button[type="submit"], button[type="submit"]',
   modelButton:
     '[data-testid="model-switcher-dropdown-button"], [data-testid="composer-footer-actions"] button[aria-haspopup="menu"], button.__composer-pill[aria-haspopup="menu"], .__composer-pill-composite button[aria-haspopup="menu"]',
   modelMenu: '[role="menu"][data-radix-menu-content]',
@@ -865,8 +868,12 @@ async function typePrompt(cdp, inputCdp, prompt, signal) {
           node.value = '';
           node.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'deleteContentBackward' }));
         } else {
-          node.textContent = '';
-          node.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'deleteContentBackward' }));
+          // ProseMirror ignores direct textContent writes — even writing ''
+          // desyncs PM's internal doc from the DOM, after which insertText,
+          // clicks and Enter are all swallowed (observed 2026-10-05).
+          // Clear through execCommand so the edit routes through beforeinput.
+          document.execCommand('selectAll', false, null);
+          document.execCommand('delete', false, null);
         }
         if (typeof node.focus === 'function') node.focus();
         const doc = node.ownerDocument;
@@ -905,16 +912,25 @@ async function typePrompt(cdp, inputCdp, prompt, signal) {
     await evaluate(
       cdp,
       `(() => {
-        const editor = document.querySelector(${JSON.stringify(SELECTORS.promptEditor)});
-        const fallback = document.querySelector(${JSON.stringify(SELECTORS.promptFallback)});
-        if (fallback) {
-          fallback.value = ${encodedPrompt};
-          fallback.dispatchEvent(new InputEvent('input', { bubbles: true, data: ${encodedPrompt}, inputType: 'insertFromPaste' }));
+        const selectors = ${selectors};
+        for (const selector of selectors) {
+          const node = document.querySelector(selector);
+          if (!node) continue;
+          node.focus();
+          if ('value' in node) {
+            node.value = ${encodedPrompt};
+            node.dispatchEvent(new InputEvent('input', { bubbles: true, data: ${encodedPrompt}, inputType: 'insertFromPaste' }));
+          } else {
+            // ProseMirror ignores direct textContent writes — its internal
+            // doc state stays empty, so the send button stays aria-disabled
+            // and both click and Enter are swallowed (observed 2026-09-25).
+            // execCommand routes through beforeinput, updating PM state.
+            document.execCommand('selectAll', false, null);
+            document.execCommand('insertText', false, ${encodedPrompt});
+          }
+          return true;
         }
-        if (editor) {
-          editor.textContent = ${encodedPrompt};
-          editor.dispatchEvent(new InputEvent('input', { bubbles: true, data: ${encodedPrompt}, inputType: 'insertFromPaste' }));
-        }
+        return false;
       })()`,
     );
   }
@@ -923,9 +939,9 @@ async function typePrompt(cdp, inputCdp, prompt, signal) {
 async function clickSend(cdp, inputCdp, signal) {
   throwIfAborted(signal);
   const selectorsJson = JSON.stringify(SELECTORS.sendButton.split(", "));
-  const deadline = Date.now() + 8000;
-  while (Date.now() < deadline) {
-    const result = await evaluate(
+
+  async function tryClick() {
+    return evaluate(
       cdp,
       `(() => {
         ${buildClickDispatcher()}
@@ -944,26 +960,52 @@ async function clickSend(cdp, inputCdp, signal) {
         return 'clicked';
       })()`,
     );
-    if (result === "clicked") return true;
-    if (result === "missing") break;
-    await delay(100, signal);
   }
-  await inputCdp("Input.dispatchKeyEvent", {
-    type: "keyDown",
-    key: "Enter",
-    code: "Enter",
-    windowsVirtualKeyCode: 13,
-    nativeVirtualKeyCode: 13,
-    text: "\r",
-  });
-  await inputCdp("Input.dispatchKeyEvent", {
-    type: "keyUp",
-    key: "Enter",
-    code: "Enter",
-    windowsVirtualKeyCode: 13,
-    nativeVirtualKeyCode: 13,
-  });
-  return true;
+
+  async function pressEnter() {
+    await inputCdp("Input.dispatchKeyEvent", {
+      type: "keyDown",
+      key: "Enter",
+      code: "Enter",
+      windowsVirtualKeyCode: 13,
+      nativeVirtualKeyCode: 13,
+      text: "\r",
+    });
+    await inputCdp("Input.dispatchKeyEvent", {
+      type: "keyUp",
+      key: "Enter",
+      code: "Enter",
+      windowsVirtualKeyCode: 13,
+      nativeVirtualKeyCode: 13,
+    });
+  }
+
+  // Submit only counts when the composer actually empties (or a user turn
+  // appears). Both submit paths can no-op silently — a stale ProseMirror doc
+  // state swallows clicks and Enter alike (observed 2026-09-25) — so verify
+  // and retry instead of returning true blindly.
+  for (let attempt = 0; attempt < 4; attempt++) {
+    if (attempt > 0) await delay(400, signal);
+    const result = await tryClick();
+    if (result === "missing" || result === "disabled") {
+      await pressEnter();
+    }
+    await delay(700, signal);
+    const submitted = await evaluate(
+      cdp,
+      `(() => {
+        // 2026-10-05: composer no longer has #prompt-textarea id; the
+        // ProseMirror div is the live composer.
+        const editor = document.querySelector('#prompt-textarea, .ProseMirror');
+        if (!editor) return !!document.querySelector('[data-message-author-role="user"]');
+        const text = (editor.innerText || editor.textContent || '').trim();
+        if (text.length === 0) return true;
+        return !!document.querySelector('[data-message-author-role="user"]');
+      })()`,
+    );
+    if (submitted) return true;
+  }
+  throw new Error("ChatGPT submit failed: send click and Enter were both rejected (composer state stale?)");
 }
 
 module.exports = {
