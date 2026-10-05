@@ -14,16 +14,23 @@ module.exports = {
     '[data-testid="pulse-answer"]',
   ],
   stopButton: [
+    // Bare accessible names — findInContent matches a11y tree TEXT only, so
+    // CSS attribute forms never match. Live capture 2026-09-25:
+    // 'Stop response (Esc)' — bare prefix wins; add Indonesian locale variant.
+    "Stop response",
+    "Stop responding",
+    "Hentikan respons",
     'button[aria-label*="stop"]',
-    'button[aria-label*="Stop"]',
     'button[data-testid="stop-button"]',
   ],
   doneToken: [
+    // Live capture 2026-09-25 done-only: Share button, Sources expander,
+    // Answer/Links/Images tabs. Bare text first.
+    "Share",
+    "Sources",
     'aria-label="Copy"',
-    'aria-label="copy"',
     'data-testid="copy-button"',
     'aria-label="Regenerate"',
-    'aria-label="regenerate"',
   ],
   rateLimitText: [/rate limit/i, /too many requests/i, /try again in/i, /slow down/i],
   errorText: [/something went wrong/i, /error/i, /failed/i, /not found/i],

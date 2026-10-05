@@ -17,13 +17,24 @@ module.exports = {
   ],
   // Stop button indicates response is still generating
   stopButton: [
+    // Bare accessible names (findInContent matches a11y tree text only).
+    // Live capture 2026-09-25 (browser locale id): 'Hentikan respons model';
+    // English fallbacks included for en-locale browsers.
+    "Hentikan respons",
+    "Stop response",
+    "Stop generating",
     'button[aria-label*="Stop"]',
-    'button[aria-label*="stop"]',
     'button[aria-label*="Cancel"]',
-    'button[aria-label*="Hentikan"]',
   ],
   // Done token — Grok marks completion with specific text or elements
   doneToken: [
+    // Live capture 2026-09-25 done-only: Regenerate, 'Salin respons' (id),
+    // 'Buat link berbagi' (id), Edit, More actions.
+    "Regenerate",
+    "Salin respons",
+    "Copy response",
+    "Buat link berbagi",
+    "Create share link",
     'button[aria-label*="Regenerate"]',
     '[data-testid="grok-done"]',
     'button[aria-label*="Create"]', // image generation done

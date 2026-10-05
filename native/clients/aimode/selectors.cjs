@@ -26,7 +26,16 @@ module.exports = {
     ".pRzye",
     ".l4cyt",
   ],
-  doneToken: ['[data-subtree="aimc"]', '[data-subtree="aimfl"]', ".X7NTVe", ".reply-content"],
+  doneToken: [
+    // Live capture 2026-09-25 done-only: Copy text, Share, Good/Bad response.
+    // Bare text first — findInContent matches a11y tree text only.
+    "Copy text",
+    "Good response",
+    '[data-subtree="aimc"]',
+    '[data-subtree="aimfl"]',
+    ".X7NTVe",
+    ".reply-content",
+  ],
   rateLimitText: [
     /rate limit/i,
     /too many requests/i,

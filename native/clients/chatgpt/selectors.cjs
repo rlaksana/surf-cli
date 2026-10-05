@@ -19,7 +19,16 @@ module.exports = {
   // "thinking" tokens here first; the final answer appears in .markdown
   // after the thinking finishes. We use this to detect mid-think state.
   thinkingBlock: ['[data-message-model-slug*="thinking"]'],
-  stopButton: ['button[data-testid="stop-button"]', 'button[aria-label="Stop generating"]'],
+  // 2026-09-25 live capture: ChatGPT repurposes the composer submit button as
+  // the stop control (same id), labeled "Stop answering". The a11y tree
+  // substrate carries accessible NAMES as plain text, not attribute strings —
+  // bare-text entries are the ones findInContent can actually match; CSS
+  // attribute forms are kept only as documentation/legacy fallbacks.
+  stopButton: [
+    "Stop answering",
+    'button[aria-label="Stop answering"]',
+    'button[data-testid="stop-button"]',
+  ],
   doneToken: [
     'div[data-testid="done"]',
     '[data-message-author-role="assistant"]',

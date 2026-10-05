@@ -18,15 +18,22 @@ module.exports = {
   ],
   // Stop button — PRIMARY completion signal (must be gone for completion)
   stopButton: [
+    // Live capture 2026-09-25: the Run button slot flips to plain "Stop"
+    // while streaming. Bare text first (findInContent matches tree text).
+    "Stop",
+    "Hentikan",
     'button[aria-label*="Stop"]',
-    'button[aria-label*="stop"]',
     'button[data-testid="stop-generating"]',
     'button[class*="stop"]',
   ],
   // Done token — appears when response is fully rendered
   doneToken: [
+    // Live capture 2026-09-25 done-only: Good/Bad response rating buttons,
+    // View more actions. Same tokens as gemini (shared Google stack).
+    "Good response",
+    "Bad response",
+    "View more actions",
     '[data-testid="response-done"]',
-    '[class*="done"]',
     '[data-message-author-role="assistant"]',
   ],
   // Rating buttons — confirmation of done, NOT a completion trigger
