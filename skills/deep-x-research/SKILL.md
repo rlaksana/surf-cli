@@ -1,6 +1,6 @@
 ---
 name: deep-x-research
-description: Deep, exhaustive research on a topic across X (Twitter) by driving Grok (x.com/i/grok) through surf. Use when the user wants comprehensive X research on a concept, technique, trend, tool, or creator scene; needs categorized findings with every claim traceable to post URLs; or when a single Grok query is not enough.
+description: Deep, exhaustive research on a topic across X (Twitter) by driving Grok (x.com/i/grok) through surf. Use when the user wants comprehensive X research on a concept, technique, trend, tool, or creator scene; needs categorized findings with every claim traceable to post URLs; or when a single Grok query is not enough. Note: `surf grok` is currently disabled in surf-cli — use the skill's direct-search fallback until it is re-enabled.
 ---
 
 # Deep X Research
@@ -8,6 +8,8 @@ description: Deep, exhaustive research on a topic across X (Twitter) by driving 
 Research a topic across X by putting Grok to work from multiple angles — it runs keyword and semantic X searches and watches videos natively — then deliver categorized findings where every claim is traceable to a post URL.
 
 Requires: surf installed and connected (`surf doctor`), Chrome logged into x.com. Command reference: the `surf` skill or `surf --help`.
+
+**Status (2026-09-25): `surf grok` is currently disabled in surf-cli** — it prints a clear disabled message, so the Grok sweep and video pass below cannot run. Until it is re-enabled, use the **Fallback** direct-search flow at the bottom instead: same traceable-findings output, keyword-only and slower.
 
 **Quota:** X caps Grok requests (typically 15 per 20 hours on a standard plan). Every `surf grok` call spends one. Budget the session before the first query and make each query do multi-angle work — never spend a request on what a quota-free step can answer.
 

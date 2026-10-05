@@ -27,6 +27,7 @@ npm run test:coverage    # With coverage report
 npm run format            # Format code with Biome
 npm run lint:test        # Lint test files only
 npm run test:ui          # Run tests with Vitest UI
+npm run deploy:local     # Build + deploy to local browser install (host auto-respawns)
 
 # Extension loading
 npm run install:native -- --id <extension-id>  # Install native host with extension ID
@@ -365,17 +366,21 @@ If the substring the selector expects is **absent from the snapshot**, the selec
 
 5. **Regression** check: re-run `surf chatgpt "PONG"` and `surf aimode "PONG"` to confirm no breakage.
 
-### Known client-specific gotchas (as of 2026-06)
+### Known client-specific gotchas (as of 2026-10-05)
+
+**Enabled providers: chatgpt, gemini, claude, aimode.** `perplexity`, `grok`, `aistudio` are **disabled** (2026-09-25): they auto-return a clear "provider is currently disabled" error. Do not debug them as regressions; re-enable only after fixing their selectors.
 
 | Client | Gotcha | Fix location |
 |---|---|---|
-| **chatgpt** | Working baseline. Uses `data-testid="stop-button"`, `data-testid="done"`. | `E:\surf-cli\native\clients\chatgpt\selectors.cjs` |
-| **claude** | CoT: forced incomplete when `thinkingBlock` selector matches. Avoid `[class*="thinking"]` — matches "thinking mode" settings toggle. | `E:\surf-cli\native\clients\claude\selectors.cjs` + `strategy.cjs` |
-| **perplexity** | "Preparing to reply" pre-stream phase may keep the response spinner visible. `a[href*="..."]` literal substrings don't work. | `E:\surf-cli\native\clients\perplexity\selectors.cjs` |
-| **gemini** | `doneToken: "message-content"` was a typo (should be `.message-content`). `mat-progress-bar` may persist after stream end. | `E:\surf-cli\native\clients\gemini\selectors.cjs` |
-| **grok** | Domain moved `x.com/i/grok` → `grok.com`. Cookies: `auth_token` (x.com) OR `x-userid` (grok.com). | `E:\surf-cli\native\grok-client.cjs` + `E:\surf-cli\src\service-worker\index.ts` (GET_TWITTER_COOKIES + GROK_NEW_TAB) |
-| **aistudio** | Same Google auth as Gemini. Uses `data-testid="stop-generating"`. | `E:\surf-cli\native\clients\aistudio\selectors.cjs` |
+| **chatgpt** | 2026-10-05: ChatGPT **removed all button `data-testid`s**. Send is `button[type="submit"][aria-label="Send"]` (repurposed to "Stop answering" while streaming). Composer is a `.ProseMirror` div with **no `#prompt-textarea` id**. Never write `textContent` on the PM composer — it desyncs PM's internal doc and swallows all input; clear via `execCommand('selectAll'+'delete')`. | `E:\surf-cli\native\chatgpt-client-ui.cjs` |
+| **claude** | CoT: forced incomplete when `thinkingBlock` selector matches. Avoid `[class*="thinking"]` — matches "thinking mode" settings toggle. `sr-only` headers ("Claude responded: X") pollute `textContent` — strip before extraction. | `E:\surf-cli\native\clients\claude\selectors.cjs` + `strategy.cjs`, `native/claude-client.cjs` |
+| **perplexity** | DISABLED. Selectors rewritten 2026-09-25 to bare a11y text (stop "Stop response (Esc)", done "Share"/"Sources"). | `E:\surf-cli\native\clients\perplexity\selectors.cjs` |
+| **gemini** | Synthetic clicks on send fail; submission only works via Enter-newline (2026-09-25). | `E:\surf-cli\native\clients\gemini\selectors.cjs` |
+| **grok** | DISABLED. grok.com locale renders Indonesian (stop "Hentikan respons model", send "Kirim"). | `E:\surf-cli\native\clients\grok\selectors.cjs` |
+| **aistudio** | DISABLED. Same Google auth as Gemini; Run/Stop share one button. | `E:\surf-cli\native\clients\aistudio\selectors.cjs` |
 | **aimode** | No login required (public Google search `udm=50`). Always works. | `E:\surf-cli\native\clients\aimode\selectors.cjs` |
+
+**Host module caching:** the surf native host is long-running and caches `require()`d client modules. Edits to `native/*-client*.cjs` or `native/clients/*/selectors.cjs` have **no effect until the host is killed and respawned** (extension reconnects and relaunches it in ~5s). If a selector fix "doesn't work", restart the host before doubting the fix.
 
 ### Quick selector edit template
 

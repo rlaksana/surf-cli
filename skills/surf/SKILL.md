@@ -1,6 +1,6 @@
 ---
 name: surf
-description: Control Chrome browser via CLI for testing, automation, and debugging. Use when the user needs browser automation, screenshots, form filling, page inspection, network/CPU emulation, DevTools streaming, or AI queries via the default `aimode` provider (Google AI Mode — no login required; `nem=143` pro / `udm=50` auto) plus Gemini/Perplexity/Grok/AI Studio/Claude. ChatGPT is temporarily disabled.
+description: Control Chrome browser via CLI for testing, automation, and debugging. Use when the user needs browser automation, screenshots, form filling, page inspection, network/CPU emulation, DevTools streaming, or AI queries via the default `aimode` provider (Google AI Mode — no login required; `nem=143` pro / `udm=50` auto) plus ChatGPT/Gemini/Claude. Perplexity, Grok, and AI Studio are disabled.
 tools: Agent, Bash, Read, Glob
 ---
 
@@ -278,7 +278,7 @@ and fingerprint; clear affects all clients using the shared file.
 
 Query AI models using your browser's logged-in session. Most require a login; **AI Mode (`aimode`) is the default** because it needs no login and works out of the box.
 
-**ChatGPT is temporarily disabled** - use AI Mode (default), Gemini, Claude, Perplexity, Grok, or AI Studio instead.
+**Perplexity, Grok, and AI Studio are disabled** — surf prints a clear disabled message if you call them. Use AI Mode (default), ChatGPT, Gemini, or Claude instead.
 
 ### AI Mode (Google) — DEFAULT
 
@@ -297,7 +297,7 @@ surf aimode "deep dive" --timeout 300             # Extended timeout (default 12
 
 **Why this is the default:** no auth needed, no rate-limit hit on free queries, and Indonesian/Indonesian-context prompts work reliably because Google handles the full search+generation pipeline.
 
-### ChatGPT (when enabled)
+### ChatGPT
 
 ```bash
 surf chatgpt "explain this code"
@@ -355,7 +355,9 @@ surf gemini "hello" --model gemini-3.5-flash      # Models: gemini-3.1-pro (defa
 surf gemini "wide banner" --generate-image /tmp/banner.png --aspect-ratio 16:9
 ```
 
-### Perplexity
+### Perplexity (disabled)
+
+**DISABLED:** `surf perplexity` is disabled in surf-cli and prints a clear disabled message. Reference below is kept for when it is re-enabled.
 
 Uses the **deep-link URL pattern** (`https://www.perplexity.ai/#?q=...&model=...&focus=...&space=...`) so the page boots already configured — no need to script the typePrompt / selectModel / submitPrompt dance.
 
@@ -391,7 +393,10 @@ surf claude "summarize" --with-page              # Include current page context
 surf claude "analyze" --model claude-opus-4      # Specify model (default: claude-opus-4)
 ```
 
-### Grok (via x.com - requires X.com login in Chrome)
+### Grok (via x.com - requires X.com login in Chrome) — DISABLED
+
+**DISABLED:** `surf grok` is disabled in surf-cli and prints a clear disabled message. Reference below is kept for when it is re-enabled (the `deep-x-research` skill is affected too).
+
 ```bash
 surf grok "what are the latest AI trends on X"    # Search X posts
 surf grok "analyze @username recent activity"     # Profile analysis  
@@ -411,7 +416,10 @@ surf grok --validate
 surf grok --validate --save-models
 ```
 
-### AI Studio (via aistudio.google.com - requires Google login in Chrome)
+### AI Studio (via aistudio.google.com - requires Google login in Chrome) — DISABLED
+
+**DISABLED:** `surf aistudio` is disabled in surf-cli and prints a clear disabled message. Reference below is kept for when it is re-enabled.
+
 ```bash
 surf aistudio "explain quantum computing"
 surf aistudio "redteam this" --with-page          # Include current page context
@@ -423,7 +431,10 @@ surf aistudio "analyze" --timeout 600             # Custom timeout (default: 300
 
 **Model selection is best-effort:** Pass any AI Studio model id (e.g. `gemini-3.1-pro-preview`, `gemini-3-flash-preview`, `gemini-flash-lite-latest`). If the model isn't found, AI Studio uses whatever model was last selected in the UI.
 
-### AI Studio App Builder
+### AI Studio App Builder — DISABLED
+
+**DISABLED:** part of the disabled `aistudio` provider. Reference kept for re-enable.
+
 ```bash
 surf aistudio.build "build a portfolio site"
 surf aistudio.build "todo app" --model gemini-3.1-pro-preview   # Model override
@@ -444,24 +455,16 @@ Returns `zipPath`, `extractedPath`, `model`, `buildDuration`, and `tookMs`.
 
 When AI queries fail, check these common issues:
 
-1. **Not logged in**: The error "login required" means you need to log into the service in Chrome (chatgpt.com, gemini.google.com, perplexity.ai, x.com, or aistudio.google.com)
-2. **Model selection failed**: The UI may have changed. Run `surf grok --validate` to check
-3. **Response timeout**: Reasoning-heavy models (ChatGPT o1, Grok Expert) can take 45+ seconds. AI Studio builds can take several minutes.
+1. **Provider disabled**: Perplexity, Grok, and AI Studio are disabled — surf prints a clear disabled message. Switch to AI Mode, ChatGPT, Gemini, or Claude
+2. **Not logged in**: The error "login required" means you need to log into the service in Chrome (chatgpt.com, gemini.google.com, or claude.ai)
+3. **Response timeout**: Reasoning-heavy models can take 45+ seconds
 4. **Element not found**: The service's UI changed. Check for surf-cli updates
 
 **Debugging workflow for agents:**
 ```bash
-# 1. Check if the service is accessible and UI is valid
-surf grok --validate
-
-# 2. If models mismatch, update the local settings
-surf grok --validate --save-models
-
-# 3. Retry with explicit model name from validation output
-surf grok "query" --model <model-from-validation>
-
-# 4. If still failing, try with longer timeout
-surf grok "query" --timeout 600
+# 1. Disabled provider (perplexity/grok/aistudio)? The message says so — switch to an active provider
+# 2. Login required? Log into the service in Chrome, then retry
+# 3. Timeout on heavy prompts? Retry with a longer --timeout
 ```
 
 ## Tab Management
@@ -524,7 +527,7 @@ surf session.info research --refresh
 
 Each session owns one explicit tab and defaults to a separate unfocused window. Commands for the same tab are FIFO; different session tabs may run concurrently. Browser-wide writers wait for tab lanes to drain. `--no-wait` returns `tab_busy` or `browser_busy` immediately. On `tab_gone` or `session_epoch_stale`, run the exact command printed after `Recovery:`—normally `surf session.reopen <name>`.
 
-Browser-login provider commands (`chatgpt`, `gemini`, `perplexity`, `grok`, `kimi`, `aistudio`, and `oracle ask`) take exclusive browser access and print a warning before dispatch. Do not assume Surf is hung while that warning is visible; inspect `surf session.info <name>` from another shell to see the active writer.
+Browser-login provider commands (`chatgpt`, `gemini`, `perplexity`, `grok`, `aistudio`, and `oracle ask`) take exclusive browser access and print a warning before dispatch. Do not assume Surf is hung while that warning is visible; inspect `surf session.info <name>` from another shell to see the active writer.
 
 Sessions share cookies, authentication, same-origin storage, downloads, history, bookmarks, and other Chrome-profile state. Use separate browser/profile instances and `SURF_SOCKET` values only when hard isolation is required. Explicit `--tab-id`, `--window-id`, and named tabs remain available for one-off targeting.
 
@@ -977,10 +980,10 @@ surf wait.element ".missing" --auto-capture --timeout 2000
 3. **JS method for contenteditable** - Modern editors (ChatGPT, Claude, Notion) need `--method js`
 4. **Named tabs for workflows** - `tab.name app` then `tab.switch app`
 5. **Auto-capture for debugging** - `--auto-capture` saves diagnostics on failure
-6. **AI tools use browser session** - Must be logged into the service (ChatGPT, Gemini, Perplexity, Grok, AI Studio), no API keys needed
-7. **Grok validation** - Run `surf grok --validate` if queries fail to check UI changes
-8. **Long timeouts for reasoning-heavy models** - ChatGPT o1 and Grok Expert can take 60+ seconds. AI Studio builds default to 600s.
-9. **AI Studio for unrestricted Gemini** - `surf aistudio` gives less filtered responses than `surf gemini` for the same models
+6. **AI tools use browser session** - Must be logged into the service (ChatGPT, Gemini, Claude; AI Mode needs no login; Perplexity, Grok, AI Studio are disabled), no API keys needed
+7. **Grok validation** - `surf grok --validate` checks UI changes (grok currently disabled; kept for reference)
+8. **Long timeouts for reasoning-heavy models** - Can take 60+ seconds on ChatGPT and similar
+9. **AI Studio for unrestricted Gemini** - `surf aistudio` gives less filtered responses than `surf gemini` for the same models (AI Studio currently disabled)
 10. **Use `surf do` for multi-step tasks** - Reduces token overhead and improves reliability
 11. **Dry-run workflows first** - `surf do '...' --dry-run` validates without executing
 12. **Session first** - Set a unique `SURF_SESSION` and run `session.ensure` before the first browser command in every independent agent shell
@@ -989,7 +992,7 @@ surf wait.element ".missing" --auto-capture --timeout 2000
 15. **Animation capture** - Use `surf record --duration 2000 --fps 10 --output /tmp/anim.gif` when the agent needs to see motion; use `animate-audit` for numeric timelines and `perf-audit` for jank/layout-shift snapshots
 16. **Hard isolation** - Sessions share a Chrome profile; use separate browser/profile instances plus separate `SURF_SOCKET` values when profile state must not be shared
 17. **HTML export** - Use `surf page.html > artifact.html` to save Claude artifacts or any rendered page as static HTML
-18. **Perplexity default = Claude Sonnet 4.6 Thinking** - Picked for format compliance; override with `--model <id>` from `/rest/models/config`. Perplexity's "Thinking" toggle is the `reasoning_model` field, not a URL flag — pass that id to `?model=...`
+18. **Perplexity default = Claude Sonnet 4.6 Thinking** (Perplexity currently disabled) - Picked for format compliance; override with `--model <id>` from `/rest/models/config`. Perplexity's "Thinking" toggle is the `reasoning_model` field, not a URL flag — pass that id to `?model=...`
 18. **Semantic locators** - `locate.role`, `locate.text`, `locate.label` for more robust element finding
 19. **Frame context** - Use `frame.switch` before interacting with iframe content
 
