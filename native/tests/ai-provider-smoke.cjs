@@ -50,9 +50,12 @@ async function killOrphanSurfProcesses() {
     const myPid = process.pid;
     let killed = 0;
     for (const line of stdout.split(/\r?\n/)) {
-      // Match any surf-cli process: host.cjs, cli.cjs, ai-provider-smoke.
-      // cli.cjs zombie is the most common (socket hang on Windows).
-      if (!/surf-cli|native\\(host|cli)\.cjs|native\/(host|cli)\.cjs|ai-provider-smoke/.test(line)) continue;
+      // Kill orphan CLI zombies (socket/browser-lock holders) and stale smoke
+      // runs. Do NOT match host.cjs or generic surf-cli paths: the host is the
+      // shared long-lived process this test depends on — killing it makes the
+      // first-tested providers fail with connection errors until the extension
+      // reconnects (~5s), which is exactly the dead window we must avoid.
+      if (!/native\\cli\.cjs|native\/cli\.cjs|ai-provider-smoke/.test(line)) continue;
       const m = line.match(/^\s*(\d+)\s+/);
       if (!m) continue;
       const pid = Number.parseInt(m[1], 10);
