@@ -13,6 +13,10 @@ const SELECTORS = {
   assistantMessage:
     '[data-is-streaming="false"], .font-claude-response, [data-turn-author="assistant"], [data-testid="assistant-message"]',
   stopButton: '[data-testid="stop-button"], button[aria-label="Stop"], button[aria-label="Stop generating"]',
+  // 2026-09-25 live capture: claude.ai now HAS a send button (aria-label
+  // "Send message"). The synthetic Enter keypress alone no longer submits the
+  // composer, so this click fallback must stay configured.
+  sendButton: 'button[aria-label="Send message"]',
   conversationTurn:
     '[data-is-streaming="false"], .font-claude-response, [data-turn-author="assistant"], [data-testid="assistant-message"], .claude-message',
 };
@@ -200,26 +204,34 @@ async function clickSend(cdp, inputCdp) {
     text: "\r",
   });
 
-  // Fallback: try clicking send button. SELECTORS.sendButton is undefined
-  // for the live Claude.ai UI (no separate send button exists; the rightmost
-  // composer toolbar icon activates voice dictation when clicked). Skip the
-  // fallback entirely when sendButton is not configured.
+  // Fallback: click the send button ONLY if Enter did not submit. The send
+  // button reverts to a Stop control while generating, so its absence means
+  // Enter worked. Firing both paths double-submits (observed 2026-09-25:
+  // extraction returned "PONGPONG" from two sends).
   if (SELECTORS.sendButton) {
-    await evaluate(
+    await delay(800);
+    const firstSelector = SELECTORS.sendButton.split(", ")[0];
+    const stillPending = await evaluate(
       cdp,
-      `(() => {
-        ${buildClickDispatcher()}
-        const selectors = ${JSON.stringify(SELECTORS.sendButton.split(", "))};
-        for (const selector of selectors) {
-          const btn = document.querySelector(selector);
-          if (btn) {
-            dispatchClickSequence(btn);
-            return true;
-          }
-        }
-        return false;
-      })()`,
+      `(() => { return document.querySelector(${JSON.stringify(firstSelector)}) ? true : false; })()`,
     );
+    if (stillPending) {
+      await evaluate(
+        cdp,
+        `(() => {
+          ${buildClickDispatcher()}
+          const selectors = ${JSON.stringify(SELECTORS.sendButton.split(", "))};
+          for (const selector of selectors) {
+            const btn = document.querySelector(selector);
+            if (btn) {
+              dispatchClickSequence(btn);
+              return true;
+            }
+          }
+          return false;
+        })()`,
+      );
+    }
     await delay(500);
   }
 }
@@ -282,7 +294,11 @@ async function getAssistantContent(cdp) {
           const removeSelectors = [
             'button', '[role="button"]', '.feedback',
             '[data-testid="feedback"]', '.thumbs-up', '.thumbs-down',
-            'div[aria-label="Good response"]', 'div[aria-label="Bad response"]'
+            'div[aria-label="Good response"]', 'div[aria-label="Bad response"]',
+            // claude.ai nests sr-only a11y turn headers ("Claude responded: <full
+            // answer>") inside the message container; without this the extracted
+            // text duplicates the whole response (observed "PONGPONG", 2026-09-25).
+            '.sr-only', '[data-find-omitted]',
           ];
           removeSelectors.forEach(sel => {
             clone.querySelectorAll(sel).forEach(el => el.remove());
